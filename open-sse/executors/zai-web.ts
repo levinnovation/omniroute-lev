@@ -165,9 +165,12 @@ function buildZaiBrowserChatOptions(input: {
   vlmConfig: ZaiVlmConfig;
 }): Parameters<typeof browserBackedChat>[0] {
   const poolKey = `zai-web:${createHash("sha256").update(input.token).digest("hex").slice(0, 24)}`;
+  // LEV fork: Z.ai's browser frontend now POSTs to /api/v1/chats/new instead of
+  // /api/v2/chat/completions. Watch for the new endpoint so the browser transport
+  // can intercept the chat creation response.
   return {
     poolKey,
-    chatUrl: ZAI_CHAT_URL,
+    chatUrl: ZAI_NEW_CHAT_URL,
     chatPageUrl: `${ZAI_BASE_URL}/?model=${encodeURIComponent(browserModelName(input.modelId))}`,
     userMessage: browserPrompt(input.messages),
     localStorage: { token: input.token },
@@ -447,11 +450,106 @@ export class ZaiWebExecutor extends BaseExecutor {
           result.status || 502,
           describeZaiBrowserFailure(result),
           input.body,
-          ZAI_CHAT_URL
+          ZAI_NEW_CHAT_URL
         ),
       };
     }
 
+    // LEV fork: Z.ai's browser now POSTs to /api/v1/chats/new which returns
+    // JSON with a chat ID, not an SSE stream. Extract the chat ID and make
+    // a direct fetch to /api/v2/chat/completions for the actual stream.
+    const responseBody = result.body.toString("utf8");
+    const contentType = result.contentType || "";
+
+    // Check if this is a JSON response (chats/new) vs SSE (chat/completions)
+    if (contentType.includes("application/json") || responseBody.trim().startsWith("{")) {
+      try {
+        const chatData = JSON.parse(responseBody);
+        const chatId = typeof chatData?.id === "string" ? chatData.id : "";
+        if (!chatId) {
+          return {
+            errorResult: makeErrorResult(
+              502,
+              "Z.ai browser transport: chats/new returned no chat id",
+              input.body,
+              ZAI_NEW_CHAT_URL
+            ),
+          };
+        }
+
+        // Now fetch the SSE stream directly using the chat ID and token
+        const timestamp = Date.now();
+        const requestId = randomUUID();
+        const userId = ""; // Browser transport doesn't have userId; the token is enough
+        const completionUrl = buildZaiCompletionUrl({
+          requestId,
+          timestamp,
+          token: input.token,
+          userId,
+        });
+        const reqHeaders = buildZaiHeaders(input.token, {
+          accept: "text/event-stream",
+        });
+        const reqBody = buildZaiRequestBody({
+          body: (input.body || {}) as Record<string, unknown>,
+          captchaVerifyParam: "",
+          chatId,
+          messages: input.messages,
+          modelId: input.modelId,
+          prompt: browserPrompt(input.messages),
+          userMessageId: randomUUID(),
+          enableThinking: input.thinkingConfig.enabled,
+          reasoningEffort: input.thinkingConfig.effort,
+          reasoningEffortSupported: input.thinkingConfig.effortSupported,
+          vlmConfig: input.vlmConfig,
+        });
+
+        const streamResponse = await fetch(completionUrl, {
+          method: "POST",
+          headers: reqHeaders,
+          body: JSON.stringify(reqBody),
+          signal: input.signal,
+        });
+
+        if (!streamResponse.ok) {
+          const errorText = await streamResponse.text().catch(() => "");
+          return {
+            errorResult: makeErrorResult(
+              streamResponse.status,
+              `Z.ai completion stream failed: ${sanitizeErrorMessage(errorText)}`,
+              input.body,
+              completionUrl
+            ),
+          };
+        }
+
+        return {
+          upstream: streamResponse,
+          auditHeaders: {
+            Authorization: "Bearer [REDACTED]",
+            "X-OmniRoute-Transport": "browser+direct",
+          },
+          auditBody: buildZaiBrowserAuditBody({
+            messages: input.messages,
+            modelId: input.modelId,
+            thinkingConfig: input.thinkingConfig,
+            vlmConfig: input.vlmConfig,
+            imageCount: attachments.length,
+          }),
+        };
+      } catch (parseError) {
+        return {
+          errorResult: makeErrorResult(
+            502,
+            `Z.ai browser transport: failed to parse chats/new response: ${sanitizeErrorMessage(parseError instanceof Error ? parseError.message : String(parseError))}`,
+            input.body,
+            ZAI_NEW_CHAT_URL
+          ),
+        };
+      }
+    }
+
+    // Fallback: if the response is SSE (older Z.ai flow), pass it through directly
     return {
       upstream: new Response(new Uint8Array(result.body), {
         status: result.status,
