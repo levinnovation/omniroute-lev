@@ -337,6 +337,43 @@ function getAuthoritativeStaticContextWindow(
   return null;
 }
 
+// LEV fork: Resolve context window from env vars, mirroring contextManager's
+// getEnvOverride. Priority: per-provider > web-providers shared > global.
+// Kept inline to avoid a circular dependency on contextManager.
+const WEB_COOKIE_PROVIDERS_CTX = new Set([
+  "deepseek-web",
+  "zai-web",
+  "gemini-web",
+  "huggingchat",
+  "claude-web",
+]);
+
+function resolveEnvContextWindow(provider: string | null): number | null {
+  if (!provider) return null;
+  // 1. Per-provider override
+  const envKey = `CONTEXT_LENGTH_${provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+  const envValue = process.env[envKey];
+  if (envValue) {
+    const parsed = parseInt(envValue, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+  // 2. Shared override for all browser-cookie providers
+  if (WEB_COOKIE_PROVIDERS_CTX.has(provider)) {
+    const webValue = process.env.CONTEXT_LENGTH_WEB_PROVIDERS;
+    if (webValue) {
+      const parsed = parseInt(webValue, 10);
+      if (!isNaN(parsed) && parsed > 0) return parsed;
+    }
+  }
+  // 3. Global override
+  const globalValue = process.env.CONTEXT_LENGTH_DEFAULT;
+  if (globalValue) {
+    const parsed = parseInt(globalValue, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
+
 // #8697-adjacent: this used to rescan Object.entries(MODEL_SPECS) per candidate per
 // call — the top hotspot in a full catalog-rebuild profile once the pricing-path and
 // getCanonicalModelSpecId() bottlenecks were fixed. Reuses the lazy index already built
@@ -815,6 +852,11 @@ export function getResolvedModelCapabilities(
     resolved.model,
     resolved.rawModel
   );
+  // LEV fork: check env override for context window (CONTEXT_LENGTH_<PROVIDER>,
+  // CONTEXT_LENGTH_WEB_PROVIDERS, CONTEXT_LENGTH_DEFAULT). This mirrors
+  // resolveTokenLimit's getEnvOverride so the input-token-cap gate also
+  // respects env overrides, not just the context-window gate.
+  const envContextWindow = resolveEnvContextWindow(resolved.provider);
   // A persisted context-window override (operator-set or auto-discovered)
   // reflects the real *total* window and wins over every static/synced source.
   // `maxInputTokens` still follows its own precedence chain; only when that
@@ -824,6 +866,7 @@ export function getResolvedModelCapabilities(
     : null;
   const contextWindow =
     persistedContextWindow ??
+    envContextWindow ??
     authoritativeContextWindow ??
     synced?.limit_context ??
     (typeof registryModel?.contextLength === "number" ? registryModel.contextLength : null) ??
