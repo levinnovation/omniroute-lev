@@ -27,12 +27,31 @@ const DEFAULT_LIMITS: Record<string, number> = {
 };
 
 // Environment variable overrides (highest priority)
+// LEV fork: web-cookie providers share a single env override so operators
+// can raise/lower the context gate for all browser-session providers at
+// once without setting five separate env vars.
+const WEB_COOKIE_PROVIDERS = new Set([
+  "deepseek-web",
+  "zai-web",
+  "gemini-web",
+  "huggingchat",
+  "claude-web",
+]);
+
 function getEnvOverride(provider: string): number | null {
   const envKey = `CONTEXT_LENGTH_${provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
   const envValue = process.env[envKey];
   if (envValue) {
     const parsed = parseInt(envValue, 10);
     if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+  // LEV fork: shared override for all browser-cookie providers
+  if (WEB_COOKIE_PROVIDERS.has(provider)) {
+    const webValue = process.env.CONTEXT_LENGTH_WEB_PROVIDERS;
+    if (webValue) {
+      const parsed = parseInt(webValue, 10);
+      if (!isNaN(parsed) && parsed > 0) return parsed;
+    }
   }
   // Global override
   const globalValue = process.env.CONTEXT_LENGTH_DEFAULT;
