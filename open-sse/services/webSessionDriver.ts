@@ -237,6 +237,7 @@ export class WebSessionDriver {
   ): ReadableStream<Uint8Array> {
     let receivedContent = false;
     let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+    let closed = false; // Guard against double-close when watchdog + pipe race
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     // Capture the watchdog timeout so the ReadableStream closure can read it
@@ -250,7 +251,7 @@ export class WebSessionDriver {
 
         // Start the watchdog — if no content arrives in N seconds, abort
         watchdogTimer = setTimeout(() => {
-          if (!receivedContent) {
+          if (!receivedContent && !closed) {
             options.onTimeout?.();
             const errorChunk = JSON.stringify({
               choices: [
@@ -265,6 +266,7 @@ export class WebSessionDriver {
             });
             controller.enqueue(encoder.encode(`data: ${errorChunk}\n\n`));
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            closed = true;
             controller.close();
             reader.cancel().catch(() => {});
           }
@@ -278,7 +280,7 @@ export class WebSessionDriver {
               if (done) {
                 if (watchdogTimer) clearTimeout(watchdogTimer);
                 // If the stream ended with no content, that's a failure
-                if (!receivedContent) {
+                if (!receivedContent && !closed) {
                   options.onEmptyStream?.();
                   const errorChunk = JSON.stringify({
                     choices: [
@@ -295,7 +297,10 @@ export class WebSessionDriver {
                   controller.enqueue(encoder.encode(`data: ${errorChunk}\n\n`));
                   controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                 }
-                controller.close();
+                if (!closed) {
+                  closed = true;
+                  controller.close();
+                }
                 return;
               }
               // Check if this chunk contains actual content (not just phase/done frames)
@@ -311,12 +316,14 @@ export class WebSessionDriver {
                   watchdogTimer = null;
                 }
               }
-              controller.enqueue(value);
+              if (!closed) {
+                controller.enqueue(value);
+              }
             }
           } catch (error) {
             if (watchdogTimer) clearTimeout(watchdogTimer);
             // If the stream errored with no content, report it
-            if (!receivedContent) {
+            if (!receivedContent && !closed) {
               options.onTimeout?.();
               const msg = sanitizeErrorMessage(
                 error instanceof Error ? error.message : "stream error"
@@ -335,10 +342,13 @@ export class WebSessionDriver {
               controller.enqueue(encoder.encode(`data: ${errorChunk}\n\n`));
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             }
-            try {
-              controller.close();
-            } catch {
-              // already closed
+            if (!closed) {
+              closed = true;
+              try {
+                controller.close();
+              } catch {
+                // already closed
+              }
             }
           }
         })();
