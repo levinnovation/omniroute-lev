@@ -186,7 +186,9 @@ interface TagToken {
 
 // Matches an opening/closing <tool .../> or <tool_call .../> tag, optionally with a `:name`
 // suffix and an attribute list. `tool_call` is listed first so it wins the alternation.
-const TAG_TOKEN_RE = /<(\/?)(?:tool_call|tool)(:[A-Za-z0-9_.+-]+)?((?:\s[^>]*)?)\/?>/g;
+// LEV fork: also match <tool_calls> (plural) which DeepSeek sometimes emits
+// instead of <tool_call>. The "s" variant is treated identically.
+const TAG_TOKEN_RE = /<(\/?)(?:tool_calls|tool_call|tool)(:[A-Za-z0-9_.+-]+)?((?:\s[^>]*)?)\/?>/g;
 
 function tokenizeToolTags(text: string): TagToken[] {
   const tokens: TagToken[] = [];
@@ -425,6 +427,111 @@ function extractCall(
 
 // ── Public parser ─────────────────────────────────────────────────────────────
 
+// LEV fork: Parse the <tool_calls> wrapper format where each child element's
+// tag name is the tool name and grandchildren are parameters:
+//   <tool_calls>
+//     <glob><glob_pattern>...</glob_pattern></glob>
+//     <shell><command>...</command></shell>
+//   </tool_calls>
+// Returns parsed calls + the byte ranges of the wrapper block, or null if
+// no child tool elements were found.
+const TOOL_CALLS_WRAPPER_RE = /<tool_calls\b[^>]*>([\s\S]*?)<\/tool_calls>/i;
+
+function parseToolCallsWrapper(
+  text: string,
+  idSeed: string,
+  requested: RequestedToolName[],
+  schemaMap?: Map<string, Set<string>>
+): { toolCalls: OpenAIToolCall[]; ranges: Array<{ start: number; end: number }> } | null {
+  const wrapperMatch = TOOL_CALLS_WRAPPER_RE.exec(text);
+  if (!wrapperMatch) return null;
+
+  const wrapperStart = wrapperMatch.index;
+  const wrapperEnd = wrapperMatch.index + wrapperMatch[0].length;
+  const inner = wrapperMatch[1];
+
+  // Find all child elements: <tagname ...>content</tagname>
+  // Each child element is a tool call where tagname = tool name and
+  // child elements inside it = parameters.
+  const childElementRe = /<([A-Za-z_][A-Za-z0-9_.-]*)\b([^>]*?)>([\s\S]*?)<\/\1>/g;
+  const toolCalls: OpenAIToolCall[] = [];
+  let m: RegExpExecArray | null;
+  let idx = 0;
+
+  while ((m = childElementRe.exec(inner)) !== null) {
+    const childTag = m[1];
+    const childInner = m[3];
+
+    // Resolve tool name from the child tag name
+    const resolved = resolveRequestedToolName(childTag, requested);
+    const name = resolved || childTag;
+
+    // Try to extract arguments from the child's inner content:
+    // 1. If it's JSON, use that
+    // 2. If it has child elements, treat each as a parameter (key=tag, value=text)
+    // 3. If it's plain text, try to use it as a single argument
+    const trimmedInner = childInner.trim();
+    let argsValue: unknown;
+
+    const jsonParsed = parseLooseJsonObject(trimmedInner);
+    if (jsonParsed) {
+      argsValue = jsonParsed;
+    } else {
+      // Extract child elements as parameters
+      const paramRe = /<([A-Za-z_][A-Za-z0-9_.-]*)\b[^>]*>([\s\S]*?)<\/\1>/g;
+      const params: Record<string, unknown> = {};
+      let pm: RegExpExecArray | null;
+      let paramFound = false;
+      while ((pm = paramRe.exec(childInner)) !== null) {
+        params[pm[1]] = pm[2].trim();
+        paramFound = true;
+      }
+      if (paramFound) {
+        argsValue = params;
+      } else if (trimmedInner) {
+        // Single text value — try to find a matching schema key
+        if (schemaMap && schemaMap.has(name)) {
+          const keys = schemaMap.get(name)!;
+          if (keys.size === 1) {
+            const [onlyKey] = keys;
+            argsValue = { [onlyKey]: trimmedInner };
+          } else {
+            // Find a key that looks like a primary input (command, content, query, input, pattern, etc.)
+            const preferredKeys = [
+              "command",
+              "content",
+              "query",
+              "input",
+              "pattern",
+              "path",
+              "code",
+              "text",
+            ];
+            const matchKey = preferredKeys.find((k) => keys.has(k));
+            argsValue = matchKey ? { [matchKey]: trimmedInner } : { input: trimmedInner };
+          }
+        } else {
+          argsValue = { input: trimmedInner };
+        }
+      } else {
+        argsValue = {};
+      }
+    }
+
+    toolCalls.push({
+      id: `${idSeed}_${idx++}`,
+      type: "function",
+      function: {
+        name,
+        arguments: typeof argsValue === "string" ? argsValue : JSON.stringify(argsValue),
+      },
+    });
+  }
+
+  if (toolCalls.length === 0) return null;
+  return { toolCalls, ranges: [{ start: wrapperStart, end: wrapperEnd }] };
+}
+
 /**
  * Parse a DeepSeek-web text reply into OpenAI `tool_calls`. Returns the surrounding text with the recognized blocks stripped (so it can
  * still be streamed to the client) plus the parsed calls, or `null` when none are present.
@@ -449,6 +556,16 @@ export function parseDeepSeekToolCalls(
 
   const requested = getRequestedToolNames(requestedTools);
   const schemaMap = buildSchemaParamMap(requestedTools);
+
+  // LEV fork: check for <tool_calls> wrapper format first. This format has
+  // child elements where each child tag IS the tool name and grandchildren
+  // are parameters. The standard <tool> block parser can't handle this.
+  const wrapperResult = parseToolCallsWrapper(text, idSeed, requested, schemaMap);
+  if (wrapperResult) {
+    const cleanedContent = stripRanges(text, wrapperResult.ranges).trim();
+    return { content: cleanedContent, toolCalls: wrapperResult.toolCalls };
+  }
+
   const blocks = pairToolBlocks(tokens, text.length);
 
   // Only extract from leaf blocks (no other block nested inside), so a doubled
@@ -479,7 +596,13 @@ export function parseDeepSeekToolCalls(
     // A missing _nonce is tolerated for backward compatibility.
     if (nonce) {
       const parsed = parseLooseJsonObject(inner);
-      if (parsed && typeof parsed.name === "string" && parsed._nonce !== undefined && parsed._nonce !== nonce) continue;
+      if (
+        parsed &&
+        typeof parsed.name === "string" &&
+        parsed._nonce !== undefined &&
+        parsed._nonce !== nonce
+      )
+        continue;
     }
 
     toolCalls.push({
