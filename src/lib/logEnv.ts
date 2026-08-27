@@ -7,7 +7,10 @@ const DEFAULT_APP_LOG_MAX_SIZE = 50 * 1024 * 1024;
 const DEFAULT_APP_LOG_MAX_FILES = 20;
 const DEFAULT_CALL_LOG_MAX_ENTRIES = 10000;
 const DEFAULT_CALL_LOGS_TABLE_MAX_ROWS = 100000;
-const DEFAULT_CALL_LOG_PIPELINE_MAX_SIZE_KB = 512;
+// LEV fork: increased from 512 KB to 10 MB. We provision a Railway volume
+// at /app/data, so disk space is not a constraint. The 512 KB limit was
+// truncating nearly all real-world request/response payloads.
+const DEFAULT_CALL_LOG_PIPELINE_MAX_SIZE_KB = 10 * 1024;
 const DEFAULT_PROXY_LOGS_TABLE_MAX_ROWS = 100000;
 /**
  * Default app log path, anchored to DATA_DIR (never `process.cwd()`).

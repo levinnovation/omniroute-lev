@@ -10,7 +10,11 @@ const isBuildPhase =
 const DATA_DIR = resolveDataDir({ isCloud });
 
 export const CALL_LOGS_DIR = isCloud ? null : path.join(DATA_DIR, "call_logs");
-export const MAX_CALL_LOG_ARTIFACT_BYTES = 512 * 1024;
+// LEV fork: increased from 512 KB to 10 MB. We have a Railway volume
+// mounted at /app/data, so disk space is not a concern. The previous
+// 512 KB limit truncated most real-world requests/responses, making
+// debugging impossible.
+export const MAX_CALL_LOG_ARTIFACT_BYTES = 10 * 1024 * 1024;
 
 const SIZE_LIMIT_EXCEEDED_REASON = "call_log_artifact_size_limit_exceeded";
 const OMITTED_FOR_SIZE_LIMIT = "[omitted: call log artifact size limit exceeded]";

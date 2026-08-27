@@ -218,16 +218,26 @@ function transformSSE(deepseekStream: ReadableStream, model: string): ReadableSt
           controller.close();
         });
 
+        // LEV fork: Track whether any content has been emitted. DeepSeek
+        // sometimes sends FINISHED prematurely before any content arrives,
+        // causing a premature "stop" with 0 output tokens. If FINISHED
+        // arrives with no content, extend the drain window instead of
+        // closing immediately.
+        let hasEmittedContent = false;
+
         // Do not close *immediately* on FINISHED — DeepSeek may still send
         // search_results afterward. Drain briefly, then always emit
         // stop + [DONE] so clients do not hang if the upstream body stays open.
+        // LEV fork: use a longer initial drain (3s) when no content has been
+        // emitted yet, to give the upstream time to deliver the actual response.
         const { scheduleFinishAfterDrain, clearFinishedDrain, isDrainPending } =
-          createFinishedDrainScheduler(finishStream);
+          createFinishedDrainScheduler(finishStream, hasEmittedContent ? undefined : 5000);
 
         const sendByPath = (raw: string) => {
           const text = formatStreamContent(raw, streamModel);
           if (!text) return;
           ensureRole();
+          hasEmittedContent = true;
           let path = currentPath;
           if (!path && thinkingModel) path = "thinking";
           else if (!path && isSearchModel(streamModel)) path = "content";

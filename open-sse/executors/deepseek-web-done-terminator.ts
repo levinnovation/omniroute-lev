@@ -7,8 +7,13 @@
 // clients that wait for `data: [DONE]` after `finish_reason: stop`.
 
 /** How long to wait after DeepSeek `response/status=FINISHED` for trailing
- * search_results before closing the OpenAI-compatible SSE. */
-export const DEEPSEEK_FINISHED_DRAIN_MS = 750;
+ * search_results before closing the OpenAI-compatible SSE.
+ *
+ * LEV fork: increased from 750ms to 3000ms. DeepSeek sometimes sends
+ * FINISHED prematurely (before the actual content stream completes),
+ * causing the stream to close with 0 output tokens. The longer drain
+ * window gives the upstream body time to deliver remaining content. */
+export const DEEPSEEK_FINISHED_DRAIN_MS = 3000;
 
 /** Wraps a stream-finishing callback so it runs at most once and never
  * throws past a controller that the client already cancelled/closed. */
