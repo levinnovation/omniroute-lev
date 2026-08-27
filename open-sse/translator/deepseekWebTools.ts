@@ -452,7 +452,8 @@ function extractCall(
 //
 // Returns parsed calls + the byte ranges of the wrapper block, or null if
 // no tool calls were found.
-const TOOL_CALLS_WRAPPER_RE = /<tool_calls\b[^>]*>([\s\S]*?)<\/tool_calls>/i;
+// Handles both closed <tool_calls>...</tool_calls> and unclosed <tool_calls>...
+const TOOL_CALLS_WRAPPER_RE = /<tool_calls\b[^>]*>([\s\S]*?)(?:<\/tool_calls>|$)/i;
 
 // Match <tool_name>X</tool_name> to extract the tool name from DSML variants.
 const TOOL_NAME_CHILD_RE = /<tool_name\b[^>]*>([\s\S]*?)<\/tool_name>/i;
@@ -620,7 +621,13 @@ function parseToolCallsWrapper(
     }
   }
 
-  if (toolCalls.length === 0) return null;
+  if (toolCalls.length === 0) {
+    // LEV fork: Even though no valid tool calls were found inside the wrapper,
+    // we still strip the <tool_calls>...</tool_calls> tags so they don't
+    // appear in the output text and confuse the client's parser. The inner
+    // content is returned as plain text with no tool_calls.
+    return { toolCalls: [], ranges: [{ start: wrapperStart, end: wrapperEnd }] };
+  }
   return { toolCalls, ranges: [{ start: wrapperStart, end: wrapperEnd }] };
 }
 
