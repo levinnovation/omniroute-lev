@@ -10,6 +10,8 @@ export const huggingchatProvider: RegistryEntry = {
   baseUrl: "https://huggingface.co/chat/conversation",
   authType: "apikey",
   authHeader: "cookie",
+  // LEV fork: HuggingChat has a default context window of ~64K tokens.
+  defaultContextLength: 65536,
   models: [
     // Sweep 2026-06-30: final HuggingChat production catalog shortlist.
     // Only concrete provider/model entries are registered here; router entries are excluded.

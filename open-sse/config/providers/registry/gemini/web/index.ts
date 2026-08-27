@@ -8,6 +8,10 @@ export const gemini_webProvider: RegistryEntry = {
   baseUrl: "https://gemini.google.com/app",
   authType: "apikey",
   authHeader: "cookie",
+  // LEV fork: Gemini web chat has a large context window but not the full
+  // 1M of the API. Set a provider default so OmniRoute's context-window
+  // gate can enforce it.
+  defaultContextLength: 256000,
   // #9356: `supportsReasoning: false` is a live-behavior statement, not a guess
   // about the underlying Gemini model. The executor drives the gemini.google.com
   // web UI by typing a prompt, so it has no thinking-budget control to set and
@@ -22,18 +26,21 @@ export const gemini_webProvider: RegistryEntry = {
       name: "Gemini 3.1 Pro",
       toolCalling: false,
       supportsReasoning: false,
+      contextLength: 256000,
     },
     {
       id: "gemini-3.7-flash",
       name: "Gemini 3.7 Flash",
       toolCalling: false,
       supportsReasoning: false,
+      contextLength: 256000,
     },
     {
       id: "gemini-3.1-flash-lite",
       name: "Gemini 3.1 Flash-Lite",
       toolCalling: false,
       supportsReasoning: false,
+      contextLength: 256000,
     },
   ],
 };
