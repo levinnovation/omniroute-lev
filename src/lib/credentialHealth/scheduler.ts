@@ -40,6 +40,19 @@ const CONCURRENCY_LIMIT = 5; // Max simultaneous connection tests
 const LOG_PREFIX = "[CredentialHealth]";
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 
+// LEV fork: Web-cookie providers need more frequent health checks because
+// cookies/JWTs expire faster than API keys. The default 5-minute sweep is
+// too slow — an expired web session can serve empty responses for up to 5
+// minutes before the scheduler catches it.
+const WEB_PROVIDER_CHECK_INTERVAL_MS = 120_000; // 2 minutes for web-cookie providers
+const WEB_COOKIE_PROVIDERS = new Set([
+  "zai-web",
+  "gemini-web",
+  "deepseek-web",
+  "huggingchat",
+  "claude-web",
+]);
+
 // ── State (globalThis singleton) ──────────────────────────────────────────
 
 declare global {
@@ -99,10 +112,23 @@ function getSweepInterval(): number {
  * - `healthCheckInterval > 0` → minutes × 60 000 (per-connection override)
  * - `healthCheckInterval <= 0` → null (never test this connection — opt-out)
  * - absent → global env interval (getSweepInterval())
+ *
+ * LEV fork: web-cookie providers use a shorter default interval (2 min) since
+ * cookies/JWTs expire faster than API keys. An explicit per-connection
+ * healthCheckInterval still overrides this.
  */
-function getConnIntervalMs(conn: { healthCheckInterval?: number | null }): number | null {
+function getConnIntervalMs(conn: {
+  healthCheckInterval?: number | null;
+  provider?: string;
+}): number | null {
   const minutes = conn.healthCheckInterval;
-  if (minutes === null || minutes === undefined) return getSweepInterval();
+  if (minutes === null || minutes === undefined) {
+    // LEV fork: use the shorter web-provider interval for cookie-based providers
+    if (conn.provider && WEB_COOKIE_PROVIDERS.has(conn.provider)) {
+      return WEB_PROVIDER_CHECK_INTERVAL_MS;
+    }
+    return getSweepInterval();
+  }
   if (minutes <= 0) return null;
   return minutes * 60_000;
 }
