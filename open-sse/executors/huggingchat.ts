@@ -28,6 +28,9 @@ import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { buildErrorBody, sanitizeErrorMessage } from "../utils/error.ts";
 import { normalizeSessionCookieHeader } from "@/lib/providers/webCookieAuth";
 import { streamJsonlToOpenAi, readJsonlResponse } from "./huggingchat/jsonlStream.ts";
+// LEV fork: WebSessionDriver for robust session management
+import { WebSessionDriver } from "../services/webSessionDriver.ts";
+import { HUGGINGCHAT_SESSION_CONFIG } from "./huggingchat/sessionConfig.ts";
 
 const HUGGINGFACE_BASE = "https://huggingface.co";
 const CONVERSATION_URL = `${HUGGINGFACE_BASE}/chat/conversation`;
@@ -245,6 +248,9 @@ function mergeCookieHeaderWithSetCookie(cookieHeader: string, setCookieHeaders: 
 // -- Executor ----------------------------------------------------------------
 
 export class HuggingChatExecutor extends BaseExecutor {
+  // LEV fork: WebSessionDriver for pre-dispatch validation and stream watchdog.
+  private sessionDriver = new WebSessionDriver(HUGGINGCHAT_SESSION_CONFIG);
+
   constructor() {
     super("huggingchat", { id: "huggingchat", baseUrl: HUGGINGFACE_BASE });
   }
@@ -305,6 +311,27 @@ export class HuggingChatExecutor extends BaseExecutor {
             },
           }),
           { status: 401, headers: { "Content-Type": "application/json" } }
+        ),
+        url: CONVERSATION_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    }
+
+    // LEV fork: Pre-dispatch session validation.
+    const connectionId = `huggingchat-${cookieHeader.slice(0, 12)}`;
+    const sessionValid = await this.sessionDriver.validateSession(cookieHeader, connectionId);
+    if (!sessionValid) {
+      return {
+        response: new Response(
+          JSON.stringify({
+            error: {
+              message:
+                "HuggingChat session is expired or invalid. Re-authenticate via the dashboard.",
+              type: "auth_error",
+            },
+          }),
+          { status: 503, headers: { "Content-Type": "application/json" } }
         ),
         url: CONVERSATION_URL,
         headers: {},

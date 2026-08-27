@@ -22,6 +22,9 @@ import {
   checkGeminiWebUnsupportedControls,
   GEMINI_WEB_UNSUPPORTED_CONTROL_CODE,
 } from "./gemini-web/capabilities.ts";
+// LEV fork: WebSessionDriver for robust cookie-based session management
+import { WebSessionDriver } from "../services/webSessionDriver.ts";
+import { GEMINI_WEB_SESSION_CONFIG } from "./gemini-web/sessionConfig.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -411,6 +414,9 @@ function resolveGeminiWebCookie(credentials: ExecuteInput["credentials"]): strin
 // ─── Executor ───────────────────────────────────────────────────────────────
 
 export class GeminiWebExecutor extends BaseExecutor {
+  // LEV fork: WebSessionDriver for pre-dispatch validation and stream watchdog.
+  private sessionDriver = new WebSessionDriver(GEMINI_WEB_SESSION_CONFIG);
+
   constructor() {
     super("gemini-web", { id: "gemini-web", baseUrl: GEMINI_URL });
   }
@@ -505,6 +511,23 @@ export class GeminiWebExecutor extends BaseExecutor {
           status: 401,
           headers: { "Content-Type": "application/json" },
         }),
+        url: GEMINI_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    }
+
+    // LEV fork: Pre-dispatch session validation.
+    const connectionId = `gemini-web-${cookie.slice(0, 12)}`;
+    const sessionValid = await this.sessionDriver.validateSession(cookie, connectionId);
+    if (!sessionValid) {
+      return {
+        response: new Response(
+          JSON.stringify({
+            error: "Gemini web session is expired or invalid. Re-authenticate via the dashboard.",
+          }),
+          { status: 503, headers: { "Content-Type": "application/json" } }
+        ),
         url: GEMINI_URL,
         headers: {},
         transformedBody: body,

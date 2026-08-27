@@ -18,6 +18,9 @@ import {
   createFinishOnceGuard,
   createFinishedDrainScheduler,
 } from "./deepseek-web-done-terminator.ts";
+// LEV fork: WebSessionDriver for robust session management
+import { WebSessionDriver } from "../services/webSessionDriver.ts";
+import { DEEPSEEK_WEB_SESSION_CONFIG } from "./deepseek-web/sessionConfig.ts";
 
 export const DEEPSEEK_WEB_BASE = "https://chat.deepseek.com";
 const DEEPSEEK_API_BASE = `${DEEPSEEK_WEB_BASE}/api`;
@@ -566,11 +569,7 @@ export function messagesToPrompt(
   }
 
   const effectiveWindow =
-    historyWindow > 0
-      ? historyWindow
-      : conversation.length > 1
-        ? DEFAULT_AUTO_HISTORY_WINDOW
-        : 0;
+    historyWindow > 0 ? historyWindow : conversation.length > 1 ? DEFAULT_AUTO_HISTORY_WINDOW : 0;
 
   if (effectiveWindow > 0 && conversation.length > 1) {
     // Rolling-window transcript of the most recent turns (#2942, auto-applied per
@@ -847,6 +846,9 @@ function buildToolAwareResult(opts: {
 // ── Executor ─────────────────────────────────────────────────────────────
 
 export class DeepSeekWebExecutor extends BaseExecutor {
+  // LEV fork: WebSessionDriver for pre-dispatch validation and stream watchdog.
+  private sessionDriver = new WebSessionDriver(DEEPSEEK_WEB_SESSION_CONFIG);
+
   constructor() {
     super("deepseek-web", { baseUrl: DEEPSEEK_WEB_BASE });
   }
@@ -893,6 +895,21 @@ export class DeepSeekWebExecutor extends BaseExecutor {
           400,
           "Invalid credentials: paste your userToken from DeepSeek localStorage " +
             "(DevTools → Application → Local Storage → chat.deepseek.com → userToken)"
+        ),
+        url: COMPLETION_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    }
+
+    // LEV fork: Pre-dispatch session validation.
+    const connectionId = `deepseek-web-${userToken.slice(0, 12)}`;
+    const sessionValid = await this.sessionDriver.validateSession(userToken, connectionId);
+    if (!sessionValid) {
+      return {
+        response: errorResponse(
+          503,
+          "DeepSeek web session is expired or invalid. Re-authenticate via the dashboard."
         ),
         url: COMPLETION_URL,
         headers: {},

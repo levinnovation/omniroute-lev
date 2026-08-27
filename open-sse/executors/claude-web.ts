@@ -34,6 +34,9 @@ import {
 } from "./claude-web/session.ts";
 import { createClaudeWebResponse } from "./claude-web/stream.ts";
 import { isClaudeWebChallenge, sendClaudeWebDirect } from "./claude-web/transport.ts";
+// LEV fork: WebSessionDriver for robust session management
+import { WebSessionDriver } from "../services/webSessionDriver.ts";
+import { CLAUDE_WEB_SESSION_CONFIG } from "./claude-web/sessionConfig.ts";
 
 const CLAUDE_WEB_API_BASE = "https://claude.ai/api";
 const CLAUDE_WEB_ORGS_URL = `${CLAUDE_WEB_API_BASE}/organizations`;
@@ -331,6 +334,8 @@ async function errorResponseForTransport(
 export class ClaudeWebExecutor extends BaseExecutor {
   private readonly sendDirect: SendClaudeWebTransport;
   private readonly sendBrowser: SendClaudeWebTransport;
+  // LEV fork: WebSessionDriver for pre-dispatch validation and stream watchdog.
+  private sessionDriver = new WebSessionDriver(CLAUDE_WEB_SESSION_CONFIG);
 
   constructor(deps: ClaudeWebExecutorDeps = {}) {
     super("claude-web", { baseUrl: CLAUDE_WEB_API_BASE });
@@ -385,6 +390,20 @@ export class ClaudeWebExecutor extends BaseExecutor {
 
     const deviceId = readClaudeWebDeviceId(credentials);
     let organizationId = readClaudeWebOrganizationId(credentials);
+
+    // LEV fork: Pre-dispatch session validation.
+    const connectionId = `claude-web-${cookieHeader.slice(0, 12)}`;
+    const sessionValid = await this.sessionDriver.validateSession(cookieHeader, connectionId);
+    if (!sessionValid) {
+      return makeExecutionResult(
+        makeErrorResponse(
+          503,
+          "Claude web session is expired or invalid. Re-authenticate via the dashboard."
+        ),
+        initialAuditBody
+      );
+    }
+
     if (!organizationId) {
       const resolution = await getOrganizationId(cookieHeader, deviceId, signal);
       organizationId = resolution.organizationId ?? undefined;
