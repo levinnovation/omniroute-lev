@@ -624,6 +624,67 @@ function parseToolCallsWrapper(
   return { toolCalls, ranges: [{ start: wrapperStart, end: wrapperEnd }] };
 }
 
+// LEV fork: Parse bare JSON tool calls (no XML tags at all).
+// DeepSeek-web sometimes emits tool calls as bare JSON objects on their own,
+// without any <tool> or <tool_calls> wrapper:
+//   {"name": "Shell", "arguments": {"command": "git status"}}
+//   {"name": "Read", "arguments": {"path": "/some/file.ts"}}
+// Each JSON object with a "name" (or "command") field and an "arguments"
+// (or "parameters") field is treated as a tool call.
+const BARE_JSON_TOOL_RE =
+  /\{[^{}]*"(?:name|command|tool_name|tool)"\s*:\s*"(?:[^"\\]|\\.)*"[^{}]*\}/g;
+
+function parseBareJsonToolCalls(
+  text: string,
+  idSeed: string,
+  requested: RequestedToolName[]
+): { content: string; toolCalls: OpenAIToolCall[] | null } {
+  const toolCalls: OpenAIToolCall[] = [];
+  const acceptedRanges: Array<{ start: number; end: number }> = [];
+
+  BARE_JSON_TOOL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  let idx = 0;
+
+  while ((m = BARE_JSON_TOOL_RE.exec(text)) !== null) {
+    const raw = m[0];
+    const parsed = parseLooseJsonObject(raw);
+    if (!parsed) continue;
+
+    const emittedName =
+      (typeof parsed.name === "string" ? parsed.name : null) ??
+      (typeof parsed.command === "string" ? parsed.command : null) ??
+      (typeof parsed.tool_name === "string" ? parsed.tool_name : null) ??
+      (typeof parsed.tool === "string" ? parsed.tool : null);
+    if (!emittedName) continue;
+
+    const name = resolveRequestedToolName(emittedName, requested) || emittedName;
+    const args =
+      parsed.arguments !== undefined
+        ? parsed.arguments
+        : parsed.parameters !== undefined
+          ? parsed.parameters
+          : parsed.args !== undefined
+            ? parsed.args
+            : {};
+
+    toolCalls.push({
+      id: `${idSeed}_${idx++}`,
+      type: "function",
+      function: {
+        name,
+        arguments: typeof args === "string" ? args : JSON.stringify(args),
+      },
+    });
+    acceptedRanges.push({ start: m.index, end: m.index + raw.length });
+  }
+
+  if (toolCalls.length === 0) {
+    return { content: text, toolCalls: null };
+  }
+  return { content: stripRanges(text, acceptedRanges), toolCalls };
+}
+
 /**
  * Parse a DeepSeek-web text reply into OpenAI `tool_calls`. Returns the surrounding text with the recognized blocks stripped (so it can
  * still be streamed to the client) plus the parsed calls, or `null` when none are present.
@@ -642,8 +703,13 @@ export function parseDeepSeekToolCalls(
 
   const tokens = tokenizeToolTags(text);
   if (tokens.length === 0) {
-    // No DeepSeek-specific tags — defer to the proven canonical parser (bare JSON, etc.).
-    return parseToolCallsFromText(text, idSeed, requestedTools);
+    // No DeepSeek-specific tags — try the canonical parser first (handles
+    // <tool> and <tool_call> tags if present but missed by tokenizer), then fall
+    // back to bare-JSON detection for unwrapped JSON tool calls.
+    const canonical = parseToolCallsFromText(text, idSeed, requestedTools);
+    if (canonical.toolCalls && canonical.toolCalls.length > 0) return canonical;
+    const requested = getRequestedToolNames(requestedTools);
+    return parseBareJsonToolCalls(text, idSeed, requested);
   }
 
   const requested = getRequestedToolNames(requestedTools);
