@@ -427,15 +427,35 @@ function extractCall(
 
 // ── Public parser ─────────────────────────────────────────────────────────────
 
-// LEV fork: Parse the <tool_calls> wrapper format where each child element's
-// tag name is the tool name and grandchildren are parameters:
+// LEV fork: Parse the <tool_calls> wrapper format. DeepSeek-web emits several
+// variants of tool-call wrappers that the standard <tool> block parser can't
+// handle. This function deals with all of them:
+//
+// Variant 1 — child element tag = tool name, grandchildren = parameters:
 //   <tool_calls>
 //     <glob><glob_pattern>...</glob_pattern></glob>
-//     <shell><command>...</command></shell>
 //   </tool_calls>
+//
+// Variant 2 — DSML hybrid wrapper with <tool_name> child + JSON body:
+//   <tool_calls>
+//     <｜｜DSML｜｜ybridPLUGIN_tool_call xmlns="...">
+//       <tool_name>Shell</tool_name>
+//       {"command": "git status"}
+//     </｜｜DSML｜｜ybridPLUGIN_tool_call>
+//   </tool_calls>
+//
+// Variant 3 — direct <tool_name> + JSON body, no outer per-call wrapper:
+//   <tool_calls>
+//     <tool_name>Shell</tool_name>
+//     {"command": "git status"}
+//   </tool_calls>
+//
 // Returns parsed calls + the byte ranges of the wrapper block, or null if
-// no child tool elements were found.
+// no tool calls were found.
 const TOOL_CALLS_WRAPPER_RE = /<tool_calls\b[^>]*>([\s\S]*?)<\/tool_calls>/i;
+
+// Match <tool_name>X</tool_name> to extract the tool name from DSML variants.
+const TOOL_NAME_CHILD_RE = /<tool_name\b[^>]*>([\s\S]*?)<\/tool_name>/i;
 
 function parseToolCallsWrapper(
   text: string,
@@ -450,53 +470,53 @@ function parseToolCallsWrapper(
   const wrapperEnd = wrapperMatch.index + wrapperMatch[0].length;
   const inner = wrapperMatch[1];
 
-  // Find all child elements: <tagname ...>content</tagname>
-  // Each child element is a tool call where tagname = tool name and
-  // child elements inside it = parameters.
-  const childElementRe = /<([A-Za-z_][A-Za-z0-9_.-]*)\b([^>]*?)>([\s\S]*?)<\/\1>/g;
   const toolCalls: OpenAIToolCall[] = [];
-  let m: RegExpExecArray | null;
   let idx = 0;
 
-  while ((m = childElementRe.exec(inner)) !== null) {
-    const childTag = m[1];
-    const childInner = m[3];
+  // Strategy 1: Look for <tool_name> tags inside the wrapper (handles DSML
+  // hybrid and direct tool_name variants). Each <tool_name> identifies a tool
+  // call; the JSON arguments follow the closing </tool_name> tag.
+  const toolNameRe = /<tool_name\b[^>]*>([\s\S]*?)<\/tool_name>/gi;
+  let tnMatch: RegExpExecArray | null;
+  const toolNamePositions: Array<{ name: string; argsStart: number }> = [];
 
-    // Resolve tool name from the child tag name
-    const resolved = resolveRequestedToolName(childTag, requested);
-    const name = resolved || childTag;
+  while ((tnMatch = toolNameRe.exec(inner)) !== null) {
+    const rawName = tnMatch[1].trim();
+    const resolved = resolveRequestedToolName(rawName, requested);
+    const name = resolved || rawName;
+    toolNamePositions.push({ name, argsStart: toolNameRe.lastIndex });
+  }
 
-    // Try to extract arguments from the child's inner content:
-    // 1. If it's JSON, use that
-    // 2. If it has child elements, treat each as a parameter (key=tag, value=text)
-    // 3. If it's plain text, try to use it as a single argument
-    const trimmedInner = childInner.trim();
-    let argsValue: unknown;
+  if (toolNamePositions.length > 0) {
+    for (let i = 0; i < toolNamePositions.length; i++) {
+      const { name, argsStart } = toolNamePositions[i];
+      // Arguments go from after </tool_name> to the next <tool_name> or end of wrapper
+      const argsEnd =
+        i + 1 < toolNamePositions.length ? inner.indexOf("<tool_name", argsStart) : inner.length;
+      const argsText = argsEnd > argsStart ? inner.slice(argsStart, argsEnd).trim() : "";
 
-    const jsonParsed = parseLooseJsonObject(trimmedInner);
-    if (jsonParsed) {
-      argsValue = jsonParsed;
-    } else {
-      // Extract child elements as parameters
-      const paramRe = /<([A-Za-z_][A-Za-z0-9_.-]*)\b[^>]*>([\s\S]*?)<\/\1>/g;
-      const params: Record<string, unknown> = {};
-      let pm: RegExpExecArray | null;
-      let paramFound = false;
-      while ((pm = paramRe.exec(childInner)) !== null) {
-        params[pm[1]] = pm[2].trim();
-        paramFound = true;
-      }
-      if (paramFound) {
-        argsValue = params;
-      } else if (trimmedInner) {
-        // Single text value — try to find a matching schema key
-        if (schemaMap && schemaMap.has(name)) {
+      let argsValue: unknown;
+      const jsonParsed = parseLooseJsonObject(argsText);
+      if (jsonParsed) {
+        argsValue = jsonParsed;
+      } else if (argsText) {
+        // Try to extract child elements as parameters
+        const paramRe = /<([A-Za-z_][A-Za-z0-9_.-]*)\b[^>]*>([\s\S]*?)<\/\1>/g;
+        const params: Record<string, unknown> = {};
+        let pm: RegExpExecArray | null;
+        let paramFound = false;
+        while ((pm = paramRe.exec(argsText)) !== null) {
+          params[pm[1]] = pm[2].trim();
+          paramFound = true;
+        }
+        if (paramFound) {
+          argsValue = params;
+        } else if (schemaMap && schemaMap.has(name)) {
           const keys = schemaMap.get(name)!;
           if (keys.size === 1) {
             const [onlyKey] = keys;
-            argsValue = { [onlyKey]: trimmedInner };
+            argsValue = { [onlyKey]: argsText };
           } else {
-            // Find a key that looks like a primary input (command, content, query, input, pattern, etc.)
             const preferredKeys = [
               "command",
               "content",
@@ -508,24 +528,96 @@ function parseToolCallsWrapper(
               "text",
             ];
             const matchKey = preferredKeys.find((k) => keys.has(k));
-            argsValue = matchKey ? { [matchKey]: trimmedInner } : { input: trimmedInner };
+            argsValue = matchKey ? { [matchKey]: argsText } : { input: argsText };
           }
         } else {
-          argsValue = { input: trimmedInner };
+          argsValue = { input: argsText };
         }
       } else {
         argsValue = {};
       }
-    }
 
-    toolCalls.push({
-      id: `${idSeed}_${idx++}`,
-      type: "function",
-      function: {
-        name,
-        arguments: typeof argsValue === "string" ? argsValue : JSON.stringify(argsValue),
-      },
-    });
+      toolCalls.push({
+        id: `${idSeed}_${idx++}`,
+        type: "function",
+        function: {
+          name,
+          arguments: typeof argsValue === "string" ? argsValue : JSON.stringify(argsValue),
+        },
+      });
+    }
+  }
+
+  // Strategy 2: If no <tool_name> tags found, try child elements where the
+  // tag name IS the tool name (variant 1).
+  if (toolCalls.length === 0) {
+    const childElementRe = /<([A-Za-z_][A-Za-z0-9_.-]*)\b([^>]*?)>([\s\S]*?)<\/\1>/g;
+    let m: RegExpExecArray | null;
+
+    while ((m = childElementRe.exec(inner)) !== null) {
+      const childTag = m[1];
+      const childInner = m[3];
+
+      // Skip if this child contains <tool_name> — already handled by strategy 1
+      if (TOOL_NAME_CHILD_RE.test(childInner)) continue;
+
+      const resolved = resolveRequestedToolName(childTag, requested);
+      const name = resolved || childTag;
+
+      const trimmedInner = childInner.trim();
+      let argsValue: unknown;
+
+      const jsonParsed = parseLooseJsonObject(trimmedInner);
+      if (jsonParsed) {
+        argsValue = jsonParsed;
+      } else {
+        const paramRe = /<([A-Za-z_][A-Za-z0-9_.-]*)\b[^>]*>([\s\S]*?)<\/\1>/g;
+        const params: Record<string, unknown> = {};
+        let pm: RegExpExecArray | null;
+        let paramFound = false;
+        while ((pm = paramRe.exec(childInner)) !== null) {
+          params[pm[1]] = pm[2].trim();
+          paramFound = true;
+        }
+        if (paramFound) {
+          argsValue = params;
+        } else if (trimmedInner) {
+          if (schemaMap && schemaMap.has(name)) {
+            const keys = schemaMap.get(name)!;
+            if (keys.size === 1) {
+              const [onlyKey] = keys;
+              argsValue = { [onlyKey]: trimmedInner };
+            } else {
+              const preferredKeys = [
+                "command",
+                "content",
+                "query",
+                "input",
+                "pattern",
+                "path",
+                "code",
+                "text",
+              ];
+              const matchKey = preferredKeys.find((k) => keys.has(k));
+              argsValue = matchKey ? { [matchKey]: trimmedInner } : { input: trimmedInner };
+            }
+          } else {
+            argsValue = { input: trimmedInner };
+          }
+        } else {
+          argsValue = {};
+        }
+      }
+
+      toolCalls.push({
+        id: `${idSeed}_${idx++}`,
+        type: "function",
+        function: {
+          name,
+          arguments: typeof argsValue === "string" ? argsValue : JSON.stringify(argsValue),
+        },
+      });
+    }
   }
 
   if (toolCalls.length === 0) return null;
