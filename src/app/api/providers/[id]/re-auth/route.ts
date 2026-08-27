@@ -8,7 +8,7 @@
  * and returns a session ID for subsequent screenshot/command calls.
  */
 import { NextResponse } from "next/server";
-import { getCachedProviderConnectionById } from "@/lib/db/providers";
+import { getCachedProviderConnectionById } from "@/lib/db/readCache";
 import {
   startReAuthSession,
   RE_AUTH_CONFIGS,

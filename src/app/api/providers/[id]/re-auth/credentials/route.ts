@@ -12,7 +12,8 @@ import {
   getExtractedCredentials,
   cleanupSession,
 } from "@omniroute/open-sse/services/reAuthBrowserManager.ts";
-import { getCachedProviderConnectionById, updateProviderConnection } from "@/lib/db/providers";
+import { getCachedProviderConnectionById } from "@/lib/db/readCache";
+import { updateProviderConnection } from "@/lib/db/providers";
 import { __clearSessionHealthCacheForTest } from "@omniroute/open-sse/services/webSessionDriver.ts";
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
