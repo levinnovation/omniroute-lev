@@ -55,6 +55,9 @@ import {
   makeExecutorErrorResult as makeErrorResult,
   sanitizeErrorMessage,
 } from "../utils/error.ts";
+// LEV fork: WebSessionDriver for robust cookie-based session management
+import { WebSessionDriver } from "../services/webSessionDriver.ts";
+import { ZAI_WEB_SESSION_CONFIG } from "./zai-web/sessionConfig.ts";
 
 export {
   buildZaiSignature,
@@ -270,6 +273,10 @@ function resolveZaiRequest(
 }
 
 export class ZaiWebExecutor extends BaseExecutor {
+  // LEV fork: WebSessionDriver for pre-dispatch validation, stream watchdog,
+  // empty-content detection, and login-redirect detection.
+  private sessionDriver = new WebSessionDriver(ZAI_WEB_SESSION_CONFIG);
+
   constructor() {
     super("zai-web", { id: "zai-web", baseUrl: ZAI_BASE_URL });
   }
@@ -536,6 +543,21 @@ export class ZaiWebExecutor extends BaseExecutor {
     const request = resolved.request;
     const { imageUrls, messages, modelId, thinkingConfig, token, vlmConfig } = request;
 
+    // LEV fork: Pre-dispatch session validation.
+    // Refuse to route to a dead session instead of producing a silent 200
+    // with content: null (the #1 user-facing bug).
+    // The connectionId is derived from the token hash for cache keying.
+    const connectionId = `zai-web-${token.slice(0, 12)}`;
+    const sessionValid = await this.sessionDriver.validateSession(token, connectionId);
+    if (!sessionValid) {
+      return makeErrorResult(
+        503,
+        "Z.ai web session is expired or invalid. Re-authenticate via the dashboard's provider connection settings.",
+        body,
+        ZAI_CHAT_URL
+      );
+    }
+
     const useSignedApi = Boolean(request.captchaVerifyParam) && imageUrls.length === 0;
     const fetched = useSignedApi
       ? await this.fetchViaSignedApi(request, input)
@@ -558,7 +580,25 @@ export class ZaiWebExecutor extends BaseExecutor {
       upstream.body ?? new ReadableStream({ start: (controller) => controller.close() });
     const emitChunk = makeZaiChunkEmitter(id, created, modelId);
     if (wantStream) {
-      const outStream = buildZaiStreamingBody(sourceBody, emitChunk, signal);
+      let outStream = buildZaiStreamingBody(sourceBody, emitChunk, signal);
+      // LEV fork: Wrap the stream with a watchdog that detects empty/truncated
+      // responses — the exact bug where zai-web returned content: null with
+      // completion_tokens: 0 and HTTP 200.
+      outStream = this.sessionDriver.withStreamWatchdog(outStream, {
+        connectionId,
+        onTimeout: () => {
+          this.sessionDriver.markExpired(
+            connectionId,
+            "Stream watchdog: no content received within timeout"
+          );
+        },
+        onEmptyStream: () => {
+          this.sessionDriver.markExpired(
+            connectionId,
+            "Stream completed with no content — session is likely expired"
+          );
+        },
+      });
       return {
         response: new Response(outStream, {
           headers: {
@@ -583,6 +623,25 @@ export class ZaiWebExecutor extends BaseExecutor {
       );
       return makeErrorResult(502, `Z.ai stream failed: ${message}`, body, ZAI_CHAT_URL);
     }
+
+    // LEV fork: Empty-content detection for non-streaming responses.
+    // If the upstream returned an empty answer, the session is likely expired.
+    if (!answer && !reasoning) {
+      this.sessionDriver.markExpired(
+        connectionId,
+        "Non-streaming response had empty content and reasoning — session is likely expired"
+      );
+      return makeErrorResult(
+        503,
+        "Z.ai web session returned an empty response — the session is likely expired. Re-authenticate via the dashboard.",
+        body,
+        ZAI_CHAT_URL
+      );
+    }
+
+    // LEV fork: Mark the session as healthy after a successful completion.
+    this.sessionDriver.markHealthy(connectionId);
+
     const message: Record<string, unknown> = { role: "assistant", content: answer };
     if (reasoning) message.reasoning_content = reasoning;
     const completion = {
