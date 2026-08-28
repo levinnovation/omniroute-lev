@@ -149,6 +149,10 @@ import { ensureStreamReadiness } from "../utils/streamReadiness.ts";
 import { resolveSuppressThinkClose, THINKING_MARKER_HEADER } from "../utils/thinkCloseMarker.ts";
 import { resolveStreamReadinessTimeout } from "../utils/streamReadinessPolicy.ts";
 import { resolveAgentGoalPolicy } from "../utils/agentGoalPolicy.ts";
+import {
+  needsPreGateTruncation,
+  truncateMessagesForWebProvider,
+} from "../utils/webProviderMessageTruncation.ts";
 import { createStreamController } from "../utils/streamHandler.ts";
 import * as streamFailure from "../utils/streamFailureFinalization.ts";
 import { createSseHeartbeatTransform, shapeForClientFormat } from "../utils/sseHeartbeat.ts";
@@ -1293,6 +1297,36 @@ export async function handleChatCore({
   // further down — see #8378 (context limit resolved by the combo was silently
   // discarded because it only existed inside this `if` block).
   let contextLimit = getTokenLimit(provider, effectiveModel);
+  // LEV fork: Pre-gate message truncation for web-cookie providers with small
+  // effective context windows (e.g. perplexity-web at 40K tokens). Without this,
+  // large Cursor requests (280K+ tokens) are rejected by the context window gate
+  // before the executor's own truncation can run. This trims the messages in-place
+  // so the estimated token count fits within the provider's context limit.
+  if (
+    body &&
+    Array.isArray(allMessages) &&
+    allMessages.length > 0 &&
+    needsPreGateTruncation(provider) &&
+    body.messages &&
+    Array.isArray(body.messages)
+  ) {
+    const beforeTokens = estimateTokens(body.messages);
+    if (beforeTokens > contextLimit) {
+      const truncated = truncateMessagesForWebProvider(
+        body.messages as Array<Record<string, unknown>>,
+        contextLimit
+      );
+      body.messages = truncated;
+      allMessages.length = 0;
+      allMessages.push(...truncated);
+      const afterTokens = estimateTokens(body.messages);
+      log?.info?.(
+        "CONTEXT",
+        `Pre-gate truncation for ${provider}: ${beforeTokens} → ${afterTokens} tokens ` +
+          `(limit ${contextLimit}, ${truncated.length} messages retained)`
+      );
+    }
+  }
   if (body && Array.isArray(allMessages) && allMessages.length > 0) {
     let estimatedTokens = estimateTokens(allMessages);
     const compressionSettingsResult = await resolveCompressionSettings(log);

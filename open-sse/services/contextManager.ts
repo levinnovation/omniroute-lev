@@ -36,6 +36,7 @@ const WEB_COOKIE_PROVIDERS = new Set([
   "gemini-web",
   "huggingchat",
   "claude-web",
+  "perplexity-web",
 ]);
 
 function getEnvOverride(provider: string): number | null {

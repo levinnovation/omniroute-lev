@@ -8,6 +8,12 @@ export const perplexity_webProvider: RegistryEntry = {
   baseUrl: "https://www.perplexity.ai/rest/sse/perplexity_ask",
   authType: "apikey",
   authHeader: "cookie",
+  // LEV fork: Perplexity's web chat has a much smaller effective input limit than
+  // the 128K default. Without this, OmniRoute's pre-flight context gate rejects
+  // large Cursor requests (280K+ tokens) with "Input exceeds context window"
+  // before the executor's own truncation can run. 40K tokens is generous enough
+  // for coding-agent context but within Perplexity's actual web API limit.
+  defaultContextLength: 40_000,
   models: [
     { id: "pplx-auto", name: "Perplexity Best", toolCalling: false },
     { id: "pplx-sonar", name: "Sonar 2 (via Perplexity)", toolCalling: false },
