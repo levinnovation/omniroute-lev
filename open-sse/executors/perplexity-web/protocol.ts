@@ -313,10 +313,17 @@ export function parseOpenAIMessages(messages: Array<Record<string, unknown>>): P
   // Assistant messages are excluded from the fold because Perplexity's web
   // API doesn't support multi-turn conversations via dsl_query — only the
   // user's accumulated context matters.
+  //
+  // The actual user query is placed FIRST, then the context block is appended.
+  // This is critical because dsl_query is truncated at MAX_DSL_LEN (16K chars)
+  // with slice(0, N) — keeping the beginning and dropping the end. If the
+  // context block were prepended, the large IDE context (user_info, git_status,
+  // agent_transcripts, rules) would push the actual user query past the
+  // truncation point, causing Perplexity to never see the real question.
   const precedingUserMsgs = history.filter((h) => h.role === "user");
   if (precedingUserMsgs.length > 0 && currentMsg) {
     const contextBlock = precedingUserMsgs.map((m) => m.content).join("\n\n");
-    currentMsg = `${contextBlock}\n\n${currentMsg}`;
+    currentMsg = `${currentMsg}\n\n--- IDE context ---\n${contextBlock}`;
   }
 
   return { systemMsg, history, currentMsg };

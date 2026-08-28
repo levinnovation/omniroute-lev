@@ -181,6 +181,14 @@ test("PPLX parseOpenAIMessages folds preceding user messages into currentMsg", a
     parsed.currentMsg.includes("git_status"),
     "currentMsg should contain the Cursor IDE context (git_status)"
   );
+  // The actual query must come BEFORE the context block so that dsl_query
+  // truncation (slice(0, MAX_DSL_LEN)) preserves the query, not the context.
+  const queryIdx = parsed.currentMsg.indexOf("Fix the crash");
+  const contextIdx = parsed.currentMsg.indexOf("user_info");
+  assert.ok(
+    queryIdx < contextIdx,
+    "Actual user query should come before IDE context in currentMsg (truncation safety)"
+  );
 });
 
 test("PPLX parseOpenAIMessages handles single user message (no context to fold)", async () => {
