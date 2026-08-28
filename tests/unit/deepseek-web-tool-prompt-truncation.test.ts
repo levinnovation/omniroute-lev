@@ -83,7 +83,7 @@ test("buildToolConversationPrompt drops older turns when total prompt exceeds li
 
   const prompt = buildToolConversationPrompt(messages, "You are a coding agent.");
   // The prompt should be under the max limit
-  assert.ok(prompt.length <= 130_000, `Prompt should be under limit, got ${prompt.length} chars`);
+  assert.ok(prompt.length <= 90_000, `Prompt should be under limit, got ${prompt.length} chars`);
   // The most recent user message should still be present
   assert.ok(prompt.includes("final answer"), "Most recent user message should be preserved");
   // The system prompt should still be present

@@ -1157,7 +1157,12 @@ export class DeepSeekWebExecutor extends BaseExecutor {
         // read X" or "I'll check Y" and then stops without emitting a <tool>
         // block — killing the agent loop because no tool actually runs. When
         // we detect this pattern (content with intent phrases but no tool
-        // calls), retry once with a corrective nudge appended to the prompt.
+        // calls), retry once with a MINIMAL corrective prompt — not the full
+        // original prompt, which may already be near DeepSeek's token limit.
+        // Appending to the full prompt would push it over the edge and produce
+        // another empty response. Instead, we build a compact prompt that
+        // includes just the tool contract, the last user request, and the
+        // corrective instruction.
         if (
           (!toolCalls || toolCalls.length === 0) &&
           cleanedContent &&
@@ -1165,18 +1170,32 @@ export class DeepSeekWebExecutor extends BaseExecutor {
         ) {
           log?.warn?.(
             "DEEPSEEK-WEB",
-            "Narrated intent without tool block — retrying with corrective nudge"
+            "Narrated intent without tool block — retrying with minimal corrective prompt"
           );
           const retrySession = await createSession(accessToken, signal);
-          const correctivePrompt =
-            prompt +
-            "\n\n---\nIMPORTANT: Your previous response narrated intent to use a tool " +
-            '("' +
-            cleanedContent.slice(0, 120) +
-            '...") but did NOT emit a <tool> block. ' +
+          // Build a minimal prompt: tool contract + last user message + nudge.
+          // This avoids re-sending the entire (possibly oversized) trajectory.
+          const lastUserMsg = messages.filter((m) => m.role === "user").pop();
+          const lastUserText = lastUserMsg
+            ? typeof lastUserMsg.content === "string"
+              ? lastUserMsg.content
+              : Array.isArray(lastUserMsg.content)
+                ? (lastUserMsg.content as Array<{ type?: string; text?: string }>)
+                    .filter((p) => p?.type === "text")
+                    .map((p) => p?.text ?? "")
+                    .join("\n")
+                : ""
+            : "";
+          const minimalRetryPrompt =
+            toolSystemPrompt +
+            "\n\n---\nPrevious task context (last user request):\n" +
+            lastUserText.slice(0, 8_000) +
+            '\n\n---\nIMPORTANT: Your previous response was: "' +
+            cleanedContent.slice(0, 200) +
+            '" — you narrated intent to use a tool but did NOT emit a <tool> block. ' +
             "You MUST emit the <tool> block NOW. Do not describe what you will do — " +
             'do it by outputting the <tool>{"name": ..., "arguments": ..., "_nonce": ...}</tool> block immediately.';
-          const retryResp = await performCompletion(retrySession, correctivePrompt);
+          const retryResp = await performCompletion(retrySession, minimalRetryPrompt);
           deleteSessionOnDeepSeek(accessToken, retrySession).catch(() => {});
           if (retryResp.resp.ok) {
             const retryResult = await collectSSEContent(retryResp.resp.body!, clientModel);

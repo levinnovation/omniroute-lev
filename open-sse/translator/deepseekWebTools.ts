@@ -146,7 +146,9 @@ export function buildToolConversationPrompt(
   // exceeds DeepSeek's limit and the API returns an empty response
   // (content: null, completion_tokens: 0), killing the agent loop.
   const MAX_TOOL_RESULT_LEN = 4_000;
-  const MAX_PROMPT_LEN = 120_000; // ~30K tokens, conservative for DeepSeek web
+  const MAX_PROMPT_LEN = 80_000; // ~20K tokens — DeepSeek-web's effective limit is ~32K
+  // tokens, but Cursor's system prompt + tool definitions alone consume ~15K tokens,
+  // leaving only ~17K for conversation history. 80K chars is a safe ceiling.
 
   const truncateToolResult = (text: string): string => {
     if (text.length <= MAX_TOOL_RESULT_LEN) return text;
