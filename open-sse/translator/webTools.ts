@@ -347,7 +347,12 @@ export function toArgumentsString(value: unknown): string {
   if (value === undefined) return "{}";
   if (typeof value === "string") {
     const parsed = parseLooseJsonObject(value);
-    return parsed ? JSON.stringify(parsed) : value;
+    // LEV fork: if the arguments string can't be parsed as valid JSON, return
+    // "{}" instead of the raw string. A truncated/malformed arguments string
+    // causes the client (Cursor) to crash with "Unterminated string in JSON"
+    // and then confuses the model in subsequent turns when the malformed tool
+    // call is sent back in the conversation history.
+    return parsed ? JSON.stringify(parsed) : "{}";
   }
   try {
     return JSON.stringify(value);

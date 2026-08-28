@@ -145,8 +145,27 @@ export function buildToolConversationPrompt(
       for (const c of calls) {
         const name = typeof c?.function?.name === "string" ? c.function.name : "";
         const rawArgs = c?.function?.arguments;
-        const args =
-          typeof rawArgs === "string" && rawArgs ? rawArgs : JSON.stringify(rawArgs ?? {});
+        // LEV fork: validate arguments JSON before embedding in the <tool> block.
+        // Malformed arguments (e.g., truncated JSON from a previous turn) produce
+        // invalid <tool> blocks that confuse DeepSeek-web and cause it to return
+        // empty responses (content: null, completion_tokens: 0).
+        let args = "{}";
+        if (typeof rawArgs === "string" && rawArgs) {
+          try {
+            JSON.parse(rawArgs);
+            args = rawArgs;
+          } catch {
+            // Arguments are not valid JSON — use empty object instead of
+            // embedding malformed JSON that would confuse the model.
+            args = "{}";
+          }
+        } else if (rawArgs && typeof rawArgs === "object") {
+          try {
+            args = JSON.stringify(rawArgs);
+          } catch {
+            args = "{}";
+          }
+        }
         if (c?.id) callNameById.set(c.id, name);
         parts.push(`<tool>{"name": ${JSON.stringify(name)}, "arguments": ${args}}</tool>`);
         sawToolActivity = true;
@@ -543,7 +562,7 @@ function parseToolCallsWrapper(
         type: "function",
         function: {
           name,
-          arguments: typeof argsValue === "string" ? argsValue : JSON.stringify(argsValue),
+          arguments: safeArgsString(argsValue),
         },
       });
     }
@@ -615,7 +634,7 @@ function parseToolCallsWrapper(
         type: "function",
         function: {
           name,
-          arguments: typeof argsValue === "string" ? argsValue : JSON.stringify(argsValue),
+          arguments: safeArgsString(argsValue),
         },
       });
     }
@@ -653,6 +672,27 @@ const TOOL_CODE_FENCE_RE = /```tool(?:_calls)?\s*\n([\s\S]*?)(?:\n```|$)/gi;
 // but the fence itself wasn't stripped. They confuse both the client and
 // the model in subsequent turns.
 const EMPTY_TOOL_FENCE_RE = /```tool(?:_calls)?\s*\n?```/gi;
+
+// LEV fork: Safely serialize tool call arguments to a valid JSON string.
+// If the args are a string that's not valid JSON (e.g., truncated from the
+// model's response), wrap it in a {raw: ...} object instead of passing it
+// through — malformed arguments crash the client and confuse the model in
+// subsequent turns.
+function safeArgsString(args: unknown): string {
+  if (typeof args === "string") {
+    try {
+      JSON.parse(args);
+      return args;
+    } catch {
+      return JSON.stringify({ raw: args });
+    }
+  }
+  try {
+    return JSON.stringify(args ?? {});
+  } catch {
+    return "{}";
+  }
+}
 
 function parseBareJsonToolCalls(
   text: string,
@@ -699,7 +739,7 @@ function parseBareJsonToolCalls(
       type: "function",
       function: {
         name,
-        arguments: typeof args === "string" ? args : JSON.stringify(args),
+        arguments: safeArgsString(args),
       },
     });
     acceptedRanges.push({ start: fenceStart, end: fenceEnd });
@@ -739,7 +779,7 @@ function parseBareJsonToolCalls(
       type: "function",
       function: {
         name,
-        arguments: typeof args === "string" ? args : JSON.stringify(args),
+        arguments: safeArgsString(args),
       },
     });
     acceptedRanges.push({ start: m.index, end: m.index + raw.length });
