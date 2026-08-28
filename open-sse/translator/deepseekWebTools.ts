@@ -641,6 +641,19 @@ function parseToolCallsWrapper(
 const BARE_JSON_TOOL_RE =
   /\{[^{}]*"(?:name|command|tool_name|tool)"\s*:\s*"(?:[^"\\]|\\.)*"[^{}]*\}/g;
 
+// LEV fork: Match markdown code fences wrapping tool call JSON:
+//   ```tool
+//   {"name": "Shell", "arguments": {"command": "git status"}}
+//   ```
+// Also matches ```tool_calls variant and unclosed fences.
+const TOOL_CODE_FENCE_RE = /```tool(?:_calls)?\s*\n([\s\S]*?)(?:\n```|$)/gi;
+
+// LEV fork: Strip any remaining empty ```tool or ```tool_calls code fences
+// from the content. These are left behind when the JSON inside was extracted
+// but the fence itself wasn't stripped. They confuse both the client and
+// the model in subsequent turns.
+const EMPTY_TOOL_FENCE_RE = /```tool(?:_calls)?\s*\n?```/gi;
+
 function parseBareJsonToolCalls(
   text: string,
   idSeed: string,
@@ -649,11 +662,57 @@ function parseBareJsonToolCalls(
   const toolCalls: OpenAIToolCall[] = [];
   const acceptedRanges: Array<{ start: number; end: number }> = [];
 
-  BARE_JSON_TOOL_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
+  // Strategy 1: Match markdown code fences wrapping tool call JSON.
+  // This must run before bare JSON detection so the entire fence (not just
+  // the JSON) gets stripped from the content.
+  TOOL_CODE_FENCE_RE.lastIndex = 0;
+  let fenceMatch: RegExpExecArray | null;
   let idx = 0;
 
+  while ((fenceMatch = TOOL_CODE_FENCE_RE.exec(text)) !== null) {
+    const fenceStart = fenceMatch.index;
+    const fenceEnd = fenceMatch.index + fenceMatch[0].length;
+    const jsonText = fenceMatch[1].trim();
+
+    const parsed = parseLooseJsonObject(jsonText);
+    if (!parsed) continue;
+
+    const emittedName =
+      (typeof parsed.name === "string" ? parsed.name : null) ??
+      (typeof parsed.command === "string" ? parsed.command : null) ??
+      (typeof parsed.tool_name === "string" ? parsed.tool_name : null) ??
+      (typeof parsed.tool === "string" ? parsed.tool : null);
+    if (!emittedName) continue;
+
+    const name = resolveRequestedToolName(emittedName, requested) || emittedName;
+    const args =
+      parsed.arguments !== undefined
+        ? parsed.arguments
+        : parsed.parameters !== undefined
+          ? parsed.parameters
+          : parsed.args !== undefined
+            ? parsed.args
+            : {};
+
+    toolCalls.push({
+      id: `${idSeed}_${idx++}`,
+      type: "function",
+      function: {
+        name,
+        arguments: typeof args === "string" ? args : JSON.stringify(args),
+      },
+    });
+    acceptedRanges.push({ start: fenceStart, end: fenceEnd });
+  }
+
+  // Strategy 2: Match bare JSON objects (no code fence wrapper).
+  BARE_JSON_TOOL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+
   while ((m = BARE_JSON_TOOL_RE.exec(text)) !== null) {
+    // Skip if this JSON is already inside a code fence that was matched
+    if (acceptedRanges.some((r) => m!.index >= r.start && m!.index < r.end)) continue;
+
     const raw = m[0];
     const parsed = parseLooseJsonObject(raw);
     if (!parsed) continue;
@@ -687,9 +746,18 @@ function parseBareJsonToolCalls(
   }
 
   if (toolCalls.length === 0) {
+    // Even if no tool calls were found, strip any empty ```tool code fences
+    // so they don't confuse the client or the model in subsequent turns.
+    const stripped = text.replace(EMPTY_TOOL_FENCE_RE, "");
+    if (stripped !== text) {
+      return { content: stripped, toolCalls: null };
+    }
     return { content: text, toolCalls: null };
   }
-  return { content: stripRanges(text, acceptedRanges), toolCalls };
+  let content = stripRanges(text, acceptedRanges);
+  // Also strip any remaining empty tool code fences
+  content = content.replace(EMPTY_TOOL_FENCE_RE, "");
+  return { content, toolCalls };
 }
 
 /**
