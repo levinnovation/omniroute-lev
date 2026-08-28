@@ -797,6 +797,21 @@ function buildToolAwareResult(opts: {
         // Surrounding natural-language text (and reasoning) is emitted before the tool_calls
         // so a model reply that interleaves a plan with a call still reaches the client (#7).
         if (reasoningContent) emit(controller, { reasoning_content: reasoningContent }, null);
+        // LEV fork: Empty-content watchdog. If both content and tool calls are
+        // empty, DeepSeek returned nothing — likely because the prompt was too
+        // large or the session expired. Emit an error message instead of a
+        // silent empty response that kills the agent loop.
+        if (!content && !hasCalls) {
+          emit(
+            controller,
+            {
+              content:
+                "[DeepSeek error] Empty response from upstream — the prompt may be too large " +
+                "or the session may be expired. Try reducing context or re-authenticating.",
+            },
+            null
+          );
+        }
         if (content) emit(controller, { content }, null);
         if (hasCalls) {
           emit(
@@ -833,6 +848,11 @@ function buildToolAwareResult(opts: {
   if (hasCalls) {
     message.tool_calls = toolCalls;
     if (!content) message.content = null;
+  } else if (!content) {
+    // LEV fork: Empty-content watchdog for non-streaming tool path.
+    message.content =
+      "[DeepSeek error] Empty response from upstream — the prompt may be too large " +
+      "or the session may be expired. Try reducing context or re-authenticating.";
   }
   const openaiResponse = {
     id,

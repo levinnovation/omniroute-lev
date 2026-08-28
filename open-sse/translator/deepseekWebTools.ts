@@ -136,6 +136,22 @@ export function buildToolConversationPrompt(
   const callNameById = new Map<string, string>();
   let sawToolActivity = false;
 
+  // LEV fork: DeepSeek's web API has a limited input token budget (~64K tokens).
+  // Cursor agentic sessions replay the entire trajectory including large tool
+  // results (file contents, grep output, etc.). Without truncation, the prompt
+  // exceeds DeepSeek's limit and the API returns an empty response
+  // (content: null, completion_tokens: 0), killing the agent loop.
+  const MAX_TOOL_RESULT_LEN = 4_000;
+  const MAX_PROMPT_LEN = 120_000; // ~30K tokens, conservative for DeepSeek web
+
+  const truncateToolResult = (text: string): string => {
+    if (text.length <= MAX_TOOL_RESULT_LEN) return text;
+    return (
+      text.slice(0, MAX_TOOL_RESULT_LEN) +
+      `\n[...tool result truncated, ${text.length - MAX_TOOL_RESULT_LEN} chars omitted...]`
+    );
+  };
+
   for (const m of messages) {
     if (m.role === "system") {
       const t = extractText(m.content).trim();
@@ -188,7 +204,10 @@ export function buildToolConversationPrompt(
     } else if (m.role === "tool") {
       const t = extractText(m.content).trim();
       const name = (m.tool_call_id && callNameById.get(m.tool_call_id)) || m.name || "tool";
-      lines.push(`Tool result (${name}): ${t || "(no output)"}`);
+      // LEV fork: Truncate large tool results to prevent the total prompt from
+      // exceeding DeepSeek's input token limit, which causes empty responses.
+      const truncated = truncateToolResult(t || "(no output)");
+      lines.push(`Tool result (${name}): ${truncated}`);
       sawToolActivity = true;
     }
   }
@@ -204,7 +223,30 @@ export function buildToolConversationPrompt(
     );
   }
 
-  return parts.join("\n\n").replace(/!\[.*?\]\(.*?\)/g, "");
+  let result = parts.join("\n\n").replace(/!\[.*?\]\(.*?\)/g, "");
+
+  // LEV fork: If the total prompt still exceeds the limit, drop older turns
+  // from the beginning of the conversation (keep system prompt + most recent
+  // turns). This preserves the current task context while shedding old tool
+  // results that are less relevant.
+  if (result.length > MAX_PROMPT_LEN) {
+    const systemSection = systemParts.length ? systemParts.join("\n\n") : "";
+    const continuationHint = sawToolActivity
+      ? "Continue the task using the tool results above. Do NOT repeat tool calls that already succeeded; perform the next step or give the final answer."
+      : "";
+    // Keep the last N lines that fit within the budget
+    const budget = MAX_PROMPT_LEN - systemSection.length - continuationHint.length - 200;
+    const allLines = lines.join("\n\n");
+    if (allLines.length > budget) {
+      const keptLines = allLines.slice(-budget);
+      result = [systemSection, keptLines, continuationHint]
+        .filter(Boolean)
+        .join("\n\n")
+        .replace(/!\[.*?\]\(.*?\)/g, "");
+    }
+  }
+
+  return result;
 }
 
 // ── Tag tokenizer ────────────────────────────────────────────────────────────
