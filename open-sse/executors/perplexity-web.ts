@@ -433,8 +433,7 @@ export class PerplexityWebExecutor extends BaseExecutor {
       pplxMode,
       modelPref,
       followUpUuid,
-      requestId,
-      parsed.systemMsg
+      requestId
     );
 
     const headers: Record<string, string> = {

@@ -315,8 +315,7 @@ export function buildPplxRequestBody(
   mode: string,
   modelPref: string,
   followUpUuid: string | null,
-  requestId: string,
-  systemPrompt?: string
+  requestId: string
 ): Record<string, unknown> {
   const tz = typeof Intl !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : "UTC";
 
@@ -343,7 +342,14 @@ export function buildPplxRequestBody(
     supported_block_use_cases: PPLX_SUPPORTED_BLOCK_USE_CASES,
     client_coordinates: null,
     mentions: [],
-    dsl_query: dslQuery && dslQuery.trim() ? dslQuery : query,
+    // LEV fork: Truncate dsl_query to avoid "Input token limit exceeded".
+    // Cursor sends huge current messages with <user_info>, <agent_transcripts>,
+    // <rules>, images, etc. Perplexity's free web API can't handle these.
+    dsl_query: (() => {
+      const dsl = dslQuery && dslQuery.trim() ? dslQuery : query;
+      const MAX_DSL_LEN = 16_000;
+      return dsl.length > MAX_DSL_LEN ? dsl.slice(0, MAX_DSL_LEN) : dsl;
+    })(),
     skip_search_enabled: true,
     is_nav_suggestions_disabled: false,
     source: "default",
@@ -365,17 +371,14 @@ export function buildPplxRequestBody(
     params.last_backend_uuid = followUpUuid;
   }
 
-  // LEV fork: Pass system prompt as a top-level field so Perplexity's API
-  // can process it directly, ensuring the model knows its operating context
-  // (e.g. Cursor IDE, coding agent role) even when query_str is truncated.
-  const result: Record<string, unknown> = {
+  // LEV fork: The system prompt is already embedded in query_str (via
+  // buildQuery). Do NOT duplicate it as a top-level instructions field —
+  // that doubles the payload and triggers Perplexity's "Input token limit
+  // exceeded" error for large Cursor system prompts.
+  return {
     query_str: query,
     params,
   };
-  if (systemPrompt && systemPrompt.trim()) {
-    result.instructions = systemPrompt.trim();
-  }
-  return result;
 }
 
 const SEARCH_HINT = "You have built-in web search. Answer questions directly using search results.";
@@ -396,11 +399,21 @@ function searchHintEnabled(): boolean {
 export function buildQuery(parsed: ParsedMessages, followUpUuid: string | null): string {
   if (followUpUuid) return parsed.currentMsg;
 
+  // LEV fork: Truncate the system prompt to a reasonable size. Cursor sends
+  // 30K-60K char system prompts with tool catalogs, rules, and repository
+  // context. Perplexity's free web API has a much smaller input token limit,
+  // so we keep the first ~12K chars of the system prompt (which contains the
+  // critical "you are in Cursor IDE" identity and core instructions) and drop
+  // the rest (tool schemas, repo context, etc. that Perplexity can't use anyway).
+  const MAX_SYSTEM_LEN = 12_000;
+  let systemMsg = parsed.systemMsg.trim();
+  if (systemMsg.length > MAX_SYSTEM_LEN) {
+    systemMsg = systemMsg.slice(0, MAX_SYSTEM_LEN) + "\n[...system prompt truncated...]";
+  }
+
   const obj: Record<string, unknown> = {};
-  if (parsed.systemMsg.trim()) {
-    obj.instructions = searchHintEnabled()
-      ? [parsed.systemMsg.trim(), SEARCH_HINT]
-      : [parsed.systemMsg.trim()];
+  if (systemMsg) {
+    obj.instructions = searchHintEnabled() ? [systemMsg, SEARCH_HINT] : [systemMsg];
   }
   if (parsed.currentMsg) {
     obj.query = parsed.currentMsg;
@@ -408,12 +421,11 @@ export function buildQuery(parsed: ParsedMessages, followUpUuid: string | null):
     obj.query = "";
   }
 
-  // LEV fork: Preserve system prompt + current message in full, truncate
-  // history from the front (oldest first) if total exceeds 96000 chars.
-  // The previous slice(-96000) cut off the system prompt at the beginning,
-  // causing the model to lose all context about its operating environment
-  // (e.g. Cursor IDE, coding agent role, tool catalog).
-  const MAX_QUERY_LEN = 96000;
+  // LEV fork: Preserve system prompt + current message, truncate history
+  // from the front (oldest first) if total exceeds the limit. The previous
+  // slice(-96000) cut off the system prompt at the beginning, causing the
+  // model to lose all context about its operating environment.
+  const MAX_QUERY_LEN = 48_000;
   let history = parsed.history;
   let json = JSON.stringify({ ...obj, history });
   while (json.length > MAX_QUERY_LEN && history.length > 0) {
