@@ -446,13 +446,14 @@ export function buildZaiCompletionUrl(input: {
   timestamp: number;
   token: string;
   userId: string;
+  clientVersion?: string;
 }): string {
   const now = new Date(input.timestamp);
   const params = new URLSearchParams({
     timestamp: String(input.timestamp),
     requestId: input.requestId,
     user_id: input.userId,
-    version: CLIENT_PROTOCOL_VERSION,
+    version: input.clientVersion ?? CLIENT_PROTOCOL_VERSION,
     platform: "web",
     token: input.token,
     user_agent: ZAI_USER_AGENT,

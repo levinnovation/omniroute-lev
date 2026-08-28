@@ -315,7 +315,8 @@ export function buildPplxRequestBody(
   mode: string,
   modelPref: string,
   followUpUuid: string | null,
-  requestId: string
+  requestId: string,
+  systemPrompt?: string
 ): Record<string, unknown> {
   const tz = typeof Intl !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : "UTC";
 
@@ -364,10 +365,17 @@ export function buildPplxRequestBody(
     params.last_backend_uuid = followUpUuid;
   }
 
-  return {
+  // LEV fork: Pass system prompt as a top-level field so Perplexity's API
+  // can process it directly, ensuring the model knows its operating context
+  // (e.g. Cursor IDE, coding agent role) even when query_str is truncated.
+  const result: Record<string, unknown> = {
     query_str: query,
     params,
   };
+  if (systemPrompt && systemPrompt.trim()) {
+    result.instructions = systemPrompt.trim();
+  }
+  return result;
 }
 
 const SEARCH_HINT = "You have built-in web search. Answer questions directly using search results.";
@@ -394,16 +402,25 @@ export function buildQuery(parsed: ParsedMessages, followUpUuid: string | null):
       ? [parsed.systemMsg.trim(), SEARCH_HINT]
       : [parsed.systemMsg.trim()];
   }
-  if (parsed.history.length > 0) {
-    obj.history = parsed.history;
-  }
   if (parsed.currentMsg) {
     obj.query = parsed.currentMsg;
   } else if (parsed.history.length === 0) {
     obj.query = "";
   }
-  const json = JSON.stringify(obj);
-  return json.length > 96000 ? json.slice(-96000) : json;
+
+  // LEV fork: Preserve system prompt + current message in full, truncate
+  // history from the front (oldest first) if total exceeds 96000 chars.
+  // The previous slice(-96000) cut off the system prompt at the beginning,
+  // causing the model to lose all context about its operating environment
+  // (e.g. Cursor IDE, coding agent role, tool catalog).
+  const MAX_QUERY_LEN = 96000;
+  let history = parsed.history;
+  let json = JSON.stringify({ ...obj, history });
+  while (json.length > MAX_QUERY_LEN && history.length > 0) {
+    history = history.slice(1);
+    json = JSON.stringify({ ...obj, history });
+  }
+  return json;
 }
 
 // ─── Content extraction ─────────────────────────────────────────────────────

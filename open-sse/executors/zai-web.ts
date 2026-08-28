@@ -358,6 +358,8 @@ export class ZaiWebExecutor extends BaseExecutor {
     vlmConfig: ZaiVlmConfig;
     signal?: AbortSignal | null;
     originalBody: unknown;
+    frontendVersion?: string;
+    clientVersion?: string;
   }): Promise<
     { chatId: string; userMessageId: string } | { errorResult: ReturnType<typeof makeErrorResult> }
   > {
@@ -374,6 +376,8 @@ export class ZaiWebExecutor extends BaseExecutor {
         method: "POST",
         headers: buildZaiHeaders(input.token, {
           accept: "application/json",
+          frontendVersion: input.frontendVersion,
+          clientVersion: input.clientVersion,
         }),
         body: JSON.stringify(payload),
         signal: input.signal,
@@ -469,6 +473,12 @@ export class ZaiWebExecutor extends BaseExecutor {
     if ("errorResult" in resolved) return resolved;
     const { attachments } = resolved;
 
+    // LEV fork: Resolve client + frontend versions so the direct fetch to
+    // /api/v2/chat/completions sends them. Without these, Z.ai returns
+    // "[Z.ai error] Your client version (unknown) is outdated."
+    const frontendVersion = await this.resolveFrontendVersion(input.signal);
+    const clientVersion = await this.resolveClientVersion(input.signal);
+
     let result: Awaited<ReturnType<typeof browserBackedChat>>;
     try {
       result = await browserBackedChat(buildZaiBrowserChatOptions({ ...input, attachments }));
@@ -528,14 +538,18 @@ export class ZaiWebExecutor extends BaseExecutor {
           timestamp,
           token: input.token,
           userId,
+          clientVersion,
         });
         const reqHeaders = buildZaiHeaders(input.token, {
           accept: "text/event-stream",
+          frontendVersion,
+          clientVersion,
         });
         const reqBody = buildZaiRequestBody({
           body: (input.body || {}) as Record<string, unknown>,
           captchaVerifyParam: "",
           chatId,
+          clientVersion,
           messages: input.messages,
           modelId: input.modelId,
           prompt: browserPrompt(input.messages),
@@ -637,13 +651,21 @@ export class ZaiWebExecutor extends BaseExecutor {
       vlmConfig,
       signal,
       originalBody: body,
+      frontendVersion,
+      clientVersion,
     });
     if ("errorResult" in createdChat) return createdChat;
 
     const timestamp = Date.now();
     const requestId = randomUUID();
     const signature = buildZaiSignature({ prompt, requestId, timestamp, userId });
-    const completionUrl = buildZaiCompletionUrl({ requestId, timestamp, token, userId });
+    const completionUrl = buildZaiCompletionUrl({
+      requestId,
+      timestamp,
+      token,
+      userId,
+      clientVersion,
+    });
     const reqHeaders = buildZaiHeaders(token, {
       accept: "text/event-stream",
       frontendVersion,

@@ -215,8 +215,20 @@ export class QwenWebExecutor extends BaseExecutor {
     }
 
     if (!wantStream) {
-      const { content } = await this.collectStream(upstream);
+      const { content, reasoning } = await this.collectStream(upstream);
       const finalText = content;
+
+      // LEV fork: Empty-content watchdog. If both content and reasoning are
+      // empty, the upstream produced nothing useful. Return an error instead
+      // of a silent null that confuses clients and pollutes conversation history.
+      if (!finalText.trim() && !reasoning.trim()) {
+        return makeErrorResult(
+          502,
+          "Qwen returned empty content (no answer or thinking phase). The session may be expired or the model may be unavailable.",
+          body,
+          completionUrl
+        );
+      }
 
       if (hasTools) {
         const {
@@ -361,6 +373,12 @@ export class QwenWebExecutor extends BaseExecutor {
     } catch {
       /* upstream closed mid-stream — return what we have */
     }
+    // LEV fork: If the model only produced thinking-phase content (no answer),
+    // use the thinking content as the answer. This prevents silent empty
+    // responses for thinking-enabled models like qwen3.8-max.
+    if (!content.trim() && reasoning.trim()) {
+      content = reasoning;
+    }
     return { content, reasoning };
   }
 
@@ -395,6 +413,7 @@ export class QwenWebExecutor extends BaseExecutor {
         }
         let buffer = "";
         let fullContent = "";
+        let fullReasoning = "";
         controller.enqueue(encoder.encode(emitChunk({ role: "assistant", content: "" }, null)));
         try {
           while (true) {
@@ -411,10 +430,13 @@ export class QwenWebExecutor extends BaseExecutor {
                 if (!hasTools) {
                   controller.enqueue(encoder.encode(emitChunk({ content: delta.text }, null)));
                 }
-              } else if (delta.kind === "think" && !hasTools) {
-                controller.enqueue(
-                  encoder.encode(emitChunk({ reasoning_content: delta.text }, null))
-                );
+              } else if (delta.kind === "think") {
+                fullReasoning += delta.text;
+                if (!hasTools) {
+                  controller.enqueue(
+                    encoder.encode(emitChunk({ reasoning_content: delta.text }, null))
+                  );
+                }
               }
             }
           }
@@ -422,6 +444,16 @@ export class QwenWebExecutor extends BaseExecutor {
           if (!signal?.aborted) {
             controller.error(err);
             return;
+          }
+        }
+
+        // LEV fork: If the model only produced thinking-phase content (no
+        // answer-phase), use the thinking content as the answer. This prevents
+        // silent empty responses for thinking-enabled models like qwen3.8-max.
+        if (!fullContent.trim() && fullReasoning.trim()) {
+          fullContent = fullReasoning;
+          if (!hasTools) {
+            controller.enqueue(encoder.encode(emitChunk({ content: fullReasoning }, null)));
           }
         }
 
@@ -486,7 +518,25 @@ function parseSseDelta(line: string): { kind: "answer" | "think"; text: string }
   const delta = parsed?.choices?.[0]?.delta;
   if (!delta) return null;
   const phase = delta.phase;
-  const content = typeof delta.content === "string" ? delta.content : "";
+  // LEV fork: Handle non-string content (arrays, objects) by extracting text
+  // from content parts, similar to contentToText. Some Qwen models send
+  // content as an array of {type, text} objects instead of a plain string.
+  let content = "";
+  if (typeof delta.content === "string") {
+    content = delta.content;
+  } else if (Array.isArray(delta.content)) {
+    content = delta.content
+      .map((part: unknown) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object") {
+          const p = part as { type?: unknown; text?: unknown };
+          if (typeof p.text === "string") return p.text;
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("");
+  }
   if (phase === "think" || phase === "thinking_summary") {
     return { kind: "think", text: content };
   }
