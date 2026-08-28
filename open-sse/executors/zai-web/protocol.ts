@@ -6,9 +6,14 @@ import { normalizeCookie, sanitizeErrorMessage } from "../../utils/error.ts";
 
 export const ZAI_BASE_URL = "https://chat.z.ai";
 export const ZAI_NEW_CHAT_URL = `${ZAI_BASE_URL}/api/v1/chats/new`;
-export const ZAI_CHAT_URL = `${ZAI_BASE_URL}/api/v2/chat/completions`;
+// LEV fork: Z.ai moved the completions endpoint from /api/v2/chat/completions to
+// /api/chat/completions (no version prefix). The v2 endpoint is deprecated and
+// silently ignores the version param/header/body field, causing Z.ai's backend
+// to see client version "unknown" and reject with "Your client version (unknown)
+// is outdated. Minimum required: 1.0.91." Verified against prod-fe-1.1.92 bundle.
+export const ZAI_CHAT_URL = `${ZAI_BASE_URL}/api/chat/completions`;
 export const ZAI_DEFAULT_MODEL = "GLM-5.1";
-export const ZAI_DEFAULT_FE_VERSION = "prod-fe-1.1.79";
+export const ZAI_DEFAULT_FE_VERSION = "prod-fe-1.1.92";
 export const ZAI_DEFAULT_CLIENT_VERSION = "1.0.91";
 export const ZAI_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";

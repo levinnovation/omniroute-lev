@@ -175,16 +175,44 @@ function emitDeltaChunks(
 export function buildZaiStreamingBody(
   sourceBody: ReadableStream<Uint8Array>,
   emitChunk: ZaiChunkEmitter,
-  signal: AbortSignal | null | undefined
+  signal: AbortSignal | null | undefined,
+  onVersionOutdated?: () => void
 ): ReadableStream {
   return new ReadableStream({
     async start(controller) {
       const roleState = { emitted: false };
+      // LEV fork: Accumulate content to detect Z.ai's "client version outdated"
+      // error, which is returned as completion text in a 200 SSE stream. Without
+      // this, the error text is passed to the IDE as if it were a valid assistant
+      // response, causing the agent to lose track of its task.
+      let accumulatedContent = "";
+      let versionErrorDetected = false;
       try {
-        const ended = await drainSseDeltas(sourceBody, (delta) =>
-          emitDeltaChunks(controller, delta, emitChunk, roleState)
-        );
-        if (ended) return;
+        const ended = await drainSseDeltas(sourceBody, (delta) => {
+          // Check for version outdated error before emitting
+          if (delta.content) {
+            accumulatedContent += delta.content;
+            if (isZaiVersionOutdatedError(accumulatedContent)) {
+              versionErrorDetected = true;
+              onVersionOutdated?.();
+              // Emit a proper error event instead of the error text as content
+              if (!roleState.emitted) {
+                emitChunk(controller, { role: "assistant", content: "" });
+                roleState.emitted = true;
+              }
+              emitChunk(controller, {
+                content:
+                  "[Z.ai error] Client version is outdated. The version cache has been invalidated — please retry.",
+              });
+              emitChunk(controller, {}, "stop");
+              controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+              controller.close();
+              return true; // stop draining
+            }
+          }
+          return emitDeltaChunks(controller, delta, emitChunk, roleState);
+        });
+        if (ended || versionErrorDetected) return;
         if (!roleState.emitted) emitChunk(controller, { role: "assistant", content: "" });
         emitChunk(controller, {}, "stop");
         controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));

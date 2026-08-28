@@ -5,8 +5,9 @@
  * browser-issued CAPTCHA proof for chat completions. The browser transport is
  * the default; callers with a short-lived proof can use the direct HTTP path.
  *
- * Completions go to /api/v2/chat/completions; the older unversioned
- * /api/chat/completions path is stale and 404s model-independently (#8014).
+ * Completions go to /api/chat/completions; the older versioned
+ * /api/v2/chat/completions path is deprecated and silently ignores the
+ * client version param, causing "client version (unknown) is outdated" errors.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { BaseExecutor, type ExecuteInput } from "./base.ts";
@@ -169,9 +170,9 @@ function buildZaiBrowserChatOptions(input: {
   vlmConfig: ZaiVlmConfig;
 }): Parameters<typeof browserBackedChat>[0] {
   const poolKey = `zai-web:${createHash("sha256").update(input.token).digest("hex").slice(0, 24)}`;
-  // LEV fork: Z.ai's browser frontend now POSTs to /api/v1/chats/new instead of
-  // /api/v2/chat/completions. Watch for the new endpoint so the browser transport
-  // can intercept the chat creation response.
+  // LEV fork: Z.ai's browser frontend POSTs to /api/v1/chats/new to create a
+  // chat, then fetches the SSE stream from /api/chat/completions. Watch for the
+  // chat creation endpoint so the browser transport can intercept its response.
   return {
     poolKey,
     chatUrl: ZAI_NEW_CHAT_URL,
@@ -474,7 +475,7 @@ export class ZaiWebExecutor extends BaseExecutor {
     const { attachments } = resolved;
 
     // LEV fork: Resolve client + frontend versions so the direct fetch to
-    // /api/v2/chat/completions sends them. Without these, Z.ai returns
+    // /api/chat/completions sends them. Without these, Z.ai returns
     // "[Z.ai error] Your client version (unknown) is outdated."
     const frontendVersion = await this.resolveFrontendVersion(input.signal);
     const clientVersion = await this.resolveClientVersion(input.signal);
@@ -507,9 +508,9 @@ export class ZaiWebExecutor extends BaseExecutor {
       };
     }
 
-    // LEV fork: Z.ai's browser now POSTs to /api/v1/chats/new which returns
+    // LEV fork: Z.ai's browser POSTs to /api/v1/chats/new which returns
     // JSON with a chat ID, not an SSE stream. Extract the chat ID and make
-    // a direct fetch to /api/v2/chat/completions for the actual stream.
+    // a direct fetch to /api/chat/completions for the actual stream.
     const responseBody = result.body.toString("utf8");
     const contentType = result.contentType || "";
 
@@ -745,7 +746,9 @@ export class ZaiWebExecutor extends BaseExecutor {
       upstream.body ?? new ReadableStream({ start: (controller) => controller.close() });
     const emitChunk = makeZaiChunkEmitter(id, created, modelId);
     if (wantStream) {
-      let outStream = buildZaiStreamingBody(sourceBody, emitChunk, signal);
+      let outStream = buildZaiStreamingBody(sourceBody, emitChunk, signal, () =>
+        this.invalidateClientVersion()
+      );
       // LEV fork: Wrap the stream with a watchdog that detects empty/truncated
       // responses — the exact bug where zai-web returned content: null with
       // completion_tokens: 0 and HTTP 200.
@@ -790,10 +793,11 @@ export class ZaiWebExecutor extends BaseExecutor {
     }
 
     // LEV fork: Detect Z.ai's "client version outdated" error, which is
-    // returned as completion text in a 200 response. When detected, surface
-    // it as a proper error instead of passing the error message to the IDE
-    // as if it were a valid assistant response.
+    // returned as completion text in a 200 response. When detected, invalidate
+    // the cached version and surface a proper error instead of passing the
+    // error message to the IDE as if it were a valid assistant response.
     if (isZaiVersionOutdatedError(answer)) {
+      this.invalidateClientVersion();
       return makeErrorResult(
         426,
         "Z.ai rejected the request: client version is outdated. The version cache has been invalidated — retry with a refreshed version.",
