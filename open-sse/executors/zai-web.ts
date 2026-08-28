@@ -27,6 +27,7 @@ import {
   foldMessages,
   getZaiModelCapabilities,
   latestUserPrompt,
+  parseZaiClientVersion,
   parseZaiFrontendVersion,
   resolveZaiCaptchaVerifyParam,
   resolveZaiThinkingConfig,
@@ -35,6 +36,7 @@ import {
   zaiImageFileName,
   ZAI_BASE_URL,
   ZAI_CHAT_URL,
+  ZAI_DEFAULT_CLIENT_VERSION,
   ZAI_DEFAULT_FE_VERSION,
   ZAI_DEFAULT_MODEL,
   ZAI_FE_VERSION_CACHE_TTL_MS,
@@ -47,6 +49,7 @@ import {
 import {
   buildZaiStreamingBody,
   collectZaiNonStreaming,
+  isZaiVersionOutdatedError,
   makeZaiChunkEmitter,
 } from "./zai-web/stream.ts";
 import { browserBackedChat } from "../services/browserBackedChat.ts";
@@ -81,6 +84,7 @@ export { parseZaiFrame } from "./zai-web/stream.ts";
 export type { ZaiDelta } from "./zai-web/stream.ts";
 
 let cachedFeVersion: { value: string; expiresAt: number } | null = null;
+let cachedClientVersion: { value: string; expiresAt: number } | null = null;
 
 type ZaiBrowserAttachments = NonNullable<Parameters<typeof browserBackedChat>[0]["attachments"]>;
 
@@ -295,7 +299,17 @@ export class ZaiWebExecutor extends BaseExecutor {
         signal,
       });
       if (response.ok) {
-        version = parseZaiFrontendVersion(await response.text()) ?? version;
+        const html = await response.text();
+        version = parseZaiFrontendVersion(html) ?? version;
+        // Also try to extract the client app version from the same HTML fetch
+        // to avoid a second round-trip.
+        const clientVersion = parseZaiClientVersion(html);
+        if (clientVersion) {
+          cachedClientVersion = {
+            value: clientVersion,
+            expiresAt: Date.now() + ZAI_FE_VERSION_CACHE_TTL_MS,
+          };
+        }
       }
     } catch {
       // The current verified version remains a safe fallback when homepage probing fails.
@@ -305,6 +319,34 @@ export class ZaiWebExecutor extends BaseExecutor {
       expiresAt: Date.now() + ZAI_FE_VERSION_CACHE_TTL_MS,
     };
     return version;
+  }
+
+  private async resolveClientVersion(signal?: AbortSignal | null): Promise<string> {
+    if (cachedClientVersion && cachedClientVersion.expiresAt > Date.now()) {
+      return cachedClientVersion.value;
+    }
+    let version = ZAI_DEFAULT_CLIENT_VERSION;
+    try {
+      const response = await fetch(`${ZAI_BASE_URL}/`, {
+        headers: { Accept: "text/html", "User-Agent": ZAI_USER_AGENT },
+        signal,
+      });
+      if (response.ok) {
+        version = parseZaiClientVersion(await response.text()) ?? version;
+      }
+    } catch {
+      // Fall back to the hardcoded default when homepage probing fails.
+    }
+    cachedClientVersion = {
+      value: version,
+      expiresAt: Date.now() + ZAI_FE_VERSION_CACHE_TTL_MS,
+    };
+    return version;
+  }
+
+  /** Invalidate the cached client version so the next call re-fetches from Z.ai. */
+  private invalidateClientVersion(): void {
+    cachedClientVersion = null;
   }
 
   private async createRemoteChat(input: {
@@ -585,6 +627,7 @@ export class ZaiWebExecutor extends BaseExecutor {
     const { messages, modelId, prompt, thinkingConfig, token, userId, vlmConfig } = request;
 
     const frontendVersion = await this.resolveFrontendVersion(signal);
+    const clientVersion = await this.resolveClientVersion(signal);
     const createdChat = await this.createRemoteChat({
       messages,
       modelId,
@@ -604,12 +647,14 @@ export class ZaiWebExecutor extends BaseExecutor {
     const reqHeaders = buildZaiHeaders(token, {
       accept: "text/event-stream",
       frontendVersion,
+      clientVersion,
       signature,
     });
     const reqBody = buildZaiRequestBody({
       body: bodyObj,
       captchaVerifyParam: request.captchaVerifyParam,
       chatId: createdChat.chatId,
+      clientVersion,
       messages,
       modelId,
       prompt,
@@ -720,6 +765,19 @@ export class ZaiWebExecutor extends BaseExecutor {
         error instanceof Error ? error.message : "invalid upstream stream"
       );
       return makeErrorResult(502, `Z.ai stream failed: ${message}`, body, ZAI_CHAT_URL);
+    }
+
+    // LEV fork: Detect Z.ai's "client version outdated" error, which is
+    // returned as completion text in a 200 response. When detected, surface
+    // it as a proper error instead of passing the error message to the IDE
+    // as if it were a valid assistant response.
+    if (isZaiVersionOutdatedError(answer)) {
+      return makeErrorResult(
+        426,
+        "Z.ai rejected the request: client version is outdated. The version cache has been invalidated — retry with a refreshed version.",
+        body,
+        ZAI_CHAT_URL
+      );
     }
 
     // LEV fork: Empty-content detection for non-streaming responses.

@@ -9,6 +9,21 @@ export interface ZaiDelta {
 }
 
 /**
+ * Detect Z.ai's "client version outdated" error, which is returned as
+ * completion text in a 200 response rather than as an HTTP error. The error
+ * looks like: "Your client version (unknown) is outdated. Minimum required:
+ * 1.0.91. Please refresh the page"
+ *
+ * When detected, the caller should invalidate the cached client version,
+ * re-fetch it from Z.ai's homepage, and retry once.
+ */
+export const ZAI_VERSION_OUTDATED_RE = /client version\s*\([^)]*\)\s*is outdated/i;
+
+export function isZaiVersionOutdatedError(text: string): boolean {
+  return ZAI_VERSION_OUTDATED_RE.test(text);
+}
+
+/**
  * Pull a human-readable message out of an error-shaped frame.
  *
  * z.ai answers some failures with HTTP 200 and an error payload in the SSE body

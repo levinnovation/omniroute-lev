@@ -76,11 +76,17 @@ export function serializeDeepSeekToolPrompt(tools: unknown): string {
   return [
     "You can call tools. To call a tool, output ONLY this exact block (no markdown fence):",
     `<tool>{"name": "<tool_name>", "arguments": { ... }, "_nonce": "${nonce}"}</tool>`,
+    "",
+    "Examples:",
+    `<tool>{"name": "Shell", "arguments": {"command": "ls -la"}, "_nonce": "${nonce}"}</tool>`,
+    `<tool>{"name": "Read", "arguments": {"path": "/src/main.ts"}, "_nonce": "${nonce}"}</tool>`,
+    "",
     "Rules:",
     "- Use exactly <tool>...</tool>. Do NOT use <tool:name>, <tool_call>, <name>, <parameter>, id=/name= attributes, or code fences.",
     `- Include the secret binding "_nonce": "${nonce}" exactly as shown.`,
     '- "name" must be one of the tools below; "arguments" must be a JSON object.',
     "- When a tool is needed, emit the <tool> block instead of only describing the plan.",
+    "- If you want to run a shell command, you MUST use the Shell tool with a <tool> block. Do NOT write commands as plain text.",
     "- Emit one <tool> block per call; you may put several blocks back to back.",
     "- If no tool is needed, just answer normally without any <tool> block.",
     "",
@@ -138,12 +144,20 @@ export function buildToolConversationPrompt(
       const t = extractText(m.content).trim();
       if (t) lines.push(`User: ${t}`);
     } else if (m.role === "assistant") {
-      const t = extractText(m.content).trim();
+      // LEV fork: Strip tool artifacts from assistant text before embedding
+      // in the conversation prompt. Leftover <tool>, <tool_call>, <tool_calls> tags
+      // from previous turns confuse DeepSeek-web and cause it to emit
+      // malformed responses or restart the task from scratch.
+      const rawText = extractText(m.content).trim();
+      const t = stripToolArtifacts(rawText);
       const calls = Array.isArray(m.tool_calls) ? m.tool_calls : [];
       const parts: string[] = [];
       if (t) parts.push(t);
       for (const c of calls) {
         const name = typeof c?.function?.name === "string" ? c.function.name : "";
+        // LEV fork: Skip tool calls with unresolvable names — embedding bogus
+        // <tool> blocks with unknown tool names confuses the model.
+        if (!name) continue;
         const rawArgs = c?.function?.arguments;
         // LEV fork: validate arguments JSON before embedding in the <tool> block.
         // Malformed arguments (e.g., truncated JSON from a previous turn) produce
@@ -800,6 +814,38 @@ function parseBareJsonToolCalls(
   return { content, toolCalls };
 }
 
+// ── Artifact cleanup ─────────────────────────────────────────────────────────
+
+/**
+ * Strip ALL tool-related markup from text, regardless of whether tool calls
+ * were extracted. This prevents wrapper artifacts (<tool>, tool_call, <tool_calls>,
+ * code fences, <invoke> blocks) from poisoning conversation history or
+ * reaching the IDE as visible content.
+ */
+const ARTIFACT_PATTERNS: Array<{ re: RegExp; replacement: string }> = [
+  // <tool>...</tool> blocks (with various tag suffixes)
+  { re: /<\/?tool(?:_calls?|:[A-Za-z0-9_.+-]+)?\b[^>]*>/gi, replacement: "" },
+  // tool_call.../tool_call blocks
+  { re: /<\/?tool_call\b[^>]*>/gi, replacement: "" },
+  // <invoke>...</invoke> blocks
+  { re: /<\/?invoke\b[^>]*>/gi, replacement: "" },
+  // <parameter>...</parameter> blocks
+  { re: /<\/?parameter\b[^>]*>/gi, replacement: "" },
+  // <tool_name>...</tool_name> blocks
+  { re: /<\/?tool_name\b[^>]*>/gi, replacement: "" },
+  // ```tool or ```tool_calls code fences (empty or not)
+  { re: /```tool(?:_calls)?\s*\n?```/gi, replacement: "" },
+];
+
+export function stripToolArtifacts(text: string): string {
+  let result = text;
+  for (const { re, replacement } of ARTIFACT_PATTERNS) {
+    result = result.replace(re, replacement);
+  }
+  // Clean up any leftover empty lines from stripped blocks
+  return result.replace(/\n{3,}/g, "\n\n").trim();
+}
+
 /**
  * Parse a DeepSeek-web text reply into OpenAI `tool_calls`. Returns the surrounding text with the recognized blocks stripped (so it can
  * still be streamed to the client) plus the parsed calls, or `null` when none are present.
@@ -891,7 +937,9 @@ export function parseDeepSeekToolCalls(
     // Do NOT fall back to parseToolCallsFromText — that would re-process content
     // already seen by this parser and potentially promote rejected tagged output
     // to tool_calls. (#9343)
-    return { content: text, toolCalls: null };
+    // LEV fork: Strip tool artifacts from the content so leftover tags don't
+    // poison conversation history or reach the IDE as visible content.
+    return { content: stripToolArtifacts(text), toolCalls: null };
   }
 
   // Strip the accepted blocks plus any stray tool tags left outside them (the unmatched outer

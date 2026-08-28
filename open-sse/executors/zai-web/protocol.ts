@@ -9,11 +9,12 @@ export const ZAI_NEW_CHAT_URL = `${ZAI_BASE_URL}/api/v1/chats/new`;
 export const ZAI_CHAT_URL = `${ZAI_BASE_URL}/api/v2/chat/completions`;
 export const ZAI_DEFAULT_MODEL = "GLM-5.1";
 export const ZAI_DEFAULT_FE_VERSION = "prod-fe-1.1.79";
+export const ZAI_DEFAULT_CLIENT_VERSION = "1.0.91";
 export const ZAI_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 export const ZAI_FE_VERSION_CACHE_TTL_MS = 15 * 60 * 1000;
 
-const CLIENT_PROTOCOL_VERSION = "0.0.1";
+const CLIENT_PROTOCOL_VERSION = ZAI_DEFAULT_CLIENT_VERSION;
 const SIGNATURE_KEY = "key-@@@@)))()((9))-xxxx&&&%%%%%";
 
 export interface NewChatRequest {
@@ -248,6 +249,54 @@ export function parseZaiFrontendVersion(html: string): string | null {
   return html.match(/\/frontend\/(prod-fe-\d+(?:\.\d+)*)\/assets\//)?.[1] ?? null;
 }
 
+/**
+ * Extract the Z.ai client app version from the frontend HTML.
+ *
+ * Z.ai enforces a minimum client version (e.g. "1.0.91") and returns an error
+ * as completion text when the version sent by the client is too old or missing.
+ * The version is embedded in the homepage HTML — either in a `<meta>` tag, a
+ * JS bundle reference, or a `__NEXT_DATA__` / `window.__version__` script block.
+ *
+ * This scans for common patterns. When extraction fails, callers fall back to
+ * `ZAI_DEFAULT_CLIENT_VERSION`.
+ */
+export function parseZaiClientVersion(html: string): string | null {
+  // Pattern 1: window.__version__ = "1.0.91" or window.__appVersion__ = "1.0.91"
+  const windowVersionMatch = html.match(
+    /window\.__(?:app)?[Vv]ersion__\s*=\s*["'](\d+\.\d+\.\d+)["']/
+  );
+  if (windowVersionMatch) return windowVersionMatch[1];
+
+  // Pattern 2: <meta name="version" content="1.0.91">
+  const metaVersionMatch = html.match(
+    /<meta\s+[^>]*name=["']version["'][^>]*content=["'](\d+\.\d+\.\d+)["']/
+  );
+  if (metaVersionMatch) return metaVersionMatch[1];
+
+  // Pattern 3: __NEXT_DATA__ JSON with a version field
+  const nextDataMatch = html.match(
+    /<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/
+  );
+  if (nextDataMatch) {
+    try {
+      const parsed = JSON.parse(nextDataMatch[1]);
+      const version =
+        parsed?.props?.pageProps?.version ?? parsed?.runtimeConfig?.version ?? parsed?.version;
+      if (typeof version === "string" && /^\d+\.\d+\.\d+$/.test(version)) {
+        return version;
+      }
+    } catch {
+      // ignore unparseable __NEXT_DATA__
+    }
+  }
+
+  // Pattern 4: "version":"1.0.91" anywhere in the HTML (broadest fallback)
+  const broadVersionMatch = html.match(/["']version["']\s*:\s*["'](\d+\.\d+\.\d+)["']/);
+  if (broadVersionMatch) return broadVersionMatch[1];
+
+  return null;
+}
+
 function textContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -373,6 +422,7 @@ export function buildZaiHeaders(
   options: {
     accept: "application/json" | "text/event-stream";
     frontendVersion?: string;
+    clientVersion?: string;
     signature?: string;
   }
 ): Record<string, string> {
@@ -386,6 +436,7 @@ export function buildZaiHeaders(
     Authorization: `Bearer ${token}`,
   };
   if (options.frontendVersion) headers["X-FE-Version"] = options.frontendVersion;
+  if (options.clientVersion) headers["X-Client-Version"] = options.clientVersion;
   if (options.signature) headers["X-Signature"] = options.signature;
   return headers;
 }
@@ -500,6 +551,7 @@ export function buildZaiRequestBody(input: {
   body: Record<string, unknown>;
   captchaVerifyParam: string;
   chatId: string;
+  clientVersion?: string;
   messages: Array<{ role: string; content: unknown }>;
   modelId: string;
   prompt: string;
@@ -531,6 +583,7 @@ export function buildZaiRequestBody(input: {
   return {
     stream: true,
     model: input.modelId,
+    version: input.clientVersion ?? ZAI_DEFAULT_CLIENT_VERSION,
     messages: foldMessages(input.messages),
     signature_prompt: input.prompt,
     params,

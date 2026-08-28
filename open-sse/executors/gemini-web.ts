@@ -643,21 +643,42 @@ export class GeminiWebExecutor extends BaseExecutor {
       if (signal?.aborted) {
         throw signal.reason instanceof Error ? signal.reason : new Error("Request aborted");
       }
-      await page.waitForTimeout(3000);
 
-      // Type and send message
+      // Wait for the input element to be ready (replaces the fixed 3s delay).
       const inputEl = await page.waitForSelector(".ql-editor, [contenteditable='true']", {
         timeout: 10000,
       });
       await inputEl.click();
-      await page.keyboard.type(prompt, { delay: 10 });
-      await page.waitForTimeout(300);
+
+      // Paste the prompt via a synthetic clipboard event instead of typing
+      // character-by-character. page.keyboard.type() with delay:10 takes
+      // ~10ms/char, so a 25K-char Cursor system prompt needs 250s — well over
+      // the 120s execution expiration. Clipboard paste is instant regardless
+      // of prompt size. Uses DataTransfer + ClipboardEvent so it works with
+      // ProseMirror/Quill editors (Gemini's .ql-editor) without needing
+      // clipboard permissions.
+      await page.evaluate((text) => {
+        const editor = document.querySelector(".ql-editor, [contenteditable='true']");
+        if (!editor) return;
+        const dataTransfer = new DataTransfer();
+        dataTransfer.setData("text/plain", text);
+        const event = new ClipboardEvent("paste", {
+          clipboardData: dataTransfer,
+          bubbles: true,
+          cancelable: true,
+        });
+        editor.dispatchEvent(event);
+      }, prompt);
+
       await page.keyboard.press("Enter");
 
       // Wait for response or timeout. Image generation (Nano Banana) is
       // noticeably slower than text — the UI renders the asset only after
       // the full generation completes — so image mode gets a wider window.
-      await Promise.race([responsePromise, page.waitForTimeout(imageMode ? 90000 : 30000)]);
+      // Tool-bearing requests get 60s (vs 30s) because the model needs more
+      // time to generate a complete, well-formed tool call.
+      const responseWaitMs = imageMode ? 90000 : hasTools ? 60000 : 30000;
+      await Promise.race([responsePromise, page.waitForTimeout(responseWaitMs)]);
       if (signal?.aborted) {
         throw signal.reason instanceof Error ? signal.reason : new Error("Request aborted");
       }

@@ -162,6 +162,16 @@ export function resolveStreamReadinessTimeout(
     reasons.push("claude_format_heavy_reasoning");
   }
 
+  // OpenRouter free-tier models (`:free` variants) can queue for a long time
+  // while waiting for a free upstream slot, sending `: ping` keepalives the
+  // whole time. The ping-aware deadline extension in streamReadiness.ts
+  // handles the keepalive case, but adding 30s to the base timeout gives extra
+  // headroom before the first ping even arrives.
+  if (input.provider?.toLowerCase() === "openrouter" && input.model?.includes(":free")) {
+    timeoutMs += 30_000;
+    reasons.push("openrouter_free_tier");
+  }
+
   timeoutMs = Math.min(timeoutMs, maxTimeoutMs);
   if (timeoutMs === baseTimeoutMs) reasons.push("base");
 

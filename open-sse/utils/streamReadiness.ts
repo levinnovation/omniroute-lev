@@ -318,6 +318,8 @@ type StreamReadinessSignalState = {
   dataLines: string[];
   pendingLine: string;
   upstreamDiagnostic: string | null;
+  /** Set to true when a ping/keepalive comment or event was seen in this chunk. */
+  sawPing?: boolean;
 };
 
 function resetCurrentEvent(state: StreamReadinessSignalState): void {
@@ -355,11 +357,17 @@ function processStreamReadinessLine(state: StreamReadinessSignalState, line: str
   const trimmed = line.trim();
   if (!trimmed || trimmed.startsWith(":")) {
     if (!trimmed) return processStreamReadinessEvent(state);
+    // Track that we saw a ping/keepalive comment so the caller can extend
+    // the deadline. A ping means "I'm alive, just waiting" — the connection
+    // is healthy, the upstream just hasn't started producing content yet.
+    state.sawPing = true;
     return false;
   }
 
   if (trimmed.startsWith("event:")) {
     state.currentEvent = trimmed.slice(6).trim();
+    // Track ping events (event: ping / event: keepalive / event: heartbeat)
+    if (isPingEventType(state.currentEvent)) state.sawPing = true;
     return false;
   }
 
@@ -471,6 +479,8 @@ export async function ensureStreamReadiness(
   response: Response,
   options: {
     timeoutMs: number;
+    /** Hard cap for ping-extended deadlines. Defaults to 3x timeoutMs. */
+    maxTimeoutMs?: number;
     provider?: string | null;
     model?: string | null;
     log?: StreamReadinessLogger | null;
@@ -489,7 +499,15 @@ export async function ensureStreamReadiness(
   };
   const startedAt = Date.now();
   const effectiveTimeoutMs = Math.max(0, Math.floor(options.timeoutMs));
-  const deadline = startedAt + effectiveTimeoutMs;
+  // Ping-aware deadline: when the upstream sends a ping/keepalive comment
+  // (`: ...`) or ping event, reset the deadline to give the upstream another
+  // full window to start producing content. A hard cap (maxDeadline) prevents
+  // infinite waiting. This fixes false 504s on OpenRouter free-tier models
+  // that queue for a long time while sending pings.
+  const maxDeadlineExtension = options.maxTimeoutMs ?? effectiveTimeoutMs * 3;
+  const maxDeadline = startedAt + Math.max(effectiveTimeoutMs, maxDeadlineExtension);
+  let deadline = startedAt + effectiveTimeoutMs;
+  let pingExtensions = 0;
   let handedOffReader = false;
 
   const buildReadyResponse = () =>
@@ -593,6 +611,12 @@ export async function ensureStreamReadiness(
       chunks.push(readResult.value);
       const decodedChunk = decoder.decode(readResult.value, { stream: true });
 
+      // Reset sawPing before processing the chunk, then check after — if the
+      // chunk contained only pings/keepalives, extend the deadline so the
+      // upstream gets another full window to start producing content. This
+      // fixes false 504s on OpenRouter free-tier models that queue for a long
+      // time while sending `: ping` keepalives.
+      readinessState.sawPing = false;
       if (appendStreamReadinessSignal(readinessState, decodedChunk)) {
         options.log?.debug?.(
           "STREAM",
@@ -603,6 +627,17 @@ export async function ensureStreamReadiness(
           ok: true,
           response: buildReadyResponse(),
         };
+      }
+      if (readinessState.sawPing) {
+        const newDeadline = Math.min(Date.now() + effectiveTimeoutMs, maxDeadline);
+        if (newDeadline > deadline) {
+          pingExtensions++;
+          deadline = newDeadline;
+          options.log?.debug?.(
+            "STREAM",
+            `Ping received, extending readiness deadline to ${Math.round((deadline - startedAt) / 1000)}s (${pingExtensions} extensions, ${options.provider || "provider"}/${options.model || "unknown"})`
+          );
+        }
       }
     }
   } finally {
