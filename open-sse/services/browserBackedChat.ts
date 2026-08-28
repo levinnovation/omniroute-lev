@@ -287,12 +287,32 @@ export async function browserBackedChat(
 
     if (beforeSubmit) {
       await beforeSubmit(page);
+      // LEV fork: Allow the page to settle after model selection / toggle changes.
+      // Svelte re-renders can temporarily detach the input element, causing the
+      // subsequent waitFor/fill to race against the re-render.
+      await waitWithSignal(500, signal);
     }
     await uploadBrowserAttachments(page, attachments, chatUrlMatchDomain, signal);
 
     const inputLocator = page.locator(inputSelector).first();
     await withAbort(inputLocator.waitFor({ state: "visible", timeout: 10000 }), signal);
-    await inputLocator.fill(userMessage);
+    // LEV fork: Use evaluate-based input instead of locator.fill() for Svelte SPAs.
+    // locator.fill() can hang for 30s on Svelte-managed textareas because the
+    // framework's reactivity layer doesn't always react to Playwright's synthetic
+    // input events. Setting .value directly and dispatching an 'input' event
+    // matches what the SPA's own code does (verified in Z.ai's prod-fe-1.1.92
+    // bundle: `vt.value = text; vt.dispatchEvent(new Event("input"))`).
+    // Falls back to locator.fill() if the evaluate approach fails.
+    try {
+      await inputLocator.evaluate((el, text) => {
+        const textarea = el as HTMLTextAreaElement;
+        textarea.value = text;
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+      }, userMessage);
+    } catch {
+      await withAbort(inputLocator.fill(userMessage), signal);
+    }
     await waitWithSignal(800, signal);
 
     const tSubmitStart = Date.now();
