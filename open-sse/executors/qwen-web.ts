@@ -48,7 +48,7 @@ const BX_UMIDTOKEN_FALLBACK = "T2gA0000000000000000000000000000000000000000";
 // for every completion request, even with a valid session. The version string is
 // the SPA build identifier shipped in the React client's `version` request header.
 // Pinned from a live capture (2026-08); bump if Qwen ships a breaking change.
-const QWEN_SPA_VERSION = "0.2.81";
+const QWEN_SPA_VERSION = "0.2.89";
 
 const MODEL_ALIASES: Record<string, string> = {
   // Legacy OmniRoute ids → current upstream catalog (GET /api/models).
@@ -457,6 +457,25 @@ export class QwenWebExecutor extends BaseExecutor {
           }
         }
 
+        // LEV fork: Streaming empty-content watchdog. If both content and
+        // reasoning are empty after the stream ends, emit an error chunk
+        // instead of a silent empty completion. This matches the non-streaming
+        // path's watchdog and prevents clients from receiving a 200 with
+        // content: null and completion_tokens: 0.
+        if (!fullContent.trim() && !fullReasoning.trim()) {
+          controller.enqueue(
+            encoder.encode(
+              emitChunk(
+                {
+                  content:
+                    "[Qwen error] Empty response from upstream — the session may be expired or the model may be unavailable.",
+                },
+                null
+              )
+            )
+          );
+        }
+
         if (hasTools) {
           const { content, toolCalls, finishReason } = buildToolAwareResult(
             fullContent,
@@ -537,12 +556,25 @@ function parseSseDelta(line: string): { kind: "answer" | "think"; text: string }
       .filter(Boolean)
       .join("");
   }
-  if (phase === "think" || phase === "thinking_summary") {
+  // LEV fork: Recognize Qwen's expanded phase enum (from SPA 0.2.89 bundle).
+  // Thinking phases: think, thinking_summary, DeepThinking, ResearchPlanning
+  // Answer phases: answer, ReportGeneration
+  // The previous parser only recognized think/thinking_summary/answer, causing
+  // DeepThinking and ReportGeneration content to be silently dropped — resulting
+  // in completion_tokens: 0 and content: null for thinking-enabled models.
+  const THINK_PHASES = new Set(["think", "thinking_summary", "DeepThinking", "ResearchPlanning"]);
+  const ANSWER_PHASES = new Set(["answer", "ReportGeneration"]);
+  if (THINK_PHASES.has(phase ?? "")) {
     return { kind: "think", text: content };
   }
-  // `answer` phase or a null/absent phase both carry assistant content.
-  if (phase === "answer" || phase === null || phase === undefined) {
+  if (ANSWER_PHASES.has(phase ?? "")) {
     return { kind: "answer", text: content };
   }
+  // A null/absent phase carries assistant content (default answer phase).
+  if (phase === null || phase === undefined) {
+    return { kind: "answer", text: content };
+  }
+  // Unknown phases (KeepAlive, finished, tool phases, image phases, etc.)
+  // carry no user-visible content — skip them.
   return null;
 }

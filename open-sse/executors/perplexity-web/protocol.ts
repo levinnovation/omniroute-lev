@@ -306,6 +306,19 @@ export function parseOpenAIMessages(messages: Array<Record<string, unknown>>): P
     currentMsg = history.pop()!.content;
   }
 
+  // LEV fork: Fold preceding user messages (Cursor context: user_info,
+  // git_status, agent_transcripts, etc.) into the current message so they
+  // are included in dsl_query. Without this, Perplexity only sees the last
+  // user message and loses all IDE context (open files, git state, etc.).
+  // Assistant messages are excluded from the fold because Perplexity's web
+  // API doesn't support multi-turn conversations via dsl_query — only the
+  // user's accumulated context matters.
+  const precedingUserMsgs = history.filter((h) => h.role === "user");
+  if (precedingUserMsgs.length > 0 && currentMsg) {
+    const contextBlock = precedingUserMsgs.map((m) => m.content).join("\n\n");
+    currentMsg = `${contextBlock}\n\n${currentMsg}`;
+  }
+
   return { systemMsg, history, currentMsg };
 }
 
