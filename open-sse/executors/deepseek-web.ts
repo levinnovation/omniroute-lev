@@ -379,6 +379,22 @@ function transformSSE(deepseekStream: ReadableStream, model: string): ReadableSt
   );
 }
 
+// LEV fork: Detect narrated tool intent — the model says it will use a tool
+// ("Let me read X", "I'll check Y", "Let me continue reading") but then stops
+// without emitting a <tool> block, killing the agent loop. This pattern is
+// common with DeepSeek-web's text-based tool calling where the model narrates
+// its plan but forgets to actually emit the structured tool block.
+const NARRATED_INTENT_RE =
+  /\b(let me|I'll|I will|I need to|let's|I want to|I'm going to)\b.+\b(read|check|look|search|find|continue|see|inspect|examine|explore|run|execute|call|use|open|list|grep|glob|write|edit|create|delete|shell|terminal)\b/i;
+
+function looksLikeNarratedIntent(content: string): boolean {
+  const text = content.trim();
+  if (text.length < 10 || text.length > 500) return false;
+  // Must not contain an actual tool block
+  if (text.includes("<tool>")) return false;
+  return NARRATED_INTENT_RE.test(text);
+}
+
 async function collectSSEContent(
   deepseekStream: ReadableStream,
   model: string
@@ -977,7 +993,7 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       );
 
       // One completion attempt against a given session id (fresh PoW per attempt).
-      const performCompletion = async (sid: string) => {
+      const performCompletion = async (sid: string, customPrompt?: string) => {
         const powChallenge = await getPowChallenge(accessToken, signal);
         const powAnswer = await solvePow(powChallenge);
         const reqHeaders: Record<string, string> = {
@@ -992,7 +1008,7 @@ export class DeepSeekWebExecutor extends BaseExecutor {
           chat_session_id: sid,
           parent_message_id: null,
           model_type: modelType,
-          prompt,
+          prompt: customPrompt ?? prompt,
           ref_file_ids: refFileIds,
           thinking_enabled: thinkingEnabled,
           search_enabled: searchEnabled,
@@ -1129,13 +1145,57 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       // OpenAI tool_calls. Buffering (even for stream clients) is acceptable because
       // tool invocations are short and need the complete block to parse. (#2820)
       if (hasTools) {
-        const { content, reasoningContent } = await collectSSEContent(resp.body!, clientModel);
+        let { content, reasoningContent } = await collectSSEContent(resp.body!, clientModel);
         await cleanupFn();
-        const { content: cleanedContent, toolCalls } = parseDeepSeekToolCalls(
+        let { content: cleanedContent, toolCalls } = parseDeepSeekToolCalls(
           content,
           `call-${Date.now()}`,
           requestedTools
         );
+
+        // LEV fork: Narrated-intent detector. The model sometimes says "Let me
+        // read X" or "I'll check Y" and then stops without emitting a <tool>
+        // block — killing the agent loop because no tool actually runs. When
+        // we detect this pattern (content with intent phrases but no tool
+        // calls), retry once with a corrective nudge appended to the prompt.
+        if (
+          (!toolCalls || toolCalls.length === 0) &&
+          cleanedContent &&
+          looksLikeNarratedIntent(cleanedContent)
+        ) {
+          log?.warn?.(
+            "DEEPSEEK-WEB",
+            "Narrated intent without tool block — retrying with corrective nudge"
+          );
+          const retrySession = await createSession(accessToken, signal);
+          const correctivePrompt =
+            prompt +
+            "\n\n---\nIMPORTANT: Your previous response narrated intent to use a tool " +
+            '("' +
+            cleanedContent.slice(0, 120) +
+            '...") but did NOT emit a <tool> block. ' +
+            "You MUST emit the <tool> block NOW. Do not describe what you will do — " +
+            'do it by outputting the <tool>{"name": ..., "arguments": ..., "_nonce": ...}</tool> block immediately.';
+          const retryResp = await performCompletion(retrySession, correctivePrompt);
+          deleteSessionOnDeepSeek(accessToken, retrySession).catch(() => {});
+          if (retryResp.resp.ok) {
+            const retryResult = await collectSSEContent(retryResp.resp.body!, clientModel);
+            const retryParsed = parseDeepSeekToolCalls(
+              retryResult.content,
+              `call-${Date.now()}`,
+              requestedTools
+            );
+            if (retryParsed.toolCalls && retryParsed.toolCalls.length > 0) {
+              content = retryResult.content;
+              reasoningContent = retryResult.reasoningContent;
+              cleanedContent = retryParsed.content;
+              toolCalls = retryParsed.toolCalls;
+              reqHeaders = retryResp.reqHeaders;
+              requestPayload = retryResp.requestPayload;
+            }
+          }
+        }
+
         return buildToolAwareResult({
           stream: stream !== false,
           clientModel,

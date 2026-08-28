@@ -85,7 +85,11 @@ export function serializeDeepSeekToolPrompt(tools: unknown): string {
     "- Use exactly <tool>...</tool>. Do NOT use <tool:name>, <tool_call>, <name>, <parameter>, id=/name= attributes, or code fences.",
     `- Include the secret binding "_nonce": "${nonce}" exactly as shown.`,
     '- "name" must be one of the tools below; "arguments" must be a JSON object.',
-    "- When a tool is needed, emit the <tool> block instead of only describing the plan.",
+    "- CRITICAL: When you want to use a tool, you MUST emit the <tool> block in THIS response, " +
+      "right now. Do NOT say 'Let me read X' or 'I'll check Y' or 'Let me continue' and then " +
+      "stop — that ends the task with no tool call executed. Instead, output the <tool> block " +
+      "immediately, optionally preceded by a one-line plan. Never narrate intent to use a tool " +
+      "without actually emitting the <tool> block in the same response.",
     "- If you want to run a shell command, you MUST use the Shell tool with a <tool> block. Do NOT write commands as plain text.",
     "- Emit one <tool> block per call; you may put several blocks back to back.",
     "- If no tool is needed, just answer normally without any <tool> block.",
@@ -219,7 +223,9 @@ export function buildToolConversationPrompt(
     // Anchor the model to the work already done so it advances instead of repeating it.
     parts.push(
       "Continue the task using the tool results above. Do NOT repeat tool calls that already " +
-        "succeeded; perform the next step or give the final answer."
+        "succeeded; perform the next step or give the final answer. " +
+        "If the next step requires a tool, emit the <tool> block NOW in this response — " +
+        "do NOT narrate intent like 'Let me read X' and then stop."
     );
   }
 
@@ -232,7 +238,7 @@ export function buildToolConversationPrompt(
   if (result.length > MAX_PROMPT_LEN) {
     const systemSection = systemParts.length ? systemParts.join("\n\n") : "";
     const continuationHint = sawToolActivity
-      ? "Continue the task using the tool results above. Do NOT repeat tool calls that already succeeded; perform the next step or give the final answer."
+      ? "Continue the task using the tool results above. Do NOT repeat tool calls that already succeeded; perform the next step or give the final answer. If the next step requires a tool, emit the <tool> block NOW in this response — do NOT narrate intent like 'Let me read X' and then stop."
       : "";
     // Keep the last N lines that fit within the budget
     const budget = MAX_PROMPT_LEN - systemSection.length - continuationHint.length - 200;
