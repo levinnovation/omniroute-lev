@@ -90,6 +90,45 @@ test("buildToolConversationPrompt drops older turns when total prompt exceeds li
   assert.ok(prompt.includes("coding agent"), "System prompt should be preserved");
 });
 
+test("buildToolConversationPrompt preserves the actual question at the start of a large last user message", async () => {
+  const { buildToolConversationPrompt } =
+    await import("../../open-sse/translator/deepseekWebTools.ts");
+
+  // Simulate a Cursor-style user message: the actual question is at the
+  // beginning, followed by a very long DOM snippet section. The naive
+  // slice(-budget) truncation would keep the END (DOM snippets) and drop
+  // the BEGINNING (the actual question), causing the model to see only
+  // context fragments with no task.
+  const actualQuestion =
+    "in https://example.com/portal/admin/retail/inventario/reposicion, " +
+    "the glass header in the unified table seems broken - not properly aligned";
+  const domSnippets = "y".repeat(70_000); // Very long DOM context after the question
+
+  const messages = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "[Image 1]: The image shows a section of a user interface" },
+        { type: "text", text: "<image_files>\n1. /path/to/image.png\n</image_files>" },
+        {
+          type: "text",
+          text: `<timestamp>Friday, Aug 28, 2026</timestamp>\n<user_query>\n${actualQuestion}\n\`\`\`browser_element\n${domSnippets}\n\`\`\`\n</user_query>`,
+        },
+      ],
+    },
+  ];
+
+  const prompt = buildToolConversationPrompt(messages, "You are a coding agent.");
+  // The actual question MUST be present — it's at the beginning of the last user message
+  assert.ok(
+    prompt.includes("glass header"),
+    "The actual user question at the start of the last user message must be preserved"
+  );
+  assert.ok(prompt.includes("reposicion"), "The URL in the user question must be preserved");
+  // The prompt should be under the limit
+  assert.ok(prompt.length <= 90_000, `Prompt should be under limit, got ${prompt.length} chars`);
+});
+
 test("buildToolConversationPrompt preserves small tool results without truncation", async () => {
   const { buildToolConversationPrompt } =
     await import("../../open-sse/translator/deepseekWebTools.ts");

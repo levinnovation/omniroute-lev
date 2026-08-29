@@ -237,21 +237,63 @@ export function buildToolConversationPrompt(
   // from the beginning of the conversation (keep system prompt + most recent
   // turns). This preserves the current task context while shedding old tool
   // results that are less relevant.
+  //
+  // CRITICAL: The last user message contains the actual question/task at its
+  // BEGINNING (before any IDE-attached DOM snippets, screenshots, etc.).
+  // A naive `slice(-budget)` keeps the END of the last user message (DOM
+  // snippets) but drops the BEGINNING (the actual question), causing the model
+  // to see only context fragments with no task. We must preserve the last
+  // user message intact and truncate older lines instead. If the last user
+  // message alone exceeds the budget, truncate its MIDDLE (keep head + tail).
   if (result.length > MAX_PROMPT_LEN) {
     const systemSection = systemParts.length ? systemParts.join("\n\n") : "";
     const continuationHint = sawToolActivity
       ? "Continue the task using the tool results above. Do NOT repeat tool calls that already succeeded; perform the next step or give the final answer. If the next step requires a tool, emit the <tool> block NOW in this response — do NOT narrate intent like 'Let me read X' and then stop."
       : "";
-    // Keep the last N lines that fit within the budget
     const budget = MAX_PROMPT_LEN - systemSection.length - continuationHint.length - 200;
-    const allLines = lines.join("\n\n");
-    if (allLines.length > budget) {
-      const keptLines = allLines.slice(-budget);
-      result = [systemSection, keptLines, continuationHint]
-        .filter(Boolean)
-        .join("\n\n")
-        .replace(/!\[.*?\]\(.*?\)/g, "");
+
+    // Find the last user line index — this is the actual task/question.
+    let lastUserIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].startsWith("User: ")) {
+        lastUserIdx = i;
+        break;
+      }
     }
+
+    // Always keep the last user message; truncate older lines from the front.
+    const lastUserLine = lastUserIdx >= 0 ? lines[lastUserIdx] : "";
+    const olderLines = lastUserIdx >= 0 ? lines.slice(0, lastUserIdx) : lines;
+    const olderJoined = olderLines.join("\n\n");
+
+    // Reserve space for the last user line
+    const olderBudget = budget - lastUserLine.length - 200;
+
+    let keptOlder = "";
+    let keptLastUser = lastUserLine;
+
+    if (olderBudget > 0 && olderJoined.length > olderBudget) {
+      // Keep the TAIL of older lines (most recent tool results / assistant turns)
+      keptOlder = olderJoined.slice(-olderBudget);
+    } else if (olderBudget > 0) {
+      keptOlder = olderJoined;
+    }
+
+    // If the last user line itself exceeds the budget, truncate its MIDDLE.
+    // Keep the head (where the question is) and tail (where recent context is).
+    if (lastUserLine.length > budget) {
+      const headLen = Math.floor(budget * 0.6);
+      const tailLen = budget - headLen - 100;
+      keptLastUser =
+        lastUserLine.slice(0, headLen) +
+        `\n\n[...truncated ${lastUserLine.length - headLen - tailLen} chars...]\n\n` +
+        lastUserLine.slice(-tailLen);
+    }
+
+    result = [systemSection, keptOlder, keptLastUser, continuationHint]
+      .filter(Boolean)
+      .join("\n\n")
+      .replace(/!\[.*?\]\(.*?\)/g, "");
   }
 
   return result;
