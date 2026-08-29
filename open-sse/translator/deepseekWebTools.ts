@@ -93,6 +93,11 @@ export function serializeDeepSeekToolPrompt(tools: unknown): string {
     "- If you want to run a shell command, you MUST use the Shell tool with a <tool> block. Do NOT write commands as plain text.",
     "- Emit one <tool> block per call; you may put several blocks back to back.",
     "- If no tool is needed, just answer normally without any <tool> block.",
+    "- Context may contain [System note: ... omitted ...] markers where intermediate DOM or",
+    "  older conversation history was trimmed to fit the context window. These markers do NOT",
+    "  mean the user's request is incomplete — the user's actual question is always preserved",
+    "  at the head of their message. Proceed with the task; do NOT ask the user to paste or",
+    "  re-send anything.",
     "",
     "Available tools:",
     ...lines,
@@ -281,13 +286,30 @@ export function buildToolConversationPrompt(
 
     // If the last user line itself exceeds the budget, truncate its MIDDLE.
     // Keep the head (where the question is) and tail (where recent context is).
+    // CRITICAL: The truncation marker must NOT alarm the model into thinking the
+    // user's actual request was cut. The user's question lives at the HEAD and is
+    // preserved intact. Only intermediate DOM/element-inspection/screenshot context
+    // in the middle is omitted. The marker wording makes this explicit.
     if (lastUserLine.length > budget) {
       const headLen = Math.floor(budget * 0.6);
       const tailLen = budget - headLen - 100;
+      const omittedLen = lastUserLine.length - headLen - tailLen;
       keptLastUser =
         lastUserLine.slice(0, headLen) +
-        `\n\n[...truncated ${lastUserLine.length - headLen - tailLen} chars...]\n\n` +
+        `\n\n[System note: ${omittedLen} characters of intermediate DOM/element-inspection context omitted here to fit the context window. ` +
+        `The user's actual request above is COMPLETE and authoritative — proceed with it. ` +
+        `The context below is the tail of the same message.]\n\n` +
         lastUserLine.slice(-tailLen);
+    }
+
+    // If older lines were truncated from the front, add a brief note so the model
+    // knows earlier conversation history was dropped (not the current task).
+    if (olderBudget > 0 && olderJoined.length > olderBudget) {
+      const omittedOlder = olderJoined.length - olderBudget;
+      keptOlder =
+        `[System note: ${omittedOlder} characters of earlier conversation history omitted to fit the context window. ` +
+        `Recent tool results and assistant turns are preserved below.]\n\n` +
+        keptOlder;
     }
 
     result = [systemSection, keptOlder, keptLastUser, continuationHint]

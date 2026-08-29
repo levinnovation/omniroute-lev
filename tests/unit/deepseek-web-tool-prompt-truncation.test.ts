@@ -88,6 +88,11 @@ test("buildToolConversationPrompt drops older turns when total prompt exceeds li
   assert.ok(prompt.includes("final answer"), "Most recent user message should be preserved");
   // The system prompt should still be present
   assert.ok(prompt.includes("coding agent"), "System prompt should be preserved");
+  // When older lines are truncated from the front, a System note should explain it
+  assert.ok(
+    prompt.includes("earlier conversation history omitted"),
+    "Front-truncation of older lines should include a System note"
+  );
 });
 
 test("buildToolConversationPrompt preserves the actual question at the start of a large last user message", async () => {
@@ -102,7 +107,7 @@ test("buildToolConversationPrompt preserves the actual question at the start of 
   const actualQuestion =
     "in https://example.com/portal/admin/retail/inventario/reposicion, " +
     "the glass header in the unified table seems broken - not properly aligned";
-  const domSnippets = "y".repeat(70_000); // Very long DOM context after the question
+  const domSnippets = "y".repeat(90_000); // Very long DOM context after the question
 
   const messages = [
     {
@@ -127,6 +132,20 @@ test("buildToolConversationPrompt preserves the actual question at the start of 
   assert.ok(prompt.includes("reposicion"), "The URL in the user question must be preserved");
   // The prompt should be under the limit
   assert.ok(prompt.length <= 90_000, `Prompt should be under limit, got ${prompt.length} chars`);
+  // The truncation marker should be informative, not alarming
+  assert.ok(
+    prompt.includes("System note:") && prompt.includes("omitted"),
+    "Truncation marker should be a System note explaining context was omitted"
+  );
+  assert.ok(
+    prompt.includes("COMPLETE and authoritative"),
+    "Truncation marker should reassure that the user's request is complete"
+  );
+  // The marker should NOT use the old alarming wording
+  assert.ok(
+    !/\[\.\.\.truncated \d+ chars\.\.\.\]/.test(prompt),
+    "Should not use the old alarming [...truncated N chars...] marker"
+  );
 });
 
 test("buildToolConversationPrompt preserves small tool results without truncation", async () => {
@@ -236,6 +255,16 @@ test("serializeDeepSeekToolPrompt includes CRITICAL no-narration rule", async ()
   assert.ok(
     prompt.includes("emit the <tool> block in THIS response"),
     "Prompt should require same-response tool emission"
+  );
+  // LEV fork: The tool prompt should also mention truncation markers so the model
+  // doesn't panic when it sees [System note: ... omitted ...]
+  assert.ok(
+    prompt.includes("System note"),
+    "Tool prompt should mention System note truncation markers"
+  );
+  assert.ok(
+    prompt.includes("do NOT ask the user to paste"),
+    "Tool prompt should tell the model not to ask user to re-send truncated content"
   );
 });
 
