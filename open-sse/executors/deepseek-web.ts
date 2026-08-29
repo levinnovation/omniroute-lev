@@ -991,6 +991,16 @@ export class DeepSeekWebExecutor extends BaseExecutor {
         "DEEPSEEK-WEB",
         `model_type=${modelType}, thinking=${thinkingEnabled}, search=${searchEnabled}, files=${refFileIds.length}, stream=${stream !== false}, persist=${persistSession}, window=${historyWindow}`
       );
+      // LEV fork: diagnostic logging for prompt truncation debugging
+      if (hasTools) {
+        log?.info?.(
+          "DEEPSEEK-WEB",
+          `prompt_len=${prompt.length}, tool_sys_prompt_len=${toolSystemPrompt.length}, ` +
+            `messages_count=${messages.length}, ` +
+            `prompt_head_200=${JSON.stringify(prompt.slice(0, 200))}, ` +
+            `has_user_query=${prompt.includes("User's actual request")}`
+        );
+      }
 
       // One completion attempt against a given session id (fresh PoW per attempt).
       const performCompletion = async (sid: string, customPrompt?: string) => {

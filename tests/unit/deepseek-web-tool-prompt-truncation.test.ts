@@ -95,15 +95,15 @@ test("buildToolConversationPrompt drops older turns when total prompt exceeds li
   );
 });
 
-test("buildToolConversationPrompt preserves the actual question at the start of a large last user message", async () => {
+test("buildToolConversationPrompt preserves the actual question via <user_query> extraction", async () => {
   const { buildToolConversationPrompt } =
     await import("../../open-sse/translator/deepseekWebTools.ts");
 
-  // Simulate a Cursor-style user message: the actual question is at the
-  // beginning, followed by a very long DOM snippet section. The naive
-  // slice(-budget) truncation would keep the END (DOM snippets) and drop
-  // the BEGINNING (the actual question), causing the model to see only
-  // context fragments with no task.
+  // Simulate a Cursor-style user message: the actual question is wrapped in
+  // <user_query> tags, buried after <image_files> and <timestamp> prefixes,
+  // followed by a very long DOM snippet section. The extraction logic pulls
+  // the <user_query> content and preserves it at the top regardless of
+  // where truncation happens.
   const actualQuestion =
     "in https://example.com/portal/admin/retail/inventario/reposicion, " +
     "the glass header in the unified table seems broken - not properly aligned";
@@ -124,14 +124,19 @@ test("buildToolConversationPrompt preserves the actual question at the start of 
   ];
 
   const prompt = buildToolConversationPrompt(messages, "You are a coding agent.");
-  // The actual question MUST be present — it's at the beginning of the last user message
+  // The actual question MUST be present — extracted from <user_query> and preserved at top
   assert.ok(
     prompt.includes("glass header"),
-    "The actual user question at the start of the last user message must be preserved"
+    "The actual user question from <user_query> must be preserved"
   );
   assert.ok(prompt.includes("reposicion"), "The URL in the user question must be preserved");
   // The prompt should be under the limit
   assert.ok(prompt.length <= 90_000, `Prompt should be under limit, got ${prompt.length} chars`);
+  // The user_query should be preserved as a labeled section at the top
+  assert.ok(
+    prompt.includes("User's actual request"),
+    "The <user_query> content should be labeled as the user's actual request"
+  );
   // The truncation marker should be informative, not alarming
   assert.ok(
     prompt.includes("System note:") && prompt.includes("omitted"),
@@ -146,6 +151,41 @@ test("buildToolConversationPrompt preserves the actual question at the start of 
     !/\[\.\.\.truncated \d+ chars\.\.\.\]/.test(prompt),
     "Should not use the old alarming [...truncated N chars...] marker"
   );
+});
+
+test("buildToolConversationPrompt preserves <user_query> even with huge system prompt and multiple messages", async () => {
+  const { buildToolConversationPrompt } =
+    await import("../../open-sse/translator/deepseekWebTools.ts");
+
+  // Simulate a realistic Cursor session: huge system prompt (tool definitions),
+  // user_info/rules message, prior tool calls, and a final user message with
+  // <user_query> buried in a large DOM context.
+  const hugeSystemPrompt = "S".repeat(40_000); // Simulate large tool definitions
+  const userInfo = "U".repeat(20_000); // Simulate AGENTS.md, rules, etc.
+  const actualQuestion = "Fix the sticky glass header alignment in the reposicion table";
+  const domSnippets = "D".repeat(50_000);
+
+  const messages = [
+    { role: "user", content: userInfo },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "<image_files>\n1. /path/to/image.png\n</image_files>" },
+        {
+          type: "text",
+          text: `<timestamp>Friday, Aug 28, 2026</timestamp>\n<user_query>\n${actualQuestion}\n\`\`\`browser_element\n${domSnippets}\n\`\`\`\n</user_query>`,
+        },
+      ],
+    },
+  ];
+
+  const prompt = buildToolConversationPrompt(messages, hugeSystemPrompt);
+  // The actual question MUST survive — this is the core fix
+  assert.ok(
+    prompt.includes(actualQuestion),
+    "The <user_query> content must be preserved even with huge system prompt and DOM context"
+  );
+  assert.ok(prompt.length <= 90_000, `Prompt should be under limit, got ${prompt.length} chars`);
 });
 
 test("buildToolConversationPrompt preserves small tool results without truncation", async () => {

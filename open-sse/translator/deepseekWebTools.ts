@@ -125,6 +125,37 @@ function extractText(content: unknown): string {
 }
 
 /**
+ * Extract the <user_query>...</user_query> content from a user message.
+ *
+ * Cursor wraps the actual user question in <user_query> tags. The rest of the
+ * message content is IDE-attached context (image descriptions, DOM dumps,
+ * timestamps, file lists, etc.). When truncating large prompts, we must
+ * preserve the <user_query> content at all costs — it IS the task.
+ *
+ * IMPORTANT: The <user_query> tag often contains BOTH the actual question AND
+ * attached context like ```browser_element``` DOM dumps. We strip code blocks
+ * and other large attached context to extract just the natural-language question.
+ *
+ * Returns the extracted query text, or empty string if no <user_query> tag found.
+ */
+function extractUserQuery(content: unknown): string {
+  const text = extractText(content);
+  // Match <user_query>...</user_query> (case-insensitive, dot-all)
+  const m = /<user_query>([\s\S]*?)<\/user_query>/i.exec(text);
+  if (!m) return "";
+  let query = m[1].trim();
+  // Strip code blocks (```...```) which contain DOM dumps, browser elements, etc.
+  query = query.replace(/```[\s\S]*?```/g, "").trim();
+  // Strip <image_files>...</image_files> blocks
+  query = query.replace(/<image_files>[\s\S]*?<\/image_files>/gi, "").trim();
+  // Strip <timestamp>...</timestamp> blocks
+  query = query.replace(/<timestamp>[\s\S]*?<\/timestamp>/gi, "").trim();
+  // Collapse multiple whitespace
+  query = query.replace(/\n{3,}/g, "\n\n").trim();
+  return query;
+}
+
+/**
  * Build the single `prompt` string for an agentic (tool-using) DeepSeek-web turn.
  *
  * The web endpoint takes a flat prompt with no `messages[]`, so the legacy `messagesToPrompt`
@@ -243,13 +274,13 @@ export function buildToolConversationPrompt(
   // turns). This preserves the current task context while shedding old tool
   // results that are less relevant.
   //
-  // CRITICAL: The last user message contains the actual question/task at its
-  // BEGINNING (before any IDE-attached DOM snippets, screenshots, etc.).
-  // A naive `slice(-budget)` keeps the END of the last user message (DOM
-  // snippets) but drops the BEGINNING (the actual question), causing the model
-  // to see only context fragments with no task. We must preserve the last
-  // user message intact and truncate older lines instead. If the last user
-  // message alone exceeds the budget, truncate its MIDDLE (keep head + tail).
+  // CRITICAL FIX: Cursor wraps the actual user question in <user_query> tags.
+  // The rest of the user message is IDE-attached context (image descriptions,
+  // DOM dumps, timestamps, file lists). Previous logic tried to preserve "the
+  // beginning of the last user message" but the <user_query> content is buried
+  // after <image_files> and <timestamp> prefixes. The robust approach: extract
+  // the <user_query> content directly and ALWAYS preserve it at the top of the
+  // conversation section, no matter what else gets truncated.
   if (result.length > MAX_PROMPT_LEN) {
     const systemSection = systemParts.length ? systemParts.join("\n\n") : "";
     const continuationHint = sawToolActivity
@@ -257,7 +288,23 @@ export function buildToolConversationPrompt(
       : "";
     const budget = MAX_PROMPT_LEN - systemSection.length - continuationHint.length - 200;
 
-    // Find the last user line index — this is the actual task/question.
+    // Extract the <user_query> from the last user message that has one.
+    // This IS the task — preserve it at all costs.
+    let userQueryText = "";
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        userQueryText = extractUserQuery(messages[i].content);
+        if (userQueryText) break;
+      }
+    }
+
+    // The query prefix is always at the top of the conversation section.
+    const queryPrefix = userQueryText
+      ? `[User's actual request — preserved in full, this is the authoritative task]:\n${userQueryText}\n\n`
+      : "";
+    const queryBudget = budget - queryPrefix.length;
+
+    // Find the last user line index for splitting older vs. recent context.
     let lastUserIdx = -1;
     for (let i = lines.length - 1; i >= 0; i--) {
       if (lines[i].startsWith("User: ")) {
@@ -266,53 +313,53 @@ export function buildToolConversationPrompt(
       }
     }
 
-    // Always keep the last user message; truncate older lines from the front.
     const lastUserLine = lastUserIdx >= 0 ? lines[lastUserIdx] : "";
     const olderLines = lastUserIdx >= 0 ? lines.slice(0, lastUserIdx) : lines;
     const olderJoined = olderLines.join("\n\n");
 
-    // Reserve space for the last user line
-    const olderBudget = budget - lastUserLine.length - 200;
+    // Split remaining budget: 30% for older context, 70% for last user line's
+    // attached context (DOM dumps, image descriptions, etc.).
+    const olderBudget = Math.floor(queryBudget * 0.3) - 200;
+    const lastUserBudget = queryBudget - Math.max(olderBudget, 0) - 200;
 
     let keptOlder = "";
-    let keptLastUser = lastUserLine;
+    let keptLastUser = "";
 
-    if (olderBudget > 0 && olderJoined.length > olderBudget) {
-      // Keep the TAIL of older lines (most recent tool results / assistant turns)
-      keptOlder = olderJoined.slice(-olderBudget);
-    } else if (olderBudget > 0) {
-      keptOlder = olderJoined;
+    // Keep the TAIL of older lines (most recent tool results / assistant turns)
+    if (olderBudget > 0) {
+      if (olderJoined.length > olderBudget) {
+        keptOlder = olderJoined.slice(-olderBudget);
+        const omittedOlder = olderJoined.length - olderBudget;
+        keptOlder =
+          `[System note: ${omittedOlder} characters of earlier conversation history omitted to fit the context window. ` +
+          `Recent tool results and assistant turns are preserved below.]\n\n` +
+          keptOlder;
+      } else {
+        keptOlder = olderJoined;
+      }
     }
 
-    // If the last user line itself exceeds the budget, truncate its MIDDLE.
-    // Keep the head (where the question is) and tail (where recent context is).
-    // CRITICAL: The truncation marker must NOT alarm the model into thinking the
-    // user's actual request was cut. The user's question lives at the HEAD and is
-    // preserved intact. Only intermediate DOM/element-inspection/screenshot context
-    // in the middle is omitted. The marker wording makes this explicit.
-    if (lastUserLine.length > budget) {
-      const headLen = Math.floor(budget * 0.6);
-      const tailLen = budget - headLen - 100;
-      const omittedLen = lastUserLine.length - headLen - tailLen;
-      keptLastUser =
-        lastUserLine.slice(0, headLen) +
-        `\n\n[System note: ${omittedLen} characters of intermediate DOM/element-inspection context omitted here to fit the context window. ` +
-        `The user's actual request above is COMPLETE and authoritative — proceed with it. ` +
-        `The context below is the tail of the same message.]\n\n` +
-        lastUserLine.slice(-tailLen);
+    // Truncate the last user line's attached context (DOM dumps, etc.)
+    if (lastUserLine.length > 0 && lastUserBudget > 0) {
+      if (lastUserLine.length > lastUserBudget) {
+        const headLen = Math.floor(lastUserBudget * 0.5);
+        const tailLen = lastUserBudget - headLen - 100;
+        const omittedLen = lastUserLine.length - headLen - tailLen;
+        keptLastUser =
+          lastUserLine.slice(0, headLen) +
+          `\n\n[System note: ${omittedLen} characters of intermediate DOM/element-inspection context omitted here to fit the context window. ` +
+          `The user's actual request (shown above in full) is COMPLETE and authoritative — proceed with it. ` +
+          `The context below is the tail of the same message.]\n\n` +
+          lastUserLine.slice(-tailLen);
+      } else {
+        keptLastUser = lastUserLine;
+      }
     }
 
-    // If older lines were truncated from the front, add a brief note so the model
-    // knows earlier conversation history was dropped (not the current task).
-    if (olderBudget > 0 && olderJoined.length > olderBudget) {
-      const omittedOlder = olderJoined.length - olderBudget;
-      keptOlder =
-        `[System note: ${omittedOlder} characters of earlier conversation history omitted to fit the context window. ` +
-        `Recent tool results and assistant turns are preserved below.]\n\n` +
-        keptOlder;
-    }
-
-    result = [systemSection, keptOlder, keptLastUser, continuationHint]
+    // Assemble: system section, then [query prefix + older context + last user context], then continuation
+    const conversationSection =
+      queryPrefix + keptOlder + (keptOlder && keptLastUser ? "\n\n" : "") + keptLastUser;
+    result = [systemSection, conversationSection, continuationHint]
       .filter(Boolean)
       .join("\n\n")
       .replace(/!\[.*?\]\(.*?\)/g, "");
