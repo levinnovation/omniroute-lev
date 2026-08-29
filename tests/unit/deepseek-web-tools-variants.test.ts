@@ -108,11 +108,47 @@ describe("deepseekWebTools — variants", () => {
     assert.deepEqual(JSON.parse(call.function.arguments), { city: "Paris" });
   });
 
-  test("bare JSON (no tags) is NOT promoted to tool_calls (#9343)", () => {
+  test("bare JSON with nested braces IS promoted to tool_calls (LEV fork)", () => {
+    // LEV fork: DeepSeek-web emits bare JSON tool calls without <tool> tags.
+    // The parser must detect these using brace-matching (not regex, which
+    // can't handle nested braces in arguments: {...}).
     const text = `{"name":"getWeather","arguments":{"city":"Paris"}}`;
-    const { toolCalls, content } = parseDeepSeekToolCalls(text, "call", TOOLS);
-    assert.equal(toolCalls, null, "bare JSON must not be promoted to tool_calls");
-    assert.equal(content, text, "bare JSON must be preserved as content text");
+    const { toolCalls } = parseDeepSeekToolCalls(text, "call", TOOLS);
+    assert.ok(
+      toolCalls && toolCalls.length === 1,
+      "bare JSON with matching tool name must be promoted"
+    );
+    assert.equal(toolCalls[0].function.name, "get_weather");
+  });
+
+  test("bare JSON with non-matching tool name is NOT promoted", () => {
+    // If the JSON name doesn't fuzzy-match any requested tool, don't promote.
+    const text = `{"name":"nonexistent_tool","arguments":{"city":"Paris"}}`;
+    const { toolCalls } = parseDeepSeekToolCalls(text, "call", TOOLS);
+    assert.equal(toolCalls, null, "bare JSON with non-matching tool name must not be promoted");
+  });
+
+  test("bare JSON with nested arguments after natural language preamble (LEV fork production fix)", () => {
+    // This is the exact production failure: DeepSeek-web emits a natural
+    // language sentence followed by a bare JSON tool call with nested
+    // arguments. The old regex couldn't handle nested braces.
+    const text = `I'll investigate the source code for this table's header alignment issue.\n\n{"name": "Grep", "arguments": {"pattern": "ORDENAR YA|COBERTURA|DECISIÓN", "path": "/Users/vinicioflores", "output_mode": "files_with_matches", "_nonce": "myf5518c"}}`;
+    const { toolCalls, content } = parseDeepSeekToolCalls(text, "call", [
+      ...TOOLS,
+      { type: "function", function: { name: "Grep", description: "Search" } },
+    ]);
+    assert.ok(toolCalls && toolCalls.length === 1, "bare JSON tool call must be detected");
+    assert.equal(toolCalls[0].function.name, "Grep");
+    assert.deepEqual(JSON.parse(toolCalls[0].function.arguments), {
+      pattern: "ORDENAR YA|COBERTURA|DECISIÓN",
+      path: "/Users/vinicioflores",
+      output_mode: "files_with_matches",
+      _nonce: "myf5518c",
+    });
+    // The natural language preamble should be preserved
+    assert.ok(content.includes("investigate the source code"), "preamble text must be preserved");
+    // The JSON tool call should be stripped from content
+    assert.ok(!content.includes('"name": "Grep"'), "tool call JSON must be stripped from content");
   });
 
   test("#3260: tag name attribute is bogus, real name is in JSON body", () => {
@@ -161,7 +197,7 @@ describe("deepseekWebTools — strict prompt", () => {
     const prompt = serializeDeepSeekToolPrompt(TOOLS);
     assert.ok(prompt.includes("todowrite"));
     assert.ok(prompt.includes("get_weather"));
-    assert.ok(prompt.includes('_nonce'), "includes nonce binding");
+    assert.ok(prompt.includes("_nonce"), "includes nonce binding");
     assert.ok(prompt.includes('<tool>{"name"'), "shows the canonical format");
     assert.ok(/never|not|do not/i.test(prompt), "warns against alternative formats");
   });

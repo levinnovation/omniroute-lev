@@ -832,8 +832,8 @@ function parseToolCallsWrapper(
 //   {"name": "Read", "arguments": {"path": "/some/file.ts"}}
 // Each JSON object with a "name" (or "command") field and an "arguments"
 // (or "parameters") field is treated as a tool call.
-const BARE_JSON_TOOL_RE =
-  /\{[^{}]*"(?:name|command|tool_name|tool)"\s*:\s*"(?:[^"\\]|\\.)*"[^{}]*\}/g;
+// NOTE: The old regex approach was replaced with a brace-matching scanner
+// because regex `[^{}]*` cannot handle nested braces in `arguments: {...}`.
 
 // LEV fork: Match markdown code fences wrapping tool call JSON:
 //   ```tool
@@ -920,15 +920,53 @@ function parseBareJsonToolCalls(
     acceptedRanges.push({ start: fenceStart, end: fenceEnd });
   }
 
-  // Strategy 2: Match bare JSON objects (no code fence wrapper).
-  BARE_JSON_TOOL_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
+  // Strategy 2: Scan for bare JSON objects with brace matching.
+  // The old regex `[^{}]*` couldn't handle nested braces in `arguments: {...}`,
+  // which is the common case for Cursor tool calls. We now scan for `{` and
+  // find the matching `}` with proper nesting, then try to parse the result.
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== "{") continue;
+    // Skip if this position is already inside a matched code fence
+    if (acceptedRanges.some((r) => i >= r.start && i < r.end)) continue;
 
-  while ((m = BARE_JSON_TOOL_RE.exec(text)) !== null) {
-    // Skip if this JSON is already inside a code fence that was matched
-    if (acceptedRanges.some((r) => m!.index >= r.start && m!.index < r.end)) continue;
+    // Quick pre-filter: the JSON must contain a "name"/"command"/"tool" field
+    // within the first ~200 chars to be a candidate. This avoids scanning
+    // every single `{` in the text (e.g., code blocks).
+    const lookahead = text.slice(i, i + 200);
+    if (!/"(?:name|command|tool_name|tool)"\s*:/.test(lookahead)) continue;
 
-    const raw = m[0];
+    // Find the matching closing brace with proper nesting
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let end = -1;
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          end = j + 1;
+          break;
+        }
+      }
+    }
+    if (end < 0) continue;
+
+    const raw = text.slice(i, end);
     const parsed = parseLooseJsonObject(raw);
     if (!parsed) continue;
 
@@ -939,7 +977,11 @@ function parseBareJsonToolCalls(
       (typeof parsed.tool === "string" ? parsed.tool : null);
     if (!emittedName) continue;
 
-    const name = resolveRequestedToolName(emittedName, requested) || emittedName;
+    // For bare JSON (no wrapper tags), only promote if the name matches a
+    // requested tool. This prevents false positives on arbitrary JSON content.
+    const name = resolveRequestedToolName(emittedName, requested);
+    if (!name) continue;
+
     const args =
       parsed.arguments !== undefined
         ? parsed.arguments
@@ -957,7 +999,9 @@ function parseBareJsonToolCalls(
         arguments: safeArgsString(args),
       },
     });
-    acceptedRanges.push({ start: m.index, end: m.index + raw.length });
+    acceptedRanges.push({ start: i, end });
+    // Skip past this match
+    i = end - 1;
   }
 
   if (toolCalls.length === 0) {
