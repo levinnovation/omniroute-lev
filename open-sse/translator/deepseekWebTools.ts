@@ -138,7 +138,7 @@ function extractText(content: unknown): string {
  *
  * Returns the extracted query text, or empty string if no <user_query> tag found.
  */
-function extractUserQuery(content: unknown): string {
+export function extractUserQuery(content: unknown): string {
   const text = extractText(content);
   // Match <user_query>...</user_query> (case-insensitive, dot-all)
   const m = /<user_query>([\s\S]*?)<\/user_query>/i.exec(text);

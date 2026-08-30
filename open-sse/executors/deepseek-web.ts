@@ -5,6 +5,7 @@ import {
   serializeDeepSeekToolPrompt,
   parseDeepSeekToolCalls,
   buildToolConversationPrompt,
+  extractUserQuery,
 } from "../translator/deepseekWebTools.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import {
@@ -1183,19 +1184,24 @@ export class DeepSeekWebExecutor extends BaseExecutor {
             "Narrated intent without tool block — retrying with minimal corrective prompt"
           );
           const retrySession = await createSession(accessToken, signal);
-          // Build a minimal prompt: tool contract + last user message + nudge.
-          // This avoids re-sending the entire (possibly oversized) trajectory.
+          // Build a minimal prompt: tool contract + extracted user query + nudge.
+          // Use extractUserQuery to get just the actual task (without image
+          // descriptions, DOM dumps, etc.) for a cleaner, more focused retry.
           const lastUserMsg = messages.filter((m) => m.role === "user").pop();
-          const lastUserText = lastUserMsg
-            ? typeof lastUserMsg.content === "string"
-              ? lastUserMsg.content
-              : Array.isArray(lastUserMsg.content)
-                ? (lastUserMsg.content as Array<{ type?: string; text?: string }>)
-                    .filter((p) => p?.type === "text")
-                    .map((p) => p?.text ?? "")
-                    .join("\n")
-                : ""
-            : "";
+          const extractedQuery = lastUserMsg ? extractUserQuery(lastUserMsg.content) : "";
+          // Fallback to raw text if extractUserQuery returns empty (no <user_query> tag)
+          let lastUserText = extractedQuery;
+          if (!lastUserText && lastUserMsg) {
+            lastUserText =
+              typeof lastUserMsg.content === "string"
+                ? lastUserMsg.content
+                : Array.isArray(lastUserMsg.content)
+                  ? (lastUserMsg.content as Array<{ type?: string; text?: string }>)
+                      .filter((p) => p?.type === "text")
+                      .map((p) => p?.text ?? "")
+                      .join("\n")
+                  : "";
+          }
           const minimalRetryPrompt =
             toolSystemPrompt +
             "\n\n---\nPrevious task context (last user request):\n" +
@@ -1204,7 +1210,9 @@ export class DeepSeekWebExecutor extends BaseExecutor {
             cleanedContent.slice(0, 200) +
             '" — you narrated intent to use a tool but did NOT emit a <tool> block. ' +
             "You MUST emit the <tool> block NOW. Do not describe what you will do — " +
-            'do it by outputting the <tool>{"name": ..., "arguments": ..., "_nonce": ...}</tool> block immediately.';
+            'do it by outputting the <tool>{"name": ..., "arguments": ..., "_nonce": ...}</tool> block immediately. ' +
+            "For example, to find relevant files, emit: " +
+            '<tool>{"name": "Grep", "arguments": {"pattern": "reposicion", "output_mode": "files_with_matches"}, "_nonce": "..."}</tool>';
           const retryResp = await performCompletion(retrySession, minimalRetryPrompt);
           deleteSessionOnDeepSeek(accessToken, retrySession).catch(() => {});
           if (retryResp.resp.ok) {
@@ -1221,6 +1229,53 @@ export class DeepSeekWebExecutor extends BaseExecutor {
               toolCalls = retryParsed.toolCalls;
               reqHeaders = retryResp.reqHeaders;
               requestPayload = retryResp.requestPayload;
+            }
+          }
+          // LEV fork: If the retry ALSO failed (no tool calls), synthesize a
+          // Grep tool call from the narrated intent to keep the agent loop
+          // alive. The model said "I need to find..." — give it a search.
+          if (!toolCalls || toolCalls.length === 0) {
+            const hasGrep = requestedTools.some(
+              (t) => t?.function?.name === "Grep" || t?.function?.name === "grep"
+            );
+            if (hasGrep && lastUserText) {
+              // Extract a search pattern from the user query — look for
+              // quoted strings, page names, or key terms.
+              const pageMatch = /\/(\w+)\/?$/.exec(lastUserText);
+              const pattern = pageMatch
+                ? pageMatch[1]
+                : lastUserText
+                    .replace(/[<>\[\]{}]/g, "")
+                    .split(/\s+/)
+                    .filter(
+                      (w) =>
+                        w.length > 3 &&
+                        !/^(the|this|that|with|from|have|your|into|page|table|header|glass|seems|broken|aligned|look|need|find|code|unified|understand|issue|alignment|not|properly)$/i.test(
+                          w
+                        )
+                    )
+                    .slice(0, 3)
+                    .join("|");
+              if (pattern) {
+                log?.warn?.(
+                  "DEEPSEEK-WEB",
+                  `Narrated intent retry also failed — synthesizing Grep tool call with pattern: ${pattern}`
+                );
+                toolCalls = [
+                  {
+                    id: `call-${Date.now()}`,
+                    type: "function" as const,
+                    function: {
+                      name: "Grep",
+                      arguments: JSON.stringify({
+                        pattern,
+                        output_mode: "files_with_matches",
+                      }),
+                    },
+                  },
+                ];
+                cleanedContent = "";
+              }
             }
           }
         }
