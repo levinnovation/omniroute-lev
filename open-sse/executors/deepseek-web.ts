@@ -390,10 +390,18 @@ const NARRATED_INTENT_RE =
 
 function looksLikeNarratedIntent(content: string): boolean {
   const text = content.trim();
-  if (text.length < 10 || text.length > 500) return false;
+  if (text.length < 10) return false;
   // Must not contain an actual tool block
   if (text.includes("<tool>")) return false;
-  return NARRATED_INTENT_RE.test(text);
+  // For short content (< 500 chars), test the whole text.
+  if (text.length <= 500) return NARRATED_INTENT_RE.test(text);
+  // For long content, the model may write a lengthy analysis and then narrate
+  // intent at the very end ("...Let me find the source file."). Check the last
+  // ~400 chars (roughly 2-3 sentences) for the narrated-intent pattern. This
+  // catches cases where the model produces a detailed diagnosis but then stops
+  // without emitting a tool block.
+  const tail = text.slice(-400);
+  return NARRATED_INTENT_RE.test(tail);
 }
 
 async function collectSSEContent(

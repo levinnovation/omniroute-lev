@@ -381,6 +381,31 @@ test("looksLikeNarratedIntent does not match content with actual tool blocks", a
   // The detector checks for <tool> presence before applying the regex
 });
 
+test("looksLikeNarratedIntent detects narrated intent in long content (tail check)", async () => {
+  // Production failure: the model wrote a ~900-char analysis of the table
+  // alignment issue, then ended with "Let me find the source file for this
+  // unified table component." — narrated intent at the END of long content.
+  // The old detector had a 500-char limit and missed this entirely.
+  const NARRATED_INTENT_RE =
+    /\b(let me|I'll|I will|I need to|let's|I want to|I'm going to)\b.+\b(read|check|look|search|find|continue|see|inspect|examine|explore|run|execute|call|use|open|list|grep|glob|write|edit|create|delete|shell|terminal)\b/i;
+  const longContent =
+    "Looking at the browser elements, I can see the issue. The table has a **sticky header** with `sticky top-[3.25rem]` but the header cells have varying widths:\n" +
+    "- First column (`w-9`): 32px\n" +
+    "- Second column (`w-7`): 32px\n" +
+    "- SKU: 95px\n" +
+    "- PRODUCTO (`min-w-[12rem]`): 352px\n\n" +
+    "The problem is the header row is using `table-auto` layout which makes the sticky `th` elements misaligned with their corresponding `td` cells. " +
+    "The glass/backdrop-blur header isn't properly aligned because sticky headers on `<th>` elements don't respect the table's column alignment when the table has `table-auto` with `min-w`.\n\n" +
+    "Let me find the source file for this unified table component.";
+  assert.ok(longContent.length > 500, "Test content must be > 500 chars");
+  // Tail-based detection: check the last ~400 chars
+  const tail = longContent.slice(-400);
+  assert.ok(
+    NARRATED_INTENT_RE.test(tail),
+    "Narrated intent at end of long content must be detected via tail check"
+  );
+});
+
 test("extractUserQuery preserves browser_element blocks referenced by 'look at:'", async () => {
   // Regression: when a user says "look at:" followed by browser_element code
   // blocks, those blocks are critical context. Previously ALL code blocks were
