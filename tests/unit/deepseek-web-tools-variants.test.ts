@@ -128,6 +128,26 @@ describe("deepseekWebTools — variants", () => {
     assert.equal(toolCalls, null, "bare JSON with non-matching tool name must not be promoted");
   });
 
+  test("truncated bare JSON (missing closing brace) IS auto-closed and promoted (LEV fork)", () => {
+    // Production failure: the stream ends before the final `}` is written.
+    // The model emitted: {"name": "Grep", "arguments": {"pattern": "...", "output_mode": "files_with_matches"}
+    // — only ONE closing brace, but TWO opening braces. The brace matcher must
+    // auto-close the missing brace(s) at end-of-text and still promote the call.
+    const text = `{"name": "Grep", "arguments": {"pattern": "sticky top-\\\\[3\\\\.25rem\\\\]|ORDENAR YA", "output_mode": "files_with_matches"}`;
+    const { toolCalls } = parseDeepSeekToolCalls(text, "call", [
+      ...TOOLS,
+      { type: "function", function: { name: "Grep", description: "Search" } },
+    ]);
+    assert.ok(
+      toolCalls && toolCalls.length === 1,
+      "truncated bare JSON must be auto-closed and promoted"
+    );
+    assert.equal(toolCalls[0].function.name, "Grep");
+    const args = JSON.parse(toolCalls[0].function.arguments);
+    assert.equal(args.output_mode, "files_with_matches");
+    assert.ok(args.pattern.includes("ORDENAR YA"), "pattern must be preserved");
+  });
+
   test("bare JSON with nested arguments after natural language preamble (LEV fork production fix)", () => {
     // This is the exact production failure: DeepSeek-web emits a natural
     // language sentence followed by a bare JSON tool call with nested

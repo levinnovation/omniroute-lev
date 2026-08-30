@@ -982,7 +982,46 @@ function parseBareJsonToolCalls(
         }
       }
     }
-    if (end < 0) continue;
+    if (end < 0) {
+      // LEV fork: The model sometimes emits truncated JSON — the stream ends
+      // before the final closing brace(s) are written (e.g., a token boundary
+      // cuts off the last `}`). When this happens at end-of-text, attempt to
+      // auto-close by appending the missing `}` characters for each open depth
+      // level, then retry the parse. This recovers tool calls that would
+      // otherwise be silently dropped.
+      const partialRaw = text.slice(i);
+      const isAtEndOfText = i + partialRaw.length >= text.length;
+      if (!isAtEndOfText) continue;
+      const autoClosed = partialRaw + "}".repeat(depth);
+      const parsedAuto = parseLooseJsonObject(autoClosed);
+      if (!parsedAuto) continue;
+      const emittedNameAuto =
+        (typeof parsedAuto.name === "string" ? parsedAuto.name : null) ??
+        (typeof parsedAuto.command === "string" ? parsedAuto.command : null) ??
+        (typeof parsedAuto.tool_name === "string" ? parsedAuto.tool_name : null) ??
+        (typeof parsedAuto.tool === "string" ? parsedAuto.tool : null);
+      if (!emittedNameAuto) continue;
+      const nameAuto = resolveRequestedToolName(emittedNameAuto, requested);
+      if (!nameAuto) continue;
+      const argsAuto =
+        parsedAuto.arguments !== undefined
+          ? parsedAuto.arguments
+          : parsedAuto.parameters !== undefined
+            ? parsedAuto.parameters
+            : parsedAuto.args !== undefined
+              ? parsedAuto.args
+              : {};
+      toolCalls.push({
+        id: `${idSeed}_${idx++}`,
+        type: "function",
+        function: {
+          name: nameAuto,
+          arguments: safeArgsString(argsAuto),
+        },
+      });
+      acceptedRanges.push({ start: i, end: text.length });
+      break; // truncated JSON is at end of text, no more candidates
+    }
 
     const raw = text.slice(i, end);
     const parsed = parseLooseJsonObject(raw);
