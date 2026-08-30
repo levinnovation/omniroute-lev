@@ -144,8 +144,26 @@ function extractUserQuery(content: unknown): string {
   const m = /<user_query>([\s\S]*?)<\/user_query>/i.exec(text);
   if (!m) return "";
   let query = m[1].trim();
-  // Strip code blocks (```...```) which contain DOM dumps, browser elements, etc.
-  query = query.replace(/```[\s\S]*?```/g, "").trim();
+  // Process code blocks (```...```):
+  // - browser_element blocks: targeted DOM element references the user
+  //   explicitly points to with "look at:" — preserve but cap at 2000 chars
+  //   each so huge DOM dumps don't blow the prompt budget.
+  // - Other code blocks: strip if >500 chars (DOM dumps, file contents),
+  //   keep small ones that may contain relevant short snippets.
+  query = query
+    .replace(/```(\w*)\n([\s\S]*?)```/g, (_full, lang, body) => {
+      if (lang === "browser_element") {
+        if (body.length <= 2000) return _full;
+        return (
+          "```browser_element\n" +
+          body.slice(0, 1800) +
+          "\n[...element context truncated to fit prompt...]\n```"
+        );
+      }
+      if (body.length < 500) return _full;
+      return "";
+    })
+    .trim();
   // Strip <image_files>...</image_files> blocks
   query = query.replace(/<image_files>[\s\S]*?<\/image_files>/gi, "").trim();
   // Strip <timestamp>...</timestamp> blocks

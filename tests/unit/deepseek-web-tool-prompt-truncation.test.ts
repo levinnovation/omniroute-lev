@@ -380,3 +380,89 @@ test("looksLikeNarratedIntent does not match content with actual tool blocks", a
   assert.ok(contentWithTool.includes("<tool>"), "Content with tool block should have <tool> tag");
   // The detector checks for <tool> presence before applying the regex
 });
+
+test("extractUserQuery preserves browser_element blocks referenced by 'look at:'", async () => {
+  // Regression: when a user says "look at:" followed by browser_element code
+  // blocks, those blocks are critical context. Previously ALL code blocks were
+  // stripped, leaving the model with "look at:" and nothing after it.
+  const { buildToolConversationPrompt } =
+    await import("../../open-sse/translator/deepseekWebTools.ts");
+
+  const actualQuestion = "the glass header in the unified table seems broken, look at:";
+  const elementBlock =
+    "```browser_element\n" +
+    "The user selected this node in the browser preview.\n\n" +
+    "tag: th\ndom_path: div.group > main > table > thead > tr > th\n" +
+    "class: sticky top-[3.25rem] z-10 bg-muted/50\n" +
+    "visible_text: SKU\n" +
+    "bounds_css_px: top=448 left=361 width=95 height=31\n" +
+    "```";
+
+  const messages = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "[Image 1]: The image shows a section of a user interface" },
+        {
+          type: "text",
+          text: `<user_query>\n${actualQuestion}\n${elementBlock}\n</user_query>`,
+        },
+      ],
+    },
+  ];
+
+  const prompt = buildToolConversationPrompt(messages, "You are a coding agent.");
+  // The question must be preserved
+  assert.ok(prompt.includes("glass header"), "Question text must be preserved");
+  // The browser_element block must be preserved — it's what "look at:" references
+  assert.ok(
+    prompt.includes("browser_element"),
+    "browser_element block must be preserved (it's what 'look at:' references)"
+  );
+  assert.ok(
+    prompt.includes("visible_text: SKU"),
+    "Key content from browser_element block must be preserved"
+  );
+  assert.ok(
+    prompt.includes("sticky top-[3.25rem]"),
+    "CSS class info from browser_element block must be preserved"
+  );
+});
+
+test("extractUserQuery caps very large browser_element blocks", async () => {
+  // Very large browser_element blocks (huge DOM dumps) should be capped
+  // to avoid blowing the prompt budget, but still preserve the beginning.
+  const { buildToolConversationPrompt } =
+    await import("../../open-sse/translator/deepseekWebTools.ts");
+
+  const actualQuestion = "Fix the alignment issue";
+  const hugeDomDump = "x".repeat(50_000); // Huge DOM dump inside browser_element
+  const largeSystemPrompt = "S".repeat(40_000); // Push total over 80K to trigger truncation
+
+  const messages = [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: `<user_query>\n${actualQuestion}\n\`\`\`browser_element\n${hugeDomDump}\n\`\`\`\n</user_query>`,
+        },
+      ],
+    },
+  ];
+
+  const prompt = buildToolConversationPrompt(messages, largeSystemPrompt);
+  // The question must be preserved
+  assert.ok(prompt.includes("Fix the alignment issue"), "Question must be preserved");
+  // The browser_element should be capped, not fully stripped
+  assert.ok(
+    prompt.includes("browser_element"),
+    "browser_element marker should still be present (capped, not stripped)"
+  );
+  assert.ok(
+    prompt.includes("truncated to fit prompt"),
+    "Large browser_element should have a truncation marker"
+  );
+  // The prompt should be under the limit (truncation worked)
+  assert.ok(prompt.length <= 90_000, `Prompt should be under limit, got ${prompt.length}`);
+});
