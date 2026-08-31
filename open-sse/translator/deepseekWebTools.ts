@@ -56,6 +56,40 @@ export function serializeDeepSeekToolPrompt(tools: unknown): string {
   const nonce = getToolNonce(tools);
   if (!nonce) return "";
 
+  // LEV fork: Compress JSON parameter schemas by stripping descriptions.
+  // Cursor sends 20+ tools with verbose parameter schemas (descriptions,
+  // nested properties, etc.) that can total 60K+ chars — exceeding
+  // DeepSeek-web's input limit and causing empty-stream responses.
+  // This compression keeps only structural info (type, name, required,
+  // enum, nested property names+types) and caps description length.
+  const MAX_DESC_LEN = 120;
+  const compressSchema = (schema: unknown, depth = 0): unknown => {
+    if (depth > 4) return "..."; // Prevent deep recursion
+    if (Array.isArray(schema)) return schema.map((s) => compressSchema(s, depth + 1));
+    if (!schema || typeof schema !== "object") return schema;
+    const obj = schema as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === "description") {
+        if (typeof v === "string" && v.length > MAX_DESC_LEN) {
+          out[k] = v.slice(0, MAX_DESC_LEN) + "...";
+        } else {
+          out[k] = v;
+        }
+      } else if (k === "$schema" || k === "definitions") {
+        // Drop these — they're metadata, not structural
+        continue;
+      } else if (v && typeof v === "object") {
+        // Recursively compress any nested object/array (properties, items,
+        // anyOf, etc.) so descriptions at any depth get capped.
+        out[k] = compressSchema(v, depth + 1);
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  };
+
   const lines: string[] = [];
   for (const t of tools as OpenAIToolDef[]) {
     const fn = t?.function;
@@ -63,7 +97,7 @@ export function serializeDeepSeekToolPrompt(tools: unknown): string {
     const desc = typeof fn.description === "string" && fn.description ? fn.description : "";
     let params = "";
     try {
-      params = fn.parameters ? JSON.stringify(fn.parameters) : "";
+      params = fn.parameters ? JSON.stringify(compressSchema(fn.parameters)) : "";
     } catch {
       params = "";
     }
@@ -200,9 +234,16 @@ export function buildToolConversationPrompt(
   // exceeds DeepSeek's limit and the API returns an empty response
   // (content: null, completion_tokens: 0), killing the agent loop.
   const MAX_TOOL_RESULT_LEN = 4_000;
-  const MAX_PROMPT_LEN = 80_000; // ~20K tokens — DeepSeek-web's effective limit is ~32K
-  // tokens, but Cursor's system prompt + tool definitions alone consume ~15K tokens,
-  // leaving only ~17K for conversation history. 80K chars is a safe ceiling.
+  // LEV fork: reduced from 80K to 60K. Production logs showed 90K-char prompts
+  // getting HTTP 200 with an empty stream (DeepSeek silently drops oversized
+  // prompts). 60K chars ≈ 15K tokens, leaving headroom under DeepSeek-web's
+  // ~32K token input limit for the model's own reasoning budget.
+  const MAX_PROMPT_LEN = 60_000;
+  // The tool system prompt (serialized tools[]) is essential — it defines the
+  // <tool> call format. Cursor's system message (IDE rules, agent instructions)
+  // is nice-to-have context. When the combined system section would blow the
+  // budget, cap the Cursor system message rather than the tool prompt.
+  const MAX_SYSTEM_SECTION_LEN = 45_000;
 
   const truncateToolResult = (text: string): string => {
     if (text.length <= MAX_TOOL_RESULT_LEN) return text;
@@ -272,8 +313,31 @@ export function buildToolConversationPrompt(
     }
   }
 
+  // LEV fork: Truncate the system section if it exceeds the budget.
+  // The tool system prompt (systemParts[0]) is essential — it defines the
+  // <tool> call format and nonce. Cursor's system message (systemParts[1+])
+  // contains IDE rules, agent instructions, etc. — useful but not critical.
+  // When the combined system section exceeds MAX_SYSTEM_SECTION_LEN, keep the
+  // tool prompt in full and truncate the Cursor system message to a summary.
+  let systemSection = systemParts.length ? systemParts.join("\n\n") : "";
+  if (systemSection.length > MAX_SYSTEM_SECTION_LEN && toolSystemPrompt) {
+    const toolPromptLen = toolSystemPrompt.length;
+    const remainingBudget = MAX_SYSTEM_SECTION_LEN - toolPromptLen - 200;
+    if (remainingBudget > 0) {
+      // Keep tool prompt + truncated Cursor system message
+      const cursorSystemText = systemParts.slice(1).join("\n\n");
+      const truncatedCursor =
+        cursorSystemText.slice(0, remainingBudget) +
+        `\n\n[System note: ${cursorSystemText.length - remainingBudget} chars of IDE system context omitted to fit the context window.]`;
+      systemSection = `${toolSystemPrompt}\n\n${truncatedCursor}`;
+    } else {
+      // Tool prompt alone exceeds the budget — keep it and drop Cursor system msg entirely
+      systemSection = toolSystemPrompt;
+    }
+  }
+
   const parts: string[] = [];
-  if (systemParts.length) parts.push(systemParts.join("\n\n"));
+  if (systemSection) parts.push(systemSection);
   if (lines.length) parts.push(lines.join("\n\n"));
   if (sawToolActivity) {
     // Anchor the model to the work already done so it advances instead of repeating it.
@@ -300,7 +364,8 @@ export function buildToolConversationPrompt(
   // the <user_query> content directly and ALWAYS preserve it at the top of the
   // conversation section, no matter what else gets truncated.
   if (result.length > MAX_PROMPT_LEN) {
-    const systemSection = systemParts.length ? systemParts.join("\n\n") : "";
+    // Reuse the already-truncated systemSection from above (which may have
+    // had the Cursor system message capped to fit MAX_SYSTEM_SECTION_LEN).
     const continuationHint = sawToolActivity
       ? "Continue the task using the tool results above. Do NOT repeat tool calls that already succeeded; perform the next step or give the final answer. If the next step requires a tool, emit the <tool> block NOW in this response — do NOT narrate intent like 'Let me read X' and then stop."
       : "";

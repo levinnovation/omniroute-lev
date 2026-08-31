@@ -491,3 +491,80 @@ test("extractUserQuery caps very large browser_element blocks", async () => {
   // The prompt should be under the limit (truncation worked)
   assert.ok(prompt.length <= 90_000, `Prompt should be under limit, got ${prompt.length}`);
 });
+
+test("buildToolConversationPrompt truncates Cursor system message when tool prompt + system exceed budget", async () => {
+  const { buildToolConversationPrompt } =
+    await import("../../open-sse/translator/deepseekWebTools.ts");
+
+  // Simulate the production failure: after schema compression, the tool
+  // system prompt is ~30K. Combined with a 20K Cursor system message and
+  // user conversation, the total would exceed the 60K limit. The system
+  // section truncation should cap the Cursor system message.
+  const toolPrompt = "T".repeat(30_000);
+  const hugeCursorSystem = "C".repeat(20_000);
+  const userMessage = "Fix the alignment issue in the reposicion table";
+
+  const messages = [
+    { role: "system", content: hugeCursorSystem },
+    { role: "user", content: userMessage },
+  ];
+
+  const prompt = buildToolConversationPrompt(messages, toolPrompt);
+
+  // The prompt MUST be under the reduced limit (60K)
+  assert.ok(
+    prompt.length <= 60_000,
+    `Prompt should be under 60K limit, got ${prompt.length} chars`
+  );
+  // The tool system prompt MUST be preserved in full — it defines the <tool> format
+  assert.ok(prompt.includes(toolPrompt), "Tool system prompt must be preserved in full");
+  // The Cursor system message should be truncated (not fully present)
+  assert.ok(
+    !prompt.includes(hugeCursorSystem),
+    "Cursor system message should be truncated when system section exceeds budget"
+  );
+  // The user's actual request must be preserved
+  assert.ok(prompt.includes("alignment issue"), "User's actual request must be preserved");
+  // A System note should explain the truncation
+  assert.ok(
+    prompt.includes("IDE system context omitted"),
+    "Should include a System note explaining IDE context truncation"
+  );
+});
+
+test("serializeDeepSeekToolPrompt compresses parameter schema descriptions", async () => {
+  const { serializeDeepSeekToolPrompt } =
+    await import("../../open-sse/translator/deepseekWebTools.ts");
+
+  // Tool with a very verbose parameter schema including long descriptions
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "Read",
+        description: "Read a file",
+        parameters: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "A".repeat(500), // Very long description
+            },
+            offset: {
+              type: "number",
+              description: "B".repeat(300),
+            },
+          },
+          required: ["path"],
+        },
+      },
+    },
+  ];
+  const prompt = serializeDeepSeekToolPrompt(tools);
+  // The long descriptions should be truncated to <= 120 chars + "..."
+  assert.ok(!prompt.includes("A".repeat(200)), "Long parameter descriptions should be compressed");
+  // The structural info (type, name, required) should still be present
+  assert.ok(prompt.includes('"path"'), "Parameter name should be preserved");
+  assert.ok(prompt.includes('"string"'), "Parameter type should be preserved");
+  assert.ok(prompt.includes('"required"'), "Required array should be preserved");
+});
