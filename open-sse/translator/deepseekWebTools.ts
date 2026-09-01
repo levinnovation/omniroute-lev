@@ -56,32 +56,35 @@ export function serializeDeepSeekToolPrompt(tools: unknown): string {
   const nonce = getToolNonce(tools);
   if (!nonce) return "";
 
-  // LEV fork: Compress JSON parameter schemas by stripping descriptions.
+  // LEV fork: Compress JSON parameter schemas aggressively.
   // Cursor sends 20+ tools with verbose parameter schemas (descriptions,
-  // nested properties, etc.) that can total 60K+ chars — exceeding
+  // nested properties, etc.) that can total 65K+ chars — exceeding
   // DeepSeek-web's input limit and causing empty-stream responses.
-  // This compression keeps only structural info (type, name, required,
-  // enum, nested property names+types) and caps description length.
-  const MAX_DESC_LEN = 120;
+  // Production logs showed 60K tool prompts even after capping descriptions
+  // at 120 chars. The fix: drop descriptions entirely from nested parameter
+  // properties (keep only type/name/required/enum), cap tool-level
+  // descriptions at 80 chars, and cap each tool line at 500 chars.
+  const MAX_TOOL_DESC_LEN = 80;
+  const MAX_TOOL_LINE_LEN = 500;
   const compressSchema = (schema: unknown, depth = 0): unknown => {
-    if (depth > 4) return "..."; // Prevent deep recursion
+    if (depth > 3) return "..."; // Prevent deep recursion
     if (Array.isArray(schema)) return schema.map((s) => compressSchema(s, depth + 1));
     if (!schema || typeof schema !== "object") return schema;
     const obj = schema as Record<string, unknown>;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
       if (k === "description") {
-        if (typeof v === "string" && v.length > MAX_DESC_LEN) {
-          out[k] = v.slice(0, MAX_DESC_LEN) + "...";
-        } else {
+        // Drop descriptions at depth > 0 (inside properties). Keep only
+        // the top-level schema description (depth 0), capped.
+        if (depth === 0 && typeof v === "string" && v.length > MAX_TOOL_DESC_LEN) {
+          out[k] = v.slice(0, MAX_TOOL_DESC_LEN) + "...";
+        } else if (depth === 0) {
           out[k] = v;
         }
-      } else if (k === "$schema" || k === "definitions") {
-        // Drop these — they're metadata, not structural
-        continue;
+        // depth > 0: skip description entirely
+      } else if (k === "$schema" || k === "definitions" || k === "title") {
+        continue; // Metadata, not structural
       } else if (v && typeof v === "object") {
-        // Recursively compress any nested object/array (properties, items,
-        // anyOf, etc.) so descriptions at any depth get capped.
         out[k] = compressSchema(v, depth + 1);
       } else {
         out[k] = v;
@@ -95,15 +98,20 @@ export function serializeDeepSeekToolPrompt(tools: unknown): string {
     const fn = t?.function;
     if (!fn?.name) continue;
     const desc = typeof fn.description === "string" && fn.description ? fn.description : "";
+    const cappedDesc =
+      desc.length > MAX_TOOL_DESC_LEN ? desc.slice(0, MAX_TOOL_DESC_LEN) + "..." : desc;
     let params = "";
     try {
       params = fn.parameters ? JSON.stringify(compressSchema(fn.parameters)) : "";
     } catch {
       params = "";
     }
-    lines.push(
-      `- ${fn.name}${desc ? `: ${desc}` : ""}${params ? `\n  parameters: ${params}` : ""}`
-    );
+    let line = `- ${fn.name}${cappedDesc ? `: ${cappedDesc}` : ""}${params ? `\n  parameters: ${params}` : ""}`;
+    // Hard cap each tool line to prevent one verbose tool from blowing the budget
+    if (line.length > MAX_TOOL_LINE_LEN) {
+      line = line.slice(0, MAX_TOOL_LINE_LEN - 20) + "\n  [...schema truncated...]";
+    }
+    lines.push(line);
   }
   if (lines.length === 0) return "";
 

@@ -28,15 +28,18 @@ async function selectZaiBrowserModel(page: Page, modelName: string): Promise<voi
   // The landing-page hero animation can remain above the already-visible
   // selector and make coordinate-based clicks time out.
   await selector.evaluate((element) => (element as HTMLElement).click());
+  // LEV fork: increased menu timeout from 5s to 10s. Production logs showed
+  // "model selection: locator.waitFor: Timeout 5000ms exceeded" — Z.ai's
+  // dropdown menu can take >5s to render after click, especially under load.
   const menu = page.locator('[role="menu"]').filter({ hasText: modelName }).first();
-  await menu.waitFor({ state: "visible", timeout: 5_000 });
+  await menu.waitFor({ state: "visible", timeout: 10_000 });
   const modelButton = menu.locator("button").filter({ hasText: modelName }).first();
   await modelButton.evaluate((element) => (element as HTMLElement).click());
   await page
     .locator('[aria-label="Select a model"]')
     .filter({ hasText: modelName })
     .first()
-    .waitFor({ state: "visible", timeout: 5_000 });
+    .waitFor({ state: "visible", timeout: 10_000 });
 }
 
 async function setZaiBrowserToggle(
