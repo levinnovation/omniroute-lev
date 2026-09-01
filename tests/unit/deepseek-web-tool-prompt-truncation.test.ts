@@ -497,10 +497,10 @@ test("buildToolConversationPrompt truncates Cursor system message when tool prom
     await import("../../open-sse/translator/deepseekWebTools.ts");
 
   // Simulate the production failure: after schema compression, the tool
-  // system prompt is ~30K. Combined with a 20K Cursor system message and
-  // user conversation, the total would exceed the 60K limit. The system
-  // section truncation should cap the Cursor system message.
-  const toolPrompt = "T".repeat(30_000);
+  // system prompt is ~8K. Combined with a 20K Cursor system message, the
+  // system section would exceed the 12K budget. The system section truncation
+  // should cap the Cursor system message.
+  const toolPrompt = "T".repeat(8_000);
   const hugeCursorSystem = "C".repeat(20_000);
   const userMessage = "Fix the alignment issue in the reposicion table";
 
@@ -511,10 +511,10 @@ test("buildToolConversationPrompt truncates Cursor system message when tool prom
 
   const prompt = buildToolConversationPrompt(messages, toolPrompt);
 
-  // The prompt MUST be under the reduced limit (60K)
+  // The prompt MUST be under the reduced limit (32K)
   assert.ok(
-    prompt.length <= 60_000,
-    `Prompt should be under 60K limit, got ${prompt.length} chars`
+    prompt.length <= 32_000,
+    `Prompt should be under 32K limit, got ${prompt.length} chars`
   );
   // The tool system prompt MUST be preserved in full — it defines the <tool> format
   assert.ok(prompt.includes(toolPrompt), "Tool system prompt must be preserved in full");

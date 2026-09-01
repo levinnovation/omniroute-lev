@@ -242,16 +242,20 @@ export function buildToolConversationPrompt(
   // exceeds DeepSeek's limit and the API returns an empty response
   // (content: null, completion_tokens: 0), killing the agent loop.
   const MAX_TOOL_RESULT_LEN = 4_000;
-  // LEV fork: reduced from 80K to 60K. Production logs showed 90K-char prompts
-  // getting HTTP 200 with an empty stream (DeepSeek silently drops oversized
-  // prompts). 60K chars ≈ 15K tokens, leaving headroom under DeepSeek-web's
-  // ~32K token input limit for the model's own reasoning budget.
-  const MAX_PROMPT_LEN = 60_000;
+  // LEV fork: reduced from 60K to 32K. Production logs (Sep 1 2026) showed
+  // 52K-char prompts still getting HTTP 200 with empty streams even after
+  // schema compression brought the tool prompt from 60K to 8K. DeepSeek-web's
+  // free chat interface has a much lower practical input limit than its API.
+  // 32K chars ≈ 8K tokens — safe for the free web tier.
+  const MAX_PROMPT_LEN = 32_000;
   // The tool system prompt (serialized tools[]) is essential — it defines the
   // <tool> call format. Cursor's system message (IDE rules, agent instructions)
   // is nice-to-have context. When the combined system section would blow the
   // budget, cap the Cursor system message rather than the tool prompt.
-  const MAX_SYSTEM_SECTION_LEN = 45_000;
+  // Reduced from 45K to 12K — the Cursor system message is mostly formatting
+  // instructions (code citation rules, tone/style, tool_calling conventions)
+  // that DeepSeek-web doesn't need. Keep only a short summary.
+  const MAX_SYSTEM_SECTION_LEN = 12_000;
 
   const truncateToolResult = (text: string): string => {
     if (text.length <= MAX_TOOL_RESULT_LEN) return text;
