@@ -1,12 +1,12 @@
 # ── OmniRoute-LEV — Railway build from source ──────────────────────────────
 #
 # This Dockerfile builds OmniRoute from source (not from a pre-built image)
-# and includes Playwright + cloakbrowser for web-cookie providers.
+# and includes Playwright + patchright for web-cookie providers.
 #
 # Key differences from the upstream Dockerfile:
 #   1. No BuildKit cache mounts (--mount=type=cache) — Railway may not support them
 #   2. Consolidates the runner-web target (we always need browsers)
-#   3. Includes cloakbrowser pre-download for stealth Chromium
+#   3. Includes patchright (stealth Playwright fork) replacing cloakbrowser
 #   4. --no-sandbox is fixed in source (packages/browser-pool), no monkey-patch
 #   5. Health check with generous start-period for Railway (300s)
 #
@@ -131,12 +131,13 @@ RUN apt-get update \
   && chown -R node:node /home/node/.cache \
   && rm -rf /var/lib/apt/lists/*
 
-# ── cloakbrowser (stealth Chromium with fingerprint patches) ───────────────
-# OmniRoute's browserPool prefers cloakbrowser over plain Playwright for
-# providers behind advanced anti-bot (DuckDuckGo VQD, Cloudflare Turnstile).
-# Pre-download at build time to avoid runtime delays.
-RUN cd /app && npm install cloakbrowser@0.5.9 --no-save \
-  && node -e "const cb = require('cloakbrowser'); cb.launch({headless:true,args:['--no-sandbox']}).then(b => {console.log('cloakbrowser OK'); return b.close();}).catch(e => console.log('cloakbrowser download skipped:', e.message.substring(0,100)))" || true
+# ── patchright (stealth Playwright fork with fingerprint patches) ──────────
+# LEV fork: replaces cloakbrowser (was off-lockfile, obfuscated dynamic import).
+# patchright is a drop-in Playwright replacement with built-in stealth patches,
+# properly pinned in package.json. Pre-download browsers at build time.
+COPY --from=builder /app/node_modules/patchright ./node_modules/patchright
+COPY --from=builder /app/node_modules/patchright-core ./node_modules/patchright-core
+RUN node -e "const {chromium} = require('patchright'); chromium.launch({headless:true,args:['--no-sandbox']}).then(b => {console.log('patchright OK'); return b.close();}).catch(e => console.log('patchright launch skipped:', e.message.substring(0,100)))" || true
 
 # ── wreq-js native binary for TLS fingerprint spoofing ─────────────────────
 RUN ls /app/node_modules/wreq-js/rust/wreq-js.linux-x64-gnu.node && echo "wreq-js native binary OK" || echo "wreq-js binary missing"

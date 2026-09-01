@@ -2142,6 +2142,85 @@ export async function handleChatCore({
       `Reduce the prompt or route to a model with a larger ${exceededInputCap ? "input limit" : "context window"}.`;
     log?.warn?.("CONTEXT", message);
     trackPendingRequest(model, provider, connectionId, false);
+
+    // LEV fork: Input-overflow combo fallback.
+    // When OMNIROUTE_INPUT_OVERFLOW_FALLBACK=on and this is NOT already a combo
+    // request, check if a combo config named via OMNIROUTE_INPUT_OVERFLOW_COMBO
+    // (default: "lev-overflow-fallback") exists. If it does, re-dispatch the
+    // request through that combo instead of hard-rejecting. This solves the
+    // 122K-token → 32K-model rejection by automatically routing to a
+    // larger-context model. The combo must be pre-configured by the operator
+    // with models that have sufficient context windows.
+    if (
+      !isCombo &&
+      process.env.OMNIROUTE_INPUT_OVERFLOW_FALLBACK === "on" &&
+      outputBudget.estimatedInputTokens > (outputBudget.maxInputTokens ?? outputBudget.contextLimit)
+    ) {
+      const overflowComboName =
+        process.env.OMNIROUTE_INPUT_OVERFLOW_COMBO || "lev-overflow-fallback";
+      try {
+        const { getComboByName } = await import("../../src/lib/localDb");
+        const overflowCombo = await getComboByName(overflowComboName);
+        if (overflowCombo) {
+          log?.info?.(
+            "CONTEXT",
+            `Input overflow (${outputBudget.estimatedInputTokens} tokens > ${outputBudget.maxInputTokens ?? outputBudget.contextLimit} limit) — re-routing to combo "${overflowComboName}" with larger-context models`
+          );
+          // Re-dispatch through the combo path by importing the combo handler
+          // and calling it with the overflow combo config. The combo handler
+          // will iterate targets and find one with a large enough context window.
+          const { handleComboChat } = await import("../services/combo.ts");
+          const { getCombosCached } = await import("../../src/lib/localDb");
+          const allCombos = await getCombosCached();
+          return handleComboChat({
+            body,
+            combo: overflowCombo as unknown as import("../services/combo/types.ts").ComboLike,
+            handleSingleModel: async (target: unknown) => {
+              // Delegate back to handleChatCore for each combo target
+              const t = target as { provider: string; model: string };
+              return handleChatCore({
+                body,
+                modelInfo: { provider: t.provider, model: t.model, extendedContext },
+                credentials,
+                log,
+                onCredentialsRefreshed,
+                onRequestSuccess,
+                onStreamFailure,
+                onDisconnect,
+                clientRawRequest,
+                connectionId,
+                apiKeyInfo,
+                userAgent,
+                isCombo: true,
+                comboName: overflowComboName,
+                cachedSettings,
+                skipUpstreamRetry,
+                createPiiTransform,
+                correlationId,
+                conversationId,
+                reasoningTransportFallback,
+                managedLease,
+              });
+            },
+            isModelAvailable: () => true,
+            log,
+            settings: cachedSettings,
+            allCombos: allCombos as unknown as import("../services/combo/types.ts").ComboLike[],
+            signal: null,
+            apiKeyAllowedConnections: null,
+            sourceFormat,
+            endpointPath,
+            requestHeaders: clientRawRequest?.headers ?? null,
+          });
+        }
+      } catch (overflowErr) {
+        log?.warn?.(
+          "CONTEXT",
+          `Input-overflow combo fallback failed: ${overflowErr instanceof Error ? overflowErr.message : String(overflowErr)} — returning original error`
+        );
+      }
+    }
+
     return createErrorResult(
       HTTP_STATUS.BAD_REQUEST,
       message,

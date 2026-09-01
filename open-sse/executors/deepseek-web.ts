@@ -1164,7 +1164,14 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       // OpenAI tool_calls. Buffering (even for stream clients) is acceptable because
       // tool invocations are short and need the complete block to parse. (#2820)
       if (hasTools) {
-        let { content, reasoningContent } = await collectSSEContent(resp.body!, clientModel);
+        if (!resp.body) {
+          await cleanupFn();
+          return {
+            response: errorResponse(502, "DeepSeek-web returned no response body"),
+            url: COMPLETION_URL,
+          };
+        }
+        let { content, reasoningContent } = await collectSSEContent(resp.body, clientModel);
         await cleanupFn();
         let { content: cleanedContent, toolCalls } = parseDeepSeekToolCalls(
           content,
@@ -1224,7 +1231,13 @@ export class DeepSeekWebExecutor extends BaseExecutor {
           const retryResp = await performCompletion(retrySession, minimalRetryPrompt);
           deleteSessionOnDeepSeek(accessToken, retrySession).catch(() => {});
           if (retryResp.resp.ok) {
-            const retryResult = await collectSSEContent(retryResp.resp.body!, clientModel);
+            if (!retryResp.resp.body) {
+              return {
+                response: errorResponse(502, "DeepSeek-web retry returned no response body"),
+                url: COMPLETION_URL,
+              };
+            }
+            const retryResult = await collectSSEContent(retryResp.resp.body, clientModel);
             const retryParsed = parseDeepSeekToolCalls(
               retryResult.content,
               `call-${Date.now()}`,
@@ -1300,7 +1313,14 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       }
 
       if (stream !== false) {
-        const openaiStream = transformSSE(resp.body!, clientModel);
+        if (!resp.body) {
+          await cleanupFn();
+          return {
+            response: errorResponse(502, "DeepSeek-web returned no response body for streaming"),
+            url: COMPLETION_URL,
+          };
+        }
+        const openaiStream = transformSSE(resp.body, clientModel);
         const wrappedStream = wrapStreamWithCleanup(openaiStream, cleanupFn);
         return {
           response: new Response(wrappedStream, {
@@ -1313,7 +1333,14 @@ export class DeepSeekWebExecutor extends BaseExecutor {
         };
       }
 
-      const { content, reasoningContent } = await collectSSEContent(resp.body!, clientModel);
+      if (!resp.body) {
+        await cleanupFn();
+        return {
+          response: errorResponse(502, "DeepSeek-web returned no response body for non-streaming"),
+          url: COMPLETION_URL,
+        };
+      }
+      const { content, reasoningContent } = await collectSSEContent(resp.body, clientModel);
       await cleanupFn();
       const message: Record<string, string> = { role: "assistant", content };
       if (reasoningContent) message.reasoning_content = reasoningContent;

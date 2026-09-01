@@ -113,20 +113,18 @@ const state: PoolState = {
   metrics: createBrowserPoolMetrics(),
 };
 
-function getCloakbrowserModuleId(): string {
-  // Keep this computed: cloakbrowser is an optional runtime enhancer, and a literal
-  // dynamic import with the package name makes Turbopack resolve it during route compilation.
-  return ["cloak", "browser"].join("");
-}
-
-async function resolveCloakLaunch(): Promise<((opts: unknown) => Promise<Browser>) | null> {
+// LEV fork: Replace cloakbrowser (obfuscated dynamic import, off-lockfile) with
+// patchright — a drop-in Playwright replacement with built-in stealth patches.
+// Same API as playwright, no version drift risk, properly pinned in package.json.
+async function resolveStealthLaunch(): Promise<((opts: unknown) => Promise<Browser>) | null> {
   if (state.cloakLaunchResolved) return state.cloakLaunch;
   state.cloakLaunchResolved = true;
   try {
-    const mod = (await import(getCloakbrowserModuleId())) as unknown as {
-      launch?: (opts: unknown) => Promise<Browser>;
-    };
-    state.cloakLaunch = mod.launch ?? null;
+    const { chromium } = await import("patchright");
+    state.cloakLaunch = ((opts: unknown) =>
+      chromium.launch(opts as Parameters<typeof chromium.launch>[0])) as (
+      opts: unknown
+    ) => Promise<Browser>;
   } catch {
     state.cloakLaunch = null;
   }
@@ -228,10 +226,12 @@ async function launchBrowser(): Promise<Browser> {
   if (state.browser) return state.browser;
   if (state.launching) return state.launching;
   state.launching = (async () => {
-    const cloakLaunch = await resolveCloakLaunch();
+    // LEV fork: Use patchright (stealth Playwright fork) instead of cloakbrowser.
+    // Falls back to plain playwright if patchright is not available.
+    const stealthLaunch = await resolveStealthLaunch();
     let browser: Browser;
-    if (cloakLaunch) {
-      browser = await cloakLaunch({
+    if (stealthLaunch) {
+      browser = await stealthLaunch({
         headless: true,
         args: ["--no-sandbox", "--disable-dev-shm-usage"],
       });

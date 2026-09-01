@@ -1911,6 +1911,22 @@ export function checkFallbackError(
     return buildRetryableFallback(RateLimitReason.SERVER_ERROR);
   }
 
+  // LEV fork: Explicit 404 handling — model not found / endpoint drift.
+  // Previously 404 fell through to the generic "all other errors" branch which
+  // applied a transient connection cooldown, effectively treating a missing
+  // model like a rate-limit. This caused the Z.ai 404 for GLM-5v-Turbo to
+  // lock ALL models on the only active Z.ai account for 120s.
+  // Correct behavior: lock ONLY the specific model (via model lockout), allow
+  // the connection to keep serving other models, and let combo routing fall
+  // back to another target. Zero connection cooldown — the account is healthy.
+  if (status === HTTP_STATUS.NOT_FOUND) {
+    return {
+      shouldFallback: true,
+      cooldownMs: 0,
+      reason: RateLimitReason.MODEL_CAPACITY,
+    };
+  }
+
   // 400 — context overflow / malformed request / model access denied
   if (status === HTTP_STATUS.BAD_REQUEST) {
     // Check structured error codes first (more reliable, no false positives)

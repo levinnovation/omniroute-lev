@@ -447,8 +447,13 @@ export class AdaptaWebExecutor extends BaseExecutor {
 
     // 4. Stream or collect
     if (stream !== false) {
+      if (!resp.body) {
+        return {
+          response: makeErrorResponse(502, "Adapta-web returned no response body for streaming"),
+        };
+      }
       return {
-        response: new Response(transformStream(resp.body!, model), {
+        response: new Response(transformStream(resp.body, model), {
           status: 200,
           headers: {
             "Content-Type": "text/event-stream",
@@ -464,7 +469,12 @@ export class AdaptaWebExecutor extends BaseExecutor {
 
     // Non-streaming: collect all text-delta events
     const decoder = new TextDecoder();
-    const reader = resp.body!.getReader();
+    if (!resp.body) {
+      return {
+        response: makeErrorResponse(502, "Adapta-web returned no response body for non-streaming"),
+      };
+    }
+    const reader = resp.body.getReader();
     let buf = "";
     let fullText = "";
 

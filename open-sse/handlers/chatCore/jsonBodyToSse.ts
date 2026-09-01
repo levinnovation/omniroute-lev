@@ -82,7 +82,10 @@ async function sniffJsonBodyForSse(
   ctx: { log?: LoggerLike; provider: string | null | undefined; model: string | null | undefined },
   deps: JsonBodyToSseDeps
 ): Promise<{ sseResponse?: Response; jsonBody: Response }> {
-  const reader = providerResponse.body!.getReader();
+  if (!providerResponse.body) {
+    return { jsonBody: providerResponse };
+  }
+  const reader = providerResponse.body.getReader();
   const bufferedChunks: Uint8Array[] = [];
   const decoder = new TextDecoder();
   let sniffed = "";
