@@ -55,14 +55,29 @@ export function getMem0Config(): SidecarConfig | null {
 
 // ── Health checks ──────────────────────────────────────────────────────────
 
+// Each sidecar has a different health endpoint.
+const SIDECAR_HEALTH_PATHS: Record<string, string> = {
+  browserless: "/config",
+  litellm: "/health/liveness",
+  mem0: "/health",
+};
+
 async function checkSidecarHealth(name: string, config: SidecarConfig): Promise<SidecarHealth> {
   const start = Date.now();
+  const healthPath = SIDECAR_HEALTH_PATHS[name] ?? "/health";
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.timeoutMs ?? 10000);
-    const response = await fetch(`${config.url}/health`, {
+    const baseUrl = `${config.url}${healthPath}`;
+    const headers: Record<string, string> = {};
+    if (config.apiKey && name !== "browserless") {
+      headers["Authorization"] = `Bearer ${config.apiKey}`;
+    }
+    const url =
+      name === "browserless" && config.apiKey ? `${baseUrl}?token=${config.apiKey}` : baseUrl;
+    const response = await fetch(url, {
       signal: controller.signal,
-      headers: config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {},
+      headers,
     });
     clearTimeout(timeout);
     const latencyMs = Date.now() - start;
@@ -72,13 +87,13 @@ async function checkSidecarHealth(name: string, config: SidecarConfig): Promise<
       healthy: response.ok,
       latencyMs,
     };
-  } catch (err) {
+  } catch {
     return {
       name,
       url: config.url,
       healthy: false,
       latencyMs: Date.now() - start,
-      error: err instanceof Error ? err.message : String(err),
+      error: "unreachable",
     };
   }
 }
