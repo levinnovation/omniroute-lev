@@ -250,6 +250,12 @@ const nextConfig = {
       // (better-sqlite3 → node:sqlite → sql.js). Next traces sql-wasm.js but can
       // omit the runtime sql-wasm.wasm asset from the standalone bundle.
       "./node_modules/sql.js/dist/sql-wasm.wasm",
+      // LEV fork: patchright/patchright-core are dynamically imported by
+      // browserPool.ts for stealth browser automation. Without explicit
+      // tracing, the standalone build omits them and web-cookie providers
+      // fail at runtime with "Cannot find module 'patchright'".
+      "./node_modules/patchright/**/*",
+      "./node_modules/patchright-core/**/*",
     ],
   },
   outputFileTracingExcludes: {
@@ -291,6 +297,10 @@ const nextConfig = {
     "tls-client-node",
     "koffi",
     "tough-cookie",
+    // LEV fork: patchright is a stealth Playwright fork used for browser-cookie
+    // providers. Must be externalized so Next.js standalone build includes it.
+    "patchright",
+    "patchright-core",
     "@ngrok/ngrok",
     "@huggingface/transformers",
     // copilot-m365-web.ts imports 'ws' as a client-side WebSocket. When bundled,
