@@ -900,15 +900,31 @@ export class ZaiWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
+    // Direct HTTP is primary; browser automation is fallback only
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
+
+    // Browser fallback — needs the resolved request
+    const resolved = resolveZaiRequest(input);
+    if ("errorResult" in resolved) return resolved.errorResult;
+    const browserResult = await this.executeViaBrowser(input, resolved.request);
+    if (browserResult) return browserResult;
+
+    return makeErrorResult(
+      502,
+      "Z.ai: both direct HTTP and browser automation failed",
+      input.body,
+      ZAI_CHAT_URL
+    );
+  }
+
+  private async executeViaDirectHttp(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
     const { body, signal, stream: wantStream } = input;
 
     const resolved = resolveZaiRequest(input);
     if ("errorResult" in resolved) return resolved.errorResult;
     const request = resolved.request;
     const { imageUrls, messages, modelId, thinkingConfig, token, vlmConfig } = request;
-
-    const browserResult = await this.executeViaBrowser(input, request);
-    if (browserResult) return browserResult;
 
     // LEV fork: Pre-dispatch session validation.
     // Refuse to route to a dead session instead of producing a silent 200
@@ -987,10 +1003,10 @@ export class ZaiWebExecutor extends BaseExecutor {
     try {
       ({ answer, reasoning } = await collectZaiNonStreaming(sourceBody));
     } catch (error) {
-      const message = sanitizeErrorMessage(
-        error instanceof Error ? error.message : "invalid upstream stream"
-      );
-      return makeErrorResult(502, `Z.ai stream failed: ${message}`, body, ZAI_CHAT_URL);
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return makeErrorResult(499, "Request cancelled", body, ZAI_CHAT_URL);
+      }
+      return null;
     }
 
     // LEV fork: Detect Z.ai's "client version outdated" error, which is

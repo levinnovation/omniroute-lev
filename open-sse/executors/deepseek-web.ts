@@ -30,10 +30,14 @@ import {
   FALLBACK_MAX_SYSTEM_CHARS,
   FALLBACK_MAX_CURRENT_MSG_CHARS,
 } from "../services/tokenBudget.ts";
+import { isBrowserAutomationEnabled } from "./base/browserAutomationFallback.ts";
 import {
-  runBrowserAutomation,
-  isBrowserAutomationEnabled,
-} from "./base/browserAutomationFallback.ts";
+  acquireBrowserContext,
+  openPage,
+  type BrowserPoolContextOptions,
+} from "../services/browserPool.ts";
+
+type Page = import("playwright").Page;
 
 export const DEEPSEEK_WEB_BASE = "https://chat.deepseek.com";
 const DEEPSEEK_API_BASE = `${DEEPSEEK_WEB_BASE}/api`;
@@ -950,11 +954,10 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       role: string;
       content: string;
     }>;
-    const {
-      modelType,
-      thinkingEnabled: _thinkingEnabled,
-      searchEnabled: _searchEnabled,
-    } = resolveModelOptions(model as string, bodyObj);
+    const { modelType, thinkingEnabled, searchEnabled } = resolveModelOptions(
+      model as string,
+      bodyObj
+    );
     const psd = (rawCreds.providerSpecificData ?? {}) as Record<string, unknown>;
     const historyWindow =
       typeof psd.historyWindow === "number" && psd.historyWindow > 0 ? psd.historyWindow : 0;
@@ -977,94 +980,270 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       prompt = tokenAwareTruncate(prompt, dsBudget.maxInputTokens);
     }
 
+    // LEV fork: Browser-backed API execution. Instead of filling a UI textarea
+    // (which times out because DeepSeek uses a custom editor), we navigate to
+    // chat.deepseek.com with the userToken cookie, then use page.evaluate() to
+    // execute the full API flow (acquireToken → createSession → PoW → completion)
+    // from within the browser context. This gives us:
+    //   - Real browser fingerprint (Cloudflare/bot-detection bypass)
+    //   - Proper cookie/origin headers
+    //   - The PoW challenge solved in-browser (DeepSeek's JS may detect Node.js)
+    //   - SSE response captured from the browser's fetch()
     const poolKey = `deepseek-web:${userToken.slice(0, 24)}`;
     const cookieString = `userToken=${userToken}`;
-    const result = await runBrowserAutomation({
-      providerName: "deepseek-web",
-      poolKey,
-      pageUrl: `${DEEPSEEK_WEB_BASE}/`,
+    const options: BrowserPoolContextOptions = {
       cookieDomain: "chat.deepseek.com",
       cookieString,
-      inputSelector: "#chat-input, textarea[data-testid='chat-input'], textarea",
-      submitSelector: 'button[data-testid="send-button"], button[aria-label="Send"]',
-      prompt,
-      responseUrlMatch: /\/api\/v0\/chat\/completion/,
-      responseTimeoutMs: 60_000,
-      postSubmitWaitMs: 30_000,
-      fillMode: "evaluate",
-      log,
-      signal,
-    });
-    if (!result) return null;
-    if (result.status < 200 || result.status >= 300) {
-      log?.warn?.("DEEPSEEK-WEB", `Browser automation upstream HTTP ${result.status}`);
+      warmupUrl: `${DEEPSEEK_WEB_BASE}/`,
+    };
+
+    let pooled;
+    try {
+      pooled = await acquireBrowserContext(poolKey, options);
+    } catch (err) {
+      log?.warn?.(
+        "DEEPSEEK-WEB",
+        `Browser automation: context acquire failed: ${sanitizeErrorMessage(err instanceof Error ? err.message : String(err))}`
+      );
       return null;
     }
 
-    const clientModel = typeof model === "string" && model.trim() ? model.trim() : "deepseek-web";
-    const upstreamStream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode(result.body));
-        controller.close();
-      },
-    });
-
-    if (hasTools) {
-      let { content, reasoningContent } = await collectSSEContent(upstreamStream, clientModel);
-      let { content: cleanedContent, toolCalls } = parseDeepSeekToolCalls(
-        content,
-        `call-${Date.now()}`,
-        requestedTools
-      );
-      return buildToolAwareResult({
-        stream: stream !== false,
-        clientModel,
-        content: cleanedContent,
-        reasoningContent,
-        toolCalls,
-        reqHeaders: { "X-OmniRoute-Transport": "browser" },
-        requestPayload: { browser_backed: true, model_type: modelType, prompt },
+    let page: Page | null = null;
+    try {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      page = await openPage(pooled);
+      await page.goto(`${DEEPSEEK_WEB_BASE}/`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
+        const t = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        }, 2000);
+        const onAbort = () => {
+          clearTimeout(t);
+          reject(new DOMException("Aborted", "AbortError"));
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
       });
-    }
 
-    if (stream !== false) {
-      const openaiStream = transformSSE(upstreamStream, clientModel);
+      // Check if we hit a login wall
+      const url = page.url();
+      if (url.includes("/login") || url.includes("/auth")) {
+        log?.warn?.("DEEPSEEK-WEB", "Browser automation: landed on login wall — session expired");
+        return null;
+      }
+
+      // Execute the full DeepSeek API flow from within the browser context.
+      // The browser's fetch() will automatically include cookies, origin, and
+      // the correct fingerprint headers that DeepSeek's bot detection checks.
+      const refFileIds = Array.isArray(bodyObj.ref_file_ids) ? bodyObj.ref_file_ids : [];
+      const completionPayload = {
+        prompt,
+        modelType,
+        thinkingEnabled,
+        searchEnabled,
+        refFileIds,
+      };
+
+      log?.info?.(
+        "DEEPSEEK-WEB",
+        `Browser-backed API execution: model_type=${modelType}, thinking=${thinkingEnabled}, prompt_len=${prompt.length}`
+      );
+
+      const apiResult = await page.evaluate(async (payload) => {
+        const API_BASE = "https://chat.deepseek.com/api";
+        const COMPLETION_URL = `${API_BASE}/v0/chat/completion`;
+
+        // Step 1: Acquire access token
+        const tokenResp = await fetch(`${API_BASE}/v0/users/current`, {
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+        });
+        if (!tokenResp.ok) return { error: `token_acquire_${tokenResp.status}`, body: "" };
+        const user = await tokenResp.json();
+        const accessToken = user?.user?.access_token;
+        if (!accessToken) return { error: "no_access_token", body: "" };
+
+        // Step 2: Create chat session
+        const sessionResp = await fetch(`${API_BASE}/v0/chat_session/create`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
+          credentials: "include",
+          body: JSON.stringify({ agent: "chat" }),
+        });
+        if (!sessionResp.ok) return { error: `session_create_${sessionResp.status}`, body: "" };
+        const session = await sessionResp.json();
+        const sessionId = session?.biz_data?.id;
+        if (!sessionId) return { error: "no_session_id", body: "" };
+
+        // Step 3: Get PoW challenge
+        const powResp = await fetch(`${API_BASE}/v0/chat/create_pow_challenge`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+          },
+          credentials: "include",
+          body: JSON.stringify({ chat_session_id: sessionId }),
+        });
+        if (!powResp.ok) return { error: `pow_challenge_${powResp.status}`, body: "" };
+        const powData = await powResp.json();
+        const challenge = powData?.biz_data?.challenge;
+        if (!challenge) return { error: "no_pow_challenge", body: "" };
+
+        // Step 4: Solve PoW (DeepSeekHashV1)
+        // The PoW algorithm is: find a nonce where SHA256(challenge + nonce) starts with N zeros
+        const { algorithm, challenge: challengeStr, target } = challenge;
+        let powAnswer = "";
+        if (algorithm === "DeepSeekHashV1") {
+          const targetZeros = parseInt(target) || 4;
+          const encoder = new TextEncoder();
+          for (let nonce = 0; nonce < 1_000_000; nonce++) {
+            const data = encoder.encode(`${challengeStr}_${nonce}`);
+            const hash = await crypto.subtle.digest("SHA-256", data);
+            const hashBytes = new Uint8Array(hash);
+            let zeros = 0;
+            for (let i = 0; i < hashBytes.length; i++) {
+              if (hashBytes[i] === 0) zeros++;
+              else break;
+            }
+            // Each zero byte = 2 hex zeros, target is in hex zeros
+            if (zeros * 2 >= targetZeros) {
+              powAnswer = `${nonce}`;
+              break;
+            }
+          }
+        }
+
+        // Step 5: Send completion request
+        const completionResp = await fetch(COMPLETION_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${accessToken}`,
+            "X-Ds-Pow-Response": powAnswer,
+            "X-Client-Timezone-Offset": String(new Date().getTimezoneOffset() * -60),
+          },
+          credentials: "include",
+          body: JSON.stringify({
+            chat_session_id: sessionId,
+            parent_message_id: null,
+            model_type: payload.modelType,
+            prompt: payload.prompt,
+            ref_file_ids: payload.refFileIds,
+            thinking_enabled: payload.thinkingEnabled,
+            search_enabled: payload.searchEnabled,
+            preempt: false,
+          }),
+        });
+
+        if (!completionResp.ok) {
+          const errText = await completionResp.text().catch(() => "");
+          return { error: `completion_${completionResp.status}`, body: errText };
+        }
+
+        // Read the full SSE response body
+        const body = await completionResp.text();
+        return { error: null, body, status: completionResp.status };
+      }, completionPayload);
+
+      if (!apiResult || apiResult.error) {
+        log?.warn?.(
+          "DEEPSEEK-WEB",
+          `Browser-backed API failed: ${apiResult?.error || "no result"}`
+        );
+        return null;
+      }
+
+      log?.info?.(
+        "DEEPSEEK-WEB",
+        `Browser-backed API success: ${apiResult.body?.length || 0} bytes`
+      );
+
+      const clientModel = typeof model === "string" && model.trim() ? model.trim() : "deepseek-web";
+      const upstreamStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(apiResult.body));
+          controller.close();
+        },
+      });
+
+      if (hasTools) {
+        let { content, reasoningContent } = await collectSSEContent(upstreamStream, clientModel);
+        let { content: cleanedContent, toolCalls } = parseDeepSeekToolCalls(
+          content,
+          `call-${Date.now()}`,
+          requestedTools
+        );
+        return buildToolAwareResult({
+          stream: stream !== false,
+          clientModel,
+          content: cleanedContent,
+          reasoningContent,
+          toolCalls,
+          reqHeaders: { "X-OmniRoute-Transport": "browser" },
+          requestPayload: { browser_backed: true, model_type: modelType, prompt },
+        });
+      }
+
+      if (stream !== false) {
+        const openaiStream = transformSSE(upstreamStream, clientModel);
+        return {
+          response: new Response(openaiStream, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+          }),
+          url: COMPLETION_URL,
+          headers: { "X-OmniRoute-Transport": "browser" },
+          transformedBody: { browser_backed: true, model_type: modelType, prompt },
+        };
+      }
+
+      const { content, reasoningContent } = await collectSSEContent(upstreamStream, clientModel);
+      const message: Record<string, string> = { role: "assistant", content };
+      if (reasoningContent) message.reasoning_content = reasoningContent;
+      const openaiResponse = {
+        id: `chatcmpl-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: model || modelType,
+        choices: [{ index: 0, message, finish_reason: "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
       return {
-        response: new Response(openaiStream, {
+        response: new Response(JSON.stringify(openaiResponse), {
           status: 200,
-          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+          headers: { "Content-Type": "application/json" },
         }),
         url: COMPLETION_URL,
         headers: { "X-OmniRoute-Transport": "browser" },
         transformedBody: { browser_backed: true, model_type: modelType, prompt },
       };
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") throw err;
+      log?.warn?.(
+        "DEEPSEEK-WEB",
+        `Browser automation failed: ${sanitizeErrorMessage(err instanceof Error ? err.message : String(err))}`
+      );
+      return null;
+    } finally {
+      try {
+        if (page) await page.close();
+      } catch {
+        // ignore
+      }
     }
-
-    const { content, reasoningContent } = await collectSSEContent(upstreamStream, clientModel);
-    const message: Record<string, string> = { role: "assistant", content };
-    if (reasoningContent) message.reasoning_content = reasoningContent;
-    const openaiResponse = {
-      id: `chatcmpl-${Date.now()}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: model || modelType,
-      choices: [{ index: 0, message, finish_reason: "stop" }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    };
-    return {
-      response: new Response(JSON.stringify(openaiResponse), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-      url: COMPLETION_URL,
-      headers: { "X-OmniRoute-Transport": "browser" },
-      transformedBody: { browser_backed: true, model_type: modelType, prompt },
-    };
   }
 
   async execute({ model, body, stream, credentials, signal, log }: ExecuteInput) {
-    const bodyObj = (body || {}) as Record<string, unknown>;
-
+    // LEV fork: Browser automation is the PRIMARY path. The browser executes
+    // the full DeepSeek API flow (token → session → PoW → completion) via
+    // page.evaluate(), giving us real browser fingerprint, proper cookies,
+    // and in-browser PoW solving. Falls back to direct HTTP if browser fails.
     const browserResult = await this.executeViaBrowser({
       model,
       body,
@@ -1074,6 +1253,36 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       log,
     });
     if (browserResult) return browserResult;
+
+    // Direct HTTP fallback (when browser automation is unavailable or fails)
+    const directResult = await this.executeViaDirectHttp({
+      model,
+      body,
+      stream,
+      credentials,
+      signal,
+      log,
+    });
+    if (directResult) return directResult;
+
+    // If both paths fail, return a generic error
+    return {
+      response: errorResponse(502, "DeepSeek-web: both browser automation and direct HTTP failed"),
+      url: COMPLETION_URL,
+      headers: {},
+      transformedBody: body,
+    };
+  }
+
+  private async executeViaDirectHttp({
+    model,
+    body,
+    stream,
+    credentials,
+    signal,
+    log,
+  }: ExecuteInput): Promise<ExecutorExecuteResult | null> {
+    const bodyObj = (body || {}) as Record<string, unknown>;
 
     // chat.deepseek.com's web API only accepts {prompt, ref_file_ids,
     // thinking_enabled, search_enabled} - no native tools field. Instead of failing
@@ -1542,7 +1751,7 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      log?.error?.("DEEPSEEK-WEB", `Execute failed: ${msg}`);
+      log?.error?.("DEEPSEEK-WEB", `Direct HTTP failed: ${msg}`);
 
       if (err instanceof DOMException && err.name === "AbortError") {
         return {
@@ -1553,12 +1762,8 @@ export class DeepSeekWebExecutor extends BaseExecutor {
         };
       }
 
-      return {
-        response: errorResponse(502, `DeepSeek error: ${sanitizeErrorMessage(msg)}`),
-        url: COMPLETION_URL,
-        headers: {},
-        transformedBody: body,
-      };
+      // Return null to allow browser automation fallback for unexpected errors
+      return null;
     }
   }
 }

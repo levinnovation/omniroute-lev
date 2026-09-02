@@ -15,7 +15,6 @@ import {
 import {
   tlsFetchPerplexity,
   isCloudflareChallenge,
-  TlsClientUnavailableError,
   type TlsFetchResult,
 } from "../services/perplexityTlsClient.ts";
 import { prepareToolMessages } from "../translator/webTools.ts";
@@ -505,7 +504,31 @@ export class PerplexityWebExecutor extends BaseExecutor {
     };
   }
 
-  async execute({
+  async execute(input: ExecuteInput) {
+    // Direct HTTP is primary; browser automation is fallback only
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
+
+    const browserResult = await this.executeViaBrowser(input);
+    if (browserResult) return browserResult;
+
+    return {
+      response: new Response(
+        JSON.stringify({
+          error: {
+            message: "Perplexity-web: both direct HTTP and browser automation failed",
+            type: "upstream_error",
+          },
+        }),
+        { status: 502, headers: { "Content-Type": "application/json" } }
+      ),
+      url: PPLX_SSE_ENDPOINT,
+      headers: {},
+      transformedBody: input.body,
+    };
+  }
+
+  private async executeViaDirectHttp({
     model,
     body,
     stream,
@@ -513,7 +536,7 @@ export class PerplexityWebExecutor extends BaseExecutor {
     signal,
     log,
     onCredentialsRefreshed,
-  }: ExecuteInput) {
+  }: ExecuteInput): Promise<ExecutorExecuteResult | null> {
     const bodyObj = (body || {}) as Record<string, unknown>;
     const rawMessages = bodyObj.messages as Array<Record<string, unknown>> | undefined;
     if (!rawMessages || !Array.isArray(rawMessages) || rawMessages.length === 0) {
@@ -525,17 +548,6 @@ export class PerplexityWebExecutor extends BaseExecutor {
       );
       return { response: errResp, url: PPLX_SSE_ENDPOINT, headers: {}, transformedBody: body };
     }
-
-    const browserResult = await this.executeViaBrowser({
-      model,
-      body,
-      stream,
-      credentials,
-      signal,
-      log,
-      onCredentialsRefreshed,
-    });
-    if (browserResult) return browserResult;
 
     const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
       bodyObj,
@@ -635,20 +647,16 @@ export class PerplexityWebExecutor extends BaseExecutor {
         streamEofSymbol: PPLX_STREAM_EOF_SYMBOL,
       });
     } catch (err) {
-      const isTlsUnavail = err instanceof TlsClientUnavailableError;
-      log?.error?.("PPLX-WEB", `Fetch failed: ${err instanceof Error ? err.message : String(err)}`);
-      const errResp = new Response(
-        JSON.stringify({
-          error: {
-            message: isTlsUnavail
-              ? `Perplexity TLS client unavailable: ${sanitizeErrorMessage((err as Error).message)}`
-              : `Perplexity connection failed: ${sanitizeErrorMessage(err instanceof Error ? err.message : String(err))}`,
-            type: "upstream_error",
-          },
-        }),
-        { status: 502, headers: { "Content-Type": "application/json" } }
-      );
-      return { response: errResp, url: PPLX_SSE_ENDPOINT, headers, transformedBody: pplxBody };
+      if (err instanceof DOMException && err.name === "AbortError") {
+        const errResp = new Response(
+          JSON.stringify({
+            error: { message: "Request cancelled", type: "upstream_error" },
+          }),
+          { status: 499, headers: { "Content-Type": "application/json" } }
+        );
+        return { response: errResp, url: PPLX_SSE_ENDPOINT, headers, transformedBody: pplxBody };
+      }
+      return null;
     }
 
     if (response.status !== 200 || (!response.body && !response.text)) {

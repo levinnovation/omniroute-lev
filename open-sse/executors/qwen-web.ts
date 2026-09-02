@@ -209,11 +209,24 @@ export class QwenWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    const { body, credentials, signal, stream: wantStream } = input;
-    const bodyObj = (body || {}) as Record<string, unknown>;
+    // Direct HTTP is primary; browser automation is fallback only
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
 
     const browserResult = await this.executeViaBrowser(input);
     if (browserResult) return browserResult;
+
+    return makeErrorResult(
+      502,
+      "Qwen-web: both direct HTTP and browser automation failed",
+      (input.body || {}) as Record<string, unknown>,
+      CHATS_NEW_URL
+    );
+  }
+
+  private async executeViaDirectHttp(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
+    const { body, credentials, signal, stream: wantStream } = input;
+    const bodyObj = (body || {}) as Record<string, unknown>;
 
     const rawCred = String(credentials?.apiKey ?? "").trim();
     const cookieHeader = buildQwenCookieHeader(rawCred);
@@ -265,12 +278,10 @@ export class QwenWebExecutor extends BaseExecutor {
         return makeErrorResult(502, "Qwen create-chat returned no chat id", body, CHATS_NEW_URL);
       }
     } catch (err) {
-      return makeErrorResult(
-        502,
-        `Qwen create-chat error: ${err instanceof Error ? err.message : "unknown"}`,
-        body,
-        CHATS_NEW_URL
-      );
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return makeErrorResult(499, "Request cancelled", body, CHATS_NEW_URL);
+      }
+      return null;
     }
 
     // ── Step 2: send the message ─────────────────────────────────────────────
@@ -286,12 +297,10 @@ export class QwenWebExecutor extends BaseExecutor {
         signal,
       });
     } catch (err) {
-      return makeErrorResult(
-        502,
-        `Qwen completion fetch failed: ${err instanceof Error ? err.message : "unknown"}`,
-        body,
-        completionUrl
-      );
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return makeErrorResult(499, "Request cancelled", body, completionUrl);
+      }
+      return null;
     }
 
     const ct = upstream.headers.get("content-type") || "";

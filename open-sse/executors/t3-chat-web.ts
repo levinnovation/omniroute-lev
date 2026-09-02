@@ -536,7 +536,30 @@ export class T3ChatWebExecutor extends BaseExecutor {
     };
   }
 
-  async execute({ model, body, stream, credentials, signal, log }: ExecuteInput) {
+  async execute(input: ExecuteInput) {
+    // Direct HTTP is primary; browser automation is fallback only
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
+
+    const browserResult = await this.executeViaBrowser(input);
+    if (browserResult) return browserResult;
+
+    return {
+      response: buildErrorResponse(502, "t3.chat: both direct HTTP and browser automation failed"),
+      url: `${SERVER_FN_PREFIX}...`,
+      headers: {},
+      transformedBody: input.body,
+    };
+  }
+
+  private async executeViaDirectHttp({
+    model,
+    body,
+    stream,
+    credentials,
+    signal,
+    log,
+  }: ExecuteInput): Promise<ExecutorExecuteResult | null> {
     const bodyObj = (body || {}) as Record<string, unknown>;
     const rawMessages = (Array.isArray(bodyObj.messages) ? bodyObj.messages : []) as Array<{
       role: string;
@@ -561,16 +584,6 @@ export class T3ChatWebExecutor extends BaseExecutor {
         transformedBody: body,
       };
     }
-
-    const browserResult = await this.executeViaBrowser({
-      model,
-      body,
-      stream,
-      credentials,
-      signal,
-      log,
-    });
-    if (browserResult) return browserResult;
 
     const cookieHeader = parsed.cookieHeader;
     const headers = buildServerFnHeaders(cookieHeader);
@@ -781,12 +794,8 @@ export class T3ChatWebExecutor extends BaseExecutor {
         };
       }
 
-      return {
-        response: buildErrorResponse(502, `t3.chat connection error: ${msg}`),
-        url: `${SERVER_FN_PREFIX}...`,
-        headers,
-        transformedBody: body,
-      };
+      // Return null to allow browser automation fallback for unexpected errors
+      return null;
     }
   }
 }

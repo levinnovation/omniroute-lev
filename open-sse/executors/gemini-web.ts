@@ -683,11 +683,29 @@ export class GeminiWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    const { model, body, stream, credentials, signal, log, onCredentialsRefreshed } = input;
-    const requestBody = body as GeminiRequestBody;
+    // Direct HTTP is primary; browser automation is fallback only
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
 
     const browserResult = await this.executeViaBrowser(input);
     if (browserResult) return browserResult;
+
+    return {
+      response: new Response(
+        JSON.stringify({
+          error: "Gemini-web: both direct HTTP and browser automation failed",
+        }),
+        { status: 502, headers: { "Content-Type": "application/json" } }
+      ),
+      url: GEMINI_URL,
+      headers: {},
+      transformedBody: input.body,
+    };
+  }
+
+  private async executeViaDirectHttp(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
+    const { model, body, stream, credentials, signal, log, onCredentialsRefreshed } = input;
+    const requestBody = body as GeminiRequestBody;
 
     // #9356: fail fast on controls this provider cannot honor (reasoning_effort
     // above "minimal", forced tool_choice). Runs before the credential check and
@@ -995,67 +1013,19 @@ export class GeminiWebExecutor extends BaseExecutor {
         transformedBody: body,
       };
     } catch (error) {
-      const rawMessage = error instanceof Error ? error.message : "Unknown error";
-      // #3516: a missing Playwright browser is a host/config problem, not a transient upstream
-      // fault. Surface an actionable error and tag it with the connection-cooldown hint so
-      // accountFallback skips the provider circuit breaker and applies a short, non-exponential
-      // cooldown instead of looping on a retryable 500.
-      if (isMissingBrowserExecutable(rawMessage)) {
+      if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) {
         return {
-          response: new Response(
-            JSON.stringify({
-              error:
-                "Gemini Web requires the Playwright Chromium browser, which is not installed. " +
-                "Run `npx playwright install chromium` on the host (or rebuild the Docker image with browsers).",
-            }),
-            {
-              status: 503,
-              headers: {
-                "Content-Type": "application/json",
-                "X-Omni-Fallback-Hint": "connection_cooldown",
-              },
-            }
-          ),
-          url: GEMINI_URL,
-          headers: {},
-          transformedBody: body,
-        };
-      }
-      // #9407: Playwright selector/click timeout errors are terminal — they indicate
-      // the page DOM does not match expectations (e.g. Gemini changed their UI or
-      // the session is so expired it lands on a different page). Return 400 so the
-      // account-fallback system does NOT retry this request as a transient 5xx.
-      if (
-        error instanceof Error &&
-        (error.name === "TimeoutError" ||
-          rawMessage.includes("waitForSelector") ||
-          rawMessage.includes("Timeout") ||
-          rawMessage.includes("actionability") ||
-          rawMessage.includes("interception"))
-      ) {
-        return {
-          response: new Response(
-            JSON.stringify({
-              error: sanitizeErrorMessage(rawMessage),
-            }),
-            { status: 400, headers: { "Content-Type": "application/json" } }
-          ),
-          url: GEMINI_URL,
-          headers: {},
-          transformedBody: body,
-        };
-      }
-      return {
-        response: new Response(
-          JSON.stringify({
-            error: sanitizeErrorMessage(rawMessage),
+          response: new Response(JSON.stringify({ error: "Request cancelled" }), {
+            status: 499,
+            headers: { "Content-Type": "application/json" },
           }),
-          { status: 500, headers: { "Content-Type": "application/json" } }
-        ),
-        url: GEMINI_URL,
-        headers: {},
-        transformedBody: body,
-      };
+          url: GEMINI_URL,
+          headers: {},
+          transformedBody: body,
+        };
+      }
+      // Return null to allow browser automation fallback for unexpected errors
+      return null;
     } finally {
       if (abortBrowser) signal?.removeEventListener("abort", abortBrowser);
       // Always close browser to prevent resource leaks
