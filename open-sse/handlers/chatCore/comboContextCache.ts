@@ -1,5 +1,6 @@
 import { getUpstreamProxyConfig } from "@/lib/localDb";
 import type { FallbackBackend } from "@/lib/db/upstreamProxy";
+import { TtlCache } from "../../services/ttlCache.ts";
 
 /**
  * Module-level cache for upstream proxy config (shared across all requests).
@@ -17,18 +18,17 @@ type UpstreamProxyConfigCacheEntry = {
 const _proxyConfigCache = new Map<string, UpstreamProxyConfigCacheEntry>();
 const PROXY_CONFIG_CACHE_TTL = 10_000;
 
-/**
- * Module-level cache for all combos data (shared across all requests).
- * Uses cached promises to prevent thundering herd — all concurrent callers
- * wait for the same underlying DB query while it's in flight.
- */
-let _combosPromise: Promise<unknown[]> | null = null;
-let _combosCacheTs = 0;
-let _combosCacheVersionSnapshot = -1;
+const COMBOS_CACHE_KEY = "combos";
 const COMBOS_CACHE_TTL = 10_000;
+const _combosCache = new TtlCache(COMBOS_CACHE_TTL);
+let _combosCacheVersionSnapshot = -1;
+
+type CombosCacheEntry = {
+  promise: Promise<unknown[]>;
+  version: number;
+};
 
 export async function getCombosCached(): Promise<unknown[]> {
-  const now = Date.now();
   const { getCombos, getCombosCacheVersion } = await import("@/lib/localDb");
   const version = getCombosCacheVersion();
   // A combo write (create/update/delete/reorder) bumps the shared version via
@@ -38,18 +38,18 @@ export async function getCombosCached(): Promise<unknown[]> {
   if (version !== _combosCacheVersionSnapshot) {
     clearCombosCache();
   }
-  if (_combosPromise && now - _combosCacheTs < COMBOS_CACHE_TTL) {
-    return _combosPromise;
+  const cached = _combosCache.get<CombosCacheEntry>(COMBOS_CACHE_KEY);
+  if (cached && cached.version === version) {
+    return cached.promise;
   }
-  _combosCacheTs = now;
   _combosCacheVersionSnapshot = version;
-  _combosPromise = getCombos();
-  return _combosPromise;
+  const promise = getCombos();
+  _combosCache.set<CombosCacheEntry>(COMBOS_CACHE_KEY, { promise, version }, COMBOS_CACHE_TTL);
+  return promise;
 }
 
 export function clearCombosCache() {
-  _combosPromise = null;
-  _combosCacheTs = 0;
+  _combosCache.invalidate(COMBOS_CACHE_KEY);
   _combosCacheVersionSnapshot = -1;
 }
 

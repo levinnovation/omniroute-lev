@@ -131,6 +131,32 @@ async function resolveStealthLaunch(): Promise<((opts: unknown) => Promise<Brows
   return state.cloakLaunch;
 }
 
+// LEV fork: Browserless sidecar CDP connection. When the Browserless sidecar is
+// configured (OMNIROUTE_BROWSERLESS_URL + OMNIROUTE_BROWSERLESS_TOKEN), connect
+// to its WebSocket endpoint via chromium.connectOverCDP() instead of launching
+// a local browser. Falls back to local launch on any failure.
+async function connectBrowserless(): Promise<Browser | null> {
+  const { getBrowserlessWsUrl } = await import("./sidecars.ts");
+  const wsUrl = getBrowserlessWsUrl();
+  if (!wsUrl) return null;
+  try {
+    const stealthLaunch = await resolveStealthLaunch();
+    const chromium =
+      stealthLaunch !== null
+        ? (await import("patchright")).chromium
+        : (await import("playwright")).chromium;
+    const browser = await chromium.connectOverCDP(wsUrl);
+    console.log("[BrowserPool] Connected to Browserless sidecar via CDP");
+    return browser as Browser;
+  } catch (err) {
+    console.warn(
+      "[BrowserPool] Browserless CDP connection failed, falling back to local launch:",
+      err
+    );
+    return null;
+  }
+}
+
 function isPoolEnabled(): boolean {
   const flag = process.env.OMNIROUTE_BROWSER_POOL;
   if (flag === undefined) return true;
@@ -226,27 +252,28 @@ async function launchBrowser(): Promise<Browser> {
   if (state.browser) return state.browser;
   if (state.launching) return state.launching;
   state.launching = (async () => {
-    // LEV fork: Use patchright (stealth Playwright fork) instead of cloakbrowser.
-    // Falls back to plain playwright if patchright is not available.
-    const stealthLaunch = await resolveStealthLaunch();
-    let browser: Browser;
-    if (stealthLaunch) {
-      browser = await stealthLaunch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      });
-    } else {
-      // Fallback: plain Playwright. Works for Claude web (cookie-only
-      // auth) but DDG's VQD challenge will detect this Chromium build.
-      const { chromium } = await import("playwright");
-      browser = await chromium.launch({
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-blink-features=AutomationControlled",
-        ],
-      });
+    // LEV fork: Try Browserless sidecar via CDP first, fall back to local launch.
+    let browser: Browser | null = await connectBrowserless();
+    if (!browser) {
+      const stealthLaunch = await resolveStealthLaunch();
+      if (stealthLaunch) {
+        browser = await stealthLaunch({
+          headless: true,
+          args: ["--no-sandbox", "--disable-dev-shm-usage"],
+        });
+      } else {
+        // Fallback: plain Playwright. Works for Claude web (cookie-only
+        // auth) but DDG's VQD challenge will detect this Chromium build.
+        const { chromium } = await import("playwright");
+        browser = await chromium.launch({
+          headless: true,
+          args: [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+          ],
+        });
+      }
     }
     state.browser = browser;
     state.launching = null;

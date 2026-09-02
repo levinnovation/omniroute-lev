@@ -22,6 +22,14 @@ import {
 // LEV fork: WebSessionDriver for robust session management
 import { WebSessionDriver } from "../services/webSessionDriver.ts";
 import { DEEPSEEK_WEB_SESSION_CONFIG } from "./deepseek-web/sessionConfig.ts";
+// LEV fork: token-aware budget utilities (Phase 4.3)
+import {
+  estimateTokens as estimateTextTokens,
+  tokenAwareTruncate,
+  getBudgetForProvider,
+  FALLBACK_MAX_SYSTEM_CHARS,
+  FALLBACK_MAX_CURRENT_MSG_CHARS,
+} from "../services/tokenBudget.ts";
 
 export const DEEPSEEK_WEB_BASE = "https://chat.deepseek.com";
 const DEEPSEEK_API_BASE = `${DEEPSEEK_WEB_BASE}/api`;
@@ -600,7 +608,11 @@ export function messagesToPrompt(
 
   const parts: string[] = [];
   if (systemParts.length > 0) {
-    parts.push(systemParts.join("\n\n"));
+    let systemText = systemParts.join("\n\n");
+    if (systemText.length > FALLBACK_MAX_SYSTEM_CHARS) {
+      systemText = systemText.slice(0, FALLBACK_MAX_SYSTEM_CHARS) + "\n[...truncated...]";
+    }
+    parts.push(systemText);
   }
 
   const effectiveWindow =
@@ -992,9 +1004,32 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       // Tool (agentic) requests replay the whole trajectory — prior tool calls and their
       // results — so the model keeps context across turns instead of restarting each time.
       // Plain chat keeps the legacy last-user-message / rolling-window behavior.
-      const prompt = hasTools
+      let prompt = hasTools
         ? buildToolConversationPrompt(messages, toolSystemPrompt)
         : messagesToPrompt(promptMessages, historyWindow);
+      // LEV fork: token-aware prompt truncation (Phase 4.3)
+      // DeepSeek-web has a ~32K token effective context window. Truncate the
+      // prompt based on token estimates instead of raw character counts so CJK
+      // content is handled correctly. Falls back to character-based budget if
+      // token estimation fails.
+      const dsBudget = getBudgetForProvider("deepseek-web", model as string);
+      const promptTokenEstimate = estimateTextTokens(prompt);
+      if (promptTokenEstimate === 0 && prompt.length > FALLBACK_MAX_CURRENT_MSG_CHARS) {
+        const charBudget = dsBudget.maxInputTokens * 4;
+        prompt = prompt.slice(0, Math.max(1, charBudget)) + "\n[...truncated...]";
+        log?.info?.(
+          "DEEPSEEK-WEB",
+          `Character-based fallback truncation: ${prompt.length} chars (token estimate unavailable)`
+        );
+      } else if (promptTokenEstimate > dsBudget.maxInputTokens) {
+        const truncatedPrompt = tokenAwareTruncate(prompt, dsBudget.maxInputTokens);
+        log?.info?.(
+          "DEEPSEEK-WEB",
+          `Token-aware prompt truncation: ${promptTokenEstimate} → ${estimateTextTokens(truncatedPrompt)} tokens ` +
+            `(budget ${dsBudget.maxInputTokens}, original ${prompt.length} chars)`
+        );
+        prompt = truncatedPrompt;
+      }
       const refFileIds = Array.isArray(bodyObj.ref_file_ids) ? bodyObj.ref_file_ids : [];
       log?.info?.(
         "DEEPSEEK-WEB",
@@ -1220,7 +1255,7 @@ export class DeepSeekWebExecutor extends BaseExecutor {
           const minimalRetryPrompt =
             toolSystemPrompt +
             "\n\n---\nPrevious task context (last user request):\n" +
-            lastUserText.slice(0, 8_000) +
+            tokenAwareTruncate(lastUserText, 2_000) +
             '\n\n---\nIMPORTANT: Your previous response was: "' +
             cleanedContent.slice(0, 200) +
             '" — you narrated intent to use a tool but did NOT emit a <tool> block. ' +

@@ -43,6 +43,8 @@ import {
   emitRoutingEvent,
   outcomeFromStatus,
 } from "../services/routing/index.ts";
+import { isVirtualAlias, resolveVirtualAlias } from "../services/virtualAliases.ts";
+import { PROVIDER_MODELS } from "../config/providerModels.ts";
 
 /**
  * Best-effort finish_reason extraction from a (possibly translated) response
@@ -280,6 +282,7 @@ import { buildExecutorClientHeaders } from "./chatCore/executorClientHeaders.ts"
 import { getExecutionConnectionId } from "./chatCore/executionCredentials.ts";
 import { resolveExecutionCredentials as resolveExecutionCredentialsFor } from "./chatCore/executionCredentials.ts";
 import { resolveExecutorWithProxy as resolveExecutorWithProxyFor } from "./chatCore/executorProxy.ts";
+import { tryLiteLLMDelegate } from "./chatCore/litellmDelegate.ts";
 import type { ClaudeMessage } from "./chatCore/claudeMessageTypes.ts";
 import { normalizeClaudeUpstreamMessages as normalizeClaudeUpstreamMessagesFor } from "./chatCore/claudeUpstreamMessages.ts";
 import {
@@ -428,6 +431,17 @@ import {
   getComboTargetTokenLimit,
   resolveComboContextLimit,
 } from "../services/contextManager.ts";
+import { compactContext as mem0CompactContext } from "../services/sidecars.ts";
+import {
+  shouldCompact as shouldCompactFidelity,
+  protectCriticalContent,
+  restoreProtectedContent,
+  type ChatMessage as FidelityChatMessage,
+} from "../services/contextFidelityGate.ts";
+import {
+  createCompressionTrailerTransform,
+  type CompressionTrailerMeta,
+} from "../services/compressionTrailer.ts";
 import { resolveBackgroundTaskRedirect } from "./chatCore/backgroundRedirect.ts";
 import type {
   CompressionConfig,
@@ -472,6 +486,7 @@ import {
   isRpmExhausted,
 } from "../services/geminiRateLimitTracker.ts";
 import { isSmallEnoughForSemanticCache } from "../utils/estimateSize.ts";
+import { resolveProviderAlias } from "../services/model.ts";
 
 type ChatCoreExecutorResult = ReturnType<typeof normalizeExecutorResult> & {
   _executionCredentials?: Record<string, unknown>;
@@ -537,6 +552,30 @@ export async function handleChatCore({
       if (pressureGuard) return pressureGuard;
     } catch {
       /* fail open */
+    }
+  }
+  if (isVirtualAlias(model)) {
+    const availableModelIds = new Set<string>();
+    for (const [providerAlias, entries] of Object.entries(PROVIDER_MODELS)) {
+      for (const entry of entries || []) {
+        if (entry?.id) availableModelIds.add(`${providerAlias}/${entry.id}`);
+      }
+    }
+    const resolved = resolveVirtualAlias(model, availableModelIds);
+    if (resolved !== model) {
+      const slashIdx = resolved.indexOf("/");
+      if (slashIdx > 0) {
+        const aliasPart = resolved.slice(0, slashIdx);
+        const modelPart = resolved.slice(slashIdx + 1);
+        const resolvedProviderId = resolveProviderAlias(aliasPart);
+        if (resolvedProviderId) {
+          provider = resolvedProviderId;
+          model = modelPart;
+          if (body && typeof body === "object") {
+            (body as Record<string, unknown>).model = model;
+          }
+        }
+      }
     }
   }
   // Per-request model-routing metadata (first extracted slice of the request-setup phase).
@@ -615,6 +654,7 @@ export async function handleChatCore({
     };
   };
   let tokensCompressed: number | null = null;
+  let preCompressionTokenEstimate: number | null = null;
   body = injectSystemPrompt(body);
   // ── Per-endpoint custom system prompt (port of upstream #2063) ──
   // Reads from cachedSettings if available (passed in from combo/chat layer)
@@ -1140,6 +1180,20 @@ export async function handleChatCore({
           streamDefaultMode: apiKeyInfo?.streamDefaultMode,
         });
 
+  // LEV fork: LiteLLM API-key delegate. For API-key providers (not web-cookie),
+  // forward the request to the LiteLLM sidecar as a thin proxy. Falls back to
+  // the existing OmniRoute executor path if disabled, inapplicable, or on error.
+  {
+    const litellmResult = await tryLiteLLMDelegate({
+      provider,
+      body: body && typeof body === "object" ? (body as Record<string, unknown>) : null,
+      stream: !!stream,
+      signal: clientRawRequest?.signal ?? null,
+      log,
+    });
+    if (litellmResult) return litellmResult;
+  }
+
   // `settings` is already consolidated once near the top of handleChatCore
   // (the "fetch once, reuse" const). A second `const settings` here was a
   // duplicate same-scope declaration that broke the esbuild/tsx transform
@@ -1329,6 +1383,7 @@ export async function handleChatCore({
   }
   if (body && Array.isArray(allMessages) && allMessages.length > 0) {
     let estimatedTokens = estimateTokens(allMessages);
+    preCompressionTokenEstimate = estimatedTokens;
     const compressionSettingsResult = await resolveCompressionSettings(log);
     const compressionSettings: CompressionConfig | null = compressionSettingsResult.settings;
     // #8034 — operator-named model/endpoint exclusions bypass the whole pipeline, exactly
@@ -2073,6 +2128,91 @@ export async function handleChatCore({
       "CONTEXT",
       `Skipping compression check: body=${!!body}, hasMessages=${Array.isArray(allMessages)}`
     );
+  }
+
+  // LEV fork: Mem0 context compaction delegation (Phase 4.1)
+  // When OMNIROUTE_CONTEXT_DELEGATE=mem0 is set and the provider is a web-cookie
+  // provider with a large context (>20 messages or >32K estimated tokens), delegate
+  // compaction to the Mem0 sidecar before the input-token gate check. Protected
+  // content (code blocks, tool results, system prompts) is preserved via the
+  // fidelity gate. Falls back to the existing compression path on failure.
+  let mem0CompactionApplied = false;
+  if (
+    process.env.OMNIROUTE_CONTEXT_DELEGATE === "mem0" &&
+    body &&
+    typeof provider === "string" &&
+    provider.endsWith("-web") &&
+    Array.isArray(allMessages) &&
+    allMessages.length > 0
+  ) {
+    const mem0MessageThreshold = 20;
+    const mem0TokenThreshold = 32_000;
+    const mem0EstimatedTokens = estimateTokens(allMessages);
+    const exceedsMessageThreshold = allMessages.length > mem0MessageThreshold;
+    const exceedsTokenThreshold = mem0EstimatedTokens > mem0TokenThreshold;
+
+    if (exceedsMessageThreshold || exceedsTokenThreshold) {
+      const fidelityMessages: FidelityChatMessage[] = allMessages.map(
+        (m: Record<string, unknown>) => ({
+          role: String(m.role ?? "user"),
+          content: m.content,
+        })
+      );
+      if (shouldCompactFidelity(fidelityMessages)) {
+        const { messages: protectedMsgs, protectedBlocks } =
+          protectCriticalContent(fidelityMessages);
+        const mem0Input = protectedMsgs.map((m) => ({
+          role: m.role,
+          content: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? ""),
+        }));
+        const mem0UserId = String(apiKeyInfo?.id ?? connectionId ?? "default").slice(0, 64);
+        try {
+          const mem0Result = await mem0CompactContext(
+            mem0Input,
+            mem0UserId,
+            Math.max(1, Math.floor(contextLimit * 0.7))
+          );
+          if (mem0Result.compacted && Array.isArray(mem0Result.messages)) {
+            const restored = restoreProtectedContent(
+              mem0Result.messages.map((m) => ({
+                role: m.role,
+                content: m.content,
+              })),
+              protectedBlocks
+            );
+            const compactedMessages = restored.map((m) => ({
+              role: m.role,
+              content: m.content,
+            }));
+            if (body.messages && Array.isArray(body.messages)) {
+              body.messages = compactedMessages;
+            } else if (body.contents && Array.isArray(body.contents)) {
+              body.contents = compactedMessages;
+            } else if (body.input && Array.isArray(body.input)) {
+              body.input = compactedMessages;
+            }
+            const mem0OriginalMsgCount = allMessages.length;
+            allMessages.length = 0;
+            allMessages.push(...compactedMessages);
+            mem0CompactionApplied = true;
+            const tokensBefore = mem0EstimatedTokens;
+            const tokensAfter = estimateTokens(compactedMessages);
+            tokensCompressed = Math.max(0, tokensBefore - tokensAfter);
+            log?.info?.(
+              "CONTEXT",
+              `Mem0 compaction applied (${mem0Result.method}): ${tokensBefore} -> ${tokensAfter} tokens, ` +
+                `${compactedMessages.length} messages (was ${mem0OriginalMsgCount})`
+            );
+          }
+        } catch (mem0Err) {
+          log?.warn?.(
+            "CONTEXT",
+            "Mem0 compaction failed, falling back to existing compression: " +
+              (mem0Err instanceof Error ? mem0Err.message : String(mem0Err))
+          );
+        }
+      }
+    }
   }
 
   // Re-check the concrete target after all compression passes. Combo compatibility
@@ -5932,7 +6072,7 @@ export async function handleChatCore({
     );
   }
 
-  const finalStream = assembleStreamingPipeline({
+  let finalStream = assembleStreamingPipeline({
     providerResponse,
     transformStream,
     streamController,
@@ -5942,6 +6082,24 @@ export async function handleChatCore({
     echoModel,
     responseHeaders,
   });
+
+  // LEV fork: x-omniroute-compression SSE trailer (Phase 4.4)
+  // Inject a trailing SSE comment before [DONE] when compression or Mem0
+  // compaction actually reduced the token count.
+  if ((tokensCompressed !== null && tokensCompressed > 0) || mem0CompactionApplied) {
+    const tokensBefore =
+      preCompressionTokenEstimate ?? finalEstimatedInputTokens + (tokensCompressed ?? 0);
+    const tokensAfter = Math.max(0, tokensBefore - (tokensCompressed ?? 0));
+    const trailerMode = mem0CompactionApplied
+      ? "mem0"
+      : ((compressionResponseMeta ?? "lite").split(",")[0].split("=")[1]?.trim() ?? "lite");
+    const trailerMeta: CompressionTrailerMeta = {
+      mode: trailerMode,
+      tokensBefore,
+      tokensAfter,
+    };
+    finalStream = finalStream.pipeThrough(createCompressionTrailerTransform(trailerMeta));
+  }
 
   // ── Gamification event (fire-and-forget) ──
   await emitRequestGamificationEvent({ apiKeyId: apiKeyInfo?.id, model, provider });
