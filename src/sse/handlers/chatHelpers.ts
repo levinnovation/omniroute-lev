@@ -39,6 +39,7 @@ import { resolveUseUpstream429BreakerHints } from "../../shared/utils/providerHi
 import { logProxyEvent } from "../../lib/proxyLogger";
 import { logTranslationEvent } from "../../lib/translatorEvents";
 import { getRuntimeProviderProfile } from "@omniroute/open-sse/services/accountFallback.ts";
+import { getRegistryEntry } from "@omniroute/open-sse/config/providerRegistry.ts";
 
 // Models that explicitly cannot run on the codex/ChatGPT-Pro OAuth pool — when
 // a caller writes `codex/deepseek-v4-pro` we transparently reroute to the
@@ -249,10 +250,33 @@ export async function resolveModelOrError(
   }
 
   if (!modelInfo.provider) {
-    // model_not_found: raised by resolveModelByProviderInference when no
-    // provider could be inferred — return a clear error instead of the
-    // misleading "openai" default that the old code silently fell back to.
+    // LEV fork: LiteLLM catalog bypass. When LiteLLM delegation is enabled and
+    // the model string has a known API-key provider prefix, bypass the stale
+    // catalog check and let the LiteLLM delegate handle routing. LiteLLM has
+    // its own model list (configured via STORE_MODEL_IN_DB), so models that
+    // OmniRoute's catalog doesn't know about can still be served.
     if ((modelInfo as any).errorType === "model_not_found") {
+      if (
+        process.env.OMNIROUTE_API_KEY_DELEGATE === "litellm" &&
+        process.env.OMNIROUTE_LITELLM_URL
+      ) {
+        const slashIdx = modelStr.indexOf("/");
+        if (slashIdx > 0) {
+          const prefix = modelStr.slice(0, slashIdx);
+          const entry = getRegistryEntry(prefix);
+          if (entry && entry.authHeader !== "cookie") {
+            log.info(
+              "LITELLM",
+              `Catalog miss for "${modelStr}" — bypassing to LiteLLM delegate (provider=${prefix})`
+            );
+            return {
+              provider: prefix,
+              model: modelStr.slice(slashIdx + 1),
+              extendedContext: modelInfo.extendedContext || null,
+            };
+          }
+        }
+      }
       const message =
         (modelInfo as any).errorMessage ||
         `Model '${modelStr}' could not be resolved to a known provider.`;
