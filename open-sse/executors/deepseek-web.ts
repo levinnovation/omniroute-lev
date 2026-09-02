@@ -1278,11 +1278,28 @@ export class DeepSeekWebExecutor extends BaseExecutor {
 
       if (hasTools) {
         let { content, reasoningContent } = await collectSSEContent(upstreamStream, clientModel);
+        // LEV fork: Thinking models (deepseek-reasoner) put the <tool> block in
+        // reasoning_content, not content. Parse both — check content first, then
+        // fall back to reasoningContent if no tool calls were found there.
         let { content: cleanedContent, toolCalls } = parseDeepSeekToolCalls(
           content,
           `call-${Date.now()}`,
           requestedTools
         );
+        if ((!toolCalls || toolCalls.length === 0) && reasoningContent) {
+          const reasoningParsed = parseDeepSeekToolCalls(
+            reasoningContent,
+            `call-${Date.now()}`,
+            requestedTools
+          );
+          if (reasoningParsed.toolCalls && reasoningParsed.toolCalls.length > 0) {
+            toolCalls = reasoningParsed.toolCalls;
+            // Strip the tool block from reasoningContent so it doesn't appear
+            // in the reasoning output sent to the client
+            reasoningContent = reasoningParsed.content;
+            cleanedContent = "";
+          }
+        }
 
         // LEV fork: Narrated-intent detector — same logic as direct HTTP path.
         // The model says "Let me read X" but stops without emitting a <tool>
@@ -1849,11 +1866,26 @@ export class DeepSeekWebExecutor extends BaseExecutor {
         }
         let { content, reasoningContent } = await collectSSEContent(resp.body, clientModel);
         await cleanupFn();
+        // LEV fork: Thinking models (deepseek-reasoner) put the <tool> block in
+        // reasoning_content, not content. Parse both — check content first, then
+        // fall back to reasoningContent if no tool calls were found there.
         let { content: cleanedContent, toolCalls } = parseDeepSeekToolCalls(
           content,
           `call-${Date.now()}`,
           requestedTools
         );
+        if ((!toolCalls || toolCalls.length === 0) && reasoningContent) {
+          const reasoningParsed = parseDeepSeekToolCalls(
+            reasoningContent,
+            `call-${Date.now()}`,
+            requestedTools
+          );
+          if (reasoningParsed.toolCalls && reasoningParsed.toolCalls.length > 0) {
+            toolCalls = reasoningParsed.toolCalls;
+            reasoningContent = reasoningParsed.content;
+            cleanedContent = "";
+          }
+        }
 
         // LEV fork: Narrated-intent detector. The model sometimes says "Let me
         // read X" or "I'll check Y" and then stops without emitting a <tool>
