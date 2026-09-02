@@ -1271,12 +1271,19 @@ export class DeepSeekWebExecutor extends BaseExecutor {
             : "")
       );
 
-      // LEV fork: If the browser response is too small, it's likely a DeepSeek
-      // error JSON (not actual SSE content). Fall back to direct HTTP.
-      if (!apiResult.body || apiResult.body.length < 50) {
+      // LEV fork: If the browser response is too small or contains a DeepSeek
+      // error JSON (not actual SSE content), fall back to direct HTTP.
+      const bodyStr = apiResult.body || "";
+      const isDeepSeekError =
+        bodyStr.length < 500 &&
+        (bodyStr.includes('"biz_code"') ||
+          bodyStr.includes('"biz_msg"') ||
+          bodyStr.includes('"is_muted"'));
+      if (!bodyStr || bodyStr.length < 50 || isDeepSeekError) {
         log?.warn?.(
           "DEEPSEEK-WEB",
-          `Browser-backed API returned suspiciously small response (${apiResult.body?.length || 0} bytes) — falling back to direct HTTP`
+          `Browser-backed API returned error/small response (${bodyStr.length} bytes) — falling back to direct HTTP` +
+            (isDeepSeekError ? ` | error: ${bodyStr.slice(0, 200)}` : "")
         );
         return null;
       }
