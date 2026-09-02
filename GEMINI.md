@@ -5,6 +5,15 @@
 > quality gates, code conventions, file-placement / repo-root hygiene rules, the repository map
 > and the local development access notes that used to live in this file.
 
+## LEV Fork Architecture
+
+Before editing any web-cookie provider executor (`open-sse/executors/*-web.ts`),
+read the LEV Fork Architecture section in `AGENTS.md` and
+[`docs/architecture/LEV-FORK-CONSTITUTION.md`](docs/architecture/LEV-FORK-CONSTITUTION.md).
+Key rules: browser-first execution order (LEV-1), composition over inheritance
+(LEV-6), shared tool-call parsing via `robustWebTools.ts` (LEV-3), and real live
+testing only (LEV-7).
+
 Gemini-specific notes:
 
 - Skills activate via the `activate_skill` tool (skill metadata is loaded at session start and

@@ -596,6 +596,101 @@ reviewers and CI babysitters do not chase ghosts.
 
 ---
 
+## LEV Fork Architecture (Browser-First Web Providers)
+
+> **READ THIS BEFORE TOUCHING ANY WEB-COOKIE PROVIDER EXECUTOR.**
+> Full specs: [`docs/architecture/LEV-FORK-CONSTITUTION.md`](docs/architecture/LEV-FORK-CONSTITUTION.md),
+> [`docs/architecture/WEB-PROVIDER-BROWSER-ARCHITECTURE.md`](docs/architecture/WEB-PROVIDER-BROWSER-ARCHITECTURE.md),
+> [`docs/architecture/PROVIDER-EXECUTOR-COMPOSITION.md`](docs/architecture/PROVIDER-EXECUTOR-COMPOSITION.md).
+
+This checkout is the **LEV fork** (`levinnovation/omniroute-lev`, branch `lev/main`),
+a production-hardened derivative of upstream OmniRoute. The fork is deployed to
+Railway at `https://omniroute.agentyx.one` and serves real agentic clients
+(Cursor, Cline, Codex, Claude Code, Prime Agent).
+
+### Core Architecture: Browser-First
+
+Every web-cookie provider executor MUST use **browser automation as the PRIMARY
+transport**, with direct HTTP as fallback only. The `execute()` method MUST call
+`executeViaBrowser()` before `executeViaDirectHttp()`:
+
+```ts
+async execute(input: ExecuteInput) {
+  const browserResult = await this.executeViaBrowser(input);  // PRIMARY
+  if (browserResult) return browserResult;
+  const directResult = await this.executeViaDirectHttp(input); // FALLBACK
+  if (directResult) return directResult;
+  return makeErrorResult(502, "both browser and HTTP failed", ...);
+}
+```
+
+**Why:** Direct HTTP fails on WAF/Cloudflare blocks, expired tokens, missing
+browser fingerprints. Browser automation via Browserless/CDP provides real
+browser state, proper fingerprints, and session validation.
+
+### Composition Over Inheritance
+
+Provider executors MUST compose shared utilities via imports, NOT inherit from
+base classes with provider-specific logic. Shared modules:
+
+| Module                              | Purpose                                                      |
+| ----------------------------------- | ------------------------------------------------------------ |
+| `base/browserAutomationFallback.ts` | `runBrowserAutomation()`, `isBrowserAutomationEnabled()`     |
+| `translator/robustWebTools.ts`      | `parseAndRecoverToolCalls()`, `buildRobustToolAwareResult()` |
+| `services/accountSelector.ts`       | Account selection strategies                                 |
+| `services/accountFallback.ts`       | Cooldown, eviction, rotation                                 |
+
+### Robust Tool-Call Parsing
+
+All web-cookie providers that support tool-mode MUST route response parsing
+through `robustWebTools.ts`. The shared parser handles:
+
+- `<tool>...</tool>` XML blocks
+- Bare JSON: `{"name":"Shell","arguments":{"command":"..."}}`
+- Tool calls in `reasoning_content`
+- Narrated intent → synthesize Grep/Shell calls
+
+### LEV Fork Hard Rules (additions to #1-#23)
+
+| Rule  | Description                                                   |
+| ----- | ------------------------------------------------------------- |
+| LEV-1 | Browser-first execution order in every web-cookie provider    |
+| LEV-2 | No direct-HTTP-only web-cookie providers                      |
+| LEV-3 | Shared tool-call parsing via `robustWebTools.ts`              |
+| LEV-4 | Provider-specific error classification (mute→429, expiry→401) |
+| LEV-5 | No secrets/credentials in logs — redacted fingerprints only   |
+| LEV-6 | Composition over inheritance for executor design              |
+| LEV-7 | Real live testing only — no mock implementations              |
+
+### Provider Registry
+
+| Provider       | Browser Path       | Status        |
+| -------------- | ------------------ | ------------- |
+| deepseek-web   | In-browser API     | Production    |
+| qwen-web       | UI automation      | Browser-first |
+| gemini-web     | Playwright context | Browser-first |
+| t3-chat-web    | UI automation      | Browser-first |
+| perplexity-web | UI automation      | Browser-first |
+| zai-web        | UI automation      | Browser-first |
+| huggingchat    | WebSessionDriver   | Browser-first |
+| chatgpt-web    | In-browser API     | Browser-only  |
+| claude-web     | Browser transport  | Browser-only  |
+| blackbox-web   | UI automation      | Browser-first |
+| duckduckgo-web | browserBackedChat  | Browser-only  |
+| adapta-web     | UI automation      | Browser-first |
+| muse-spark-web | UI automation      | Browser-first |
+| grok-web       | grokClearance      | Browser-first |
+
+### Environment Variables
+
+| Var                           | Purpose                                |
+| ----------------------------- | -------------------------------------- |
+| `OMNIROUTE_BROWSER_POOL`      | `on`/`off` — enable browser automation |
+| `OMNIROUTE_BROWSERLESS_URL`   | Browserless sidecar URL                |
+| `OMNIROUTE_BROWSERLESS_TOKEN` | Browserless auth token                 |
+
+---
+
 ## Upstream contributions
 
 This checkout is a fork of `diegosouzapw/OmniRoute`. Keep fork-only deployment and personal

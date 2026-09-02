@@ -7,6 +7,26 @@ assistant (architecture, conventions, testing, quality gates, git workflow, the 
 PII learnings). Read it in full; do not re-add project rules here. Everything below applies ONLY
 to Claude Code — operational refinements of rules already defined in `AGENTS.md`.
 
+## LEV Fork Architecture — Claude Code specifics
+
+The LEV fork architecture (browser-first web providers, composition over
+inheritance, robust tool-call parsing) is defined in `AGENTS.md` → "LEV Fork
+Architecture". Claude-Code-specific points:
+
+- **Before editing any web-cookie executor** (`open-sse/executors/*-web.ts`),
+  read [`docs/architecture/LEV-FORK-CONSTITUTION.md`](docs/architecture/LEV-FORK-CONSTITUTION.md)
+  and [`docs/architecture/WEB-PROVIDER-BROWSER-ARCHITECTURE.md`](docs/architecture/WEB-PROVIDER-BROWSER-ARCHITECTURE.md).
+- **Never swap browser-first to direct-HTTP-first** — this is LEV Hard Rule #1.
+  If a provider's `execute()` calls `executeViaDirectHttp()` before
+  `executeViaBrowser()`, that is a bug, not a design choice.
+- **Always use `robustWebTools.ts`** for tool-call parsing in web-cookie
+  providers (LEV Hard Rule #3). Do not write provider-specific parsers that
+  bypass the shared recovery layer.
+- **Test changes live** against `https://omniroute.agentyx.one` after deploying
+  (LEV Hard Rule #7). No mock tests for provider transport behavior.
+- **Prefer composition** — import shared utilities, do not extend base classes
+  with provider-specific logic (LEV Hard Rule #6).
+
 ## Worktree isolation — Claude Code specifics
 
 The full mandatory worktree protocol (base-branch confirmation, `.claude/worktrees/` canonical
