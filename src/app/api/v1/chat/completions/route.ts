@@ -27,6 +27,8 @@ import {
   withCompressionHeaderEcho,
 } from "@/shared/utils/compressionHeaderEcho";
 import { resolveModelAliasWithSeedFallbackOnBody } from "@/lib/modelAliasResolver";
+import { isVirtualAlias, resolveVirtualAlias } from "@/../open-sse/services/virtualAliases.ts";
+import { PROVIDER_MODELS } from "@/../open-sse/config/providerModels.ts";
 
 let initPromise = null;
 
@@ -159,6 +161,24 @@ export async function POST(request) {
           return finishAdmission(structuralAdmission.response);
         }
 
+        // Resolve virtual aliases (lev.coding.default, etc.) before forwarding to handleChat
+        if (
+          parsedBody &&
+          typeof parsedBody === "object" &&
+          typeof parsedBody.model === "string" &&
+          isVirtualAlias(parsedBody.model)
+        ) {
+          const availableModelIds = new Set<string>();
+          for (const [providerAlias, entries] of Object.entries(PROVIDER_MODELS)) {
+            for (const entry of entries || []) {
+              if (entry?.id) availableModelIds.add(`${providerAlias}/${entry.id}`);
+            }
+          }
+          const resolved = resolveVirtualAlias(parsedBody.model, availableModelIds);
+          if (resolved !== parsedBody.model) {
+            parsedBody.model = resolved;
+          }
+        }
         // Resolve model alias before forwarding to handleChat
         if (parsedBody && typeof parsedBody === "object") {
           await resolveModelAliasWithSeedFallbackOnBody(parsedBody).catch(() => {
