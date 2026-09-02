@@ -185,8 +185,10 @@ export async function compactContext(
 export function getBrowserlessWsUrl(): string | null {
   const config = getBrowserlessConfig();
   if (!config) return null;
-  // Convert HTTP URL to WebSocket URL
-  const wsUrl = config.url.replace(/^https?:\/\//, "ws://").replace(/^ws:\/\//, "wss://");
+  // Convert HTTP(S) URL to WebSocket URL — preserve the scheme:
+  // https:// → wss://, http:// → ws://. Internal Railway URLs are http://
+  // so they must use ws:// (not wss://) to avoid SSL protocol errors.
+  const wsUrl = config.url.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
   const tokenParam = config.apiKey ? `?token=${config.apiKey}` : "";
   return `${wsUrl}/chromium${tokenParam}`;
 }

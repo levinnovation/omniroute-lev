@@ -1043,6 +1043,7 @@ export class DeepSeekWebExecutor extends BaseExecutor {
         thinkingEnabled,
         searchEnabled,
         refFileIds,
+        userToken,
       };
 
       log?.info?.(
@@ -1054,15 +1055,19 @@ export class DeepSeekWebExecutor extends BaseExecutor {
         const API_BASE = "https://chat.deepseek.com/api";
         const COMPLETION_URL = `${API_BASE}/v0/chat/completion`;
 
-        // Step 1: Acquire access token
+        // Step 1: Acquire access token — needs Authorization: Bearer <userToken>
         const tokenResp = await fetch(`${API_BASE}/v0/users/current`, {
           method: "GET",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${payload.userToken}`,
+          },
           credentials: "include",
         });
         if (!tokenResp.ok) return { error: `token_acquire_${tokenResp.status}`, body: "" };
-        const user = await tokenResp.json();
-        const accessToken = user?.user?.access_token;
+        const tokenJson = await tokenResp.json();
+        const bizData = tokenJson?.data?.biz_data || tokenJson?.biz_data;
+        const accessToken = bizData?.token;
         if (!accessToken) return { error: "no_access_token", body: "" };
 
         // Step 2: Create chat session
