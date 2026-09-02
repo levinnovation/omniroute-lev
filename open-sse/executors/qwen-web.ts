@@ -28,7 +28,13 @@
  */
 import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./base.ts";
 import { makeExecutorErrorResult as makeErrorResult } from "../utils/error.ts";
-import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
+import { prepareToolMessages } from "../translator/webTools.ts";
+import {
+  buildRobustToolAwareResult,
+  looksLikeNarratedIntent,
+  synthesizeGrepToolCall,
+  extractLastUserText,
+} from "../translator/robustWebTools.ts";
 import { buildQwenCookieHeader, extractQwenToken } from "@/lib/providers/webCookieAuth";
 import {
   runBrowserAutomation,
@@ -172,11 +178,25 @@ export class QwenWebExecutor extends BaseExecutor {
       const { content, reasoning } = await this.collectStream(upstream);
       if (!content.trim() && !reasoning.trim()) return null;
       if (hasTools) {
-        const {
+        let {
           content: toolContent,
           toolCalls,
           finishReason,
-        } = buildToolAwareResult(content, requestedTools, "qwen");
+        } = buildRobustToolAwareResult(content, requestedTools, "qwen");
+        // LEV fork: Narrated-intent recovery — synthesize Grep if no tool calls
+        if (
+          (!toolCalls || toolCalls.length === 0) &&
+          toolContent &&
+          looksLikeNarratedIntent(toolContent)
+        ) {
+          const lastUserText = extractLastUserText(messages);
+          const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+          if (synthCall) {
+            toolCalls = [synthCall];
+            toolContent = "";
+            finishReason = "tool_calls";
+          }
+        }
         const message: Record<string, unknown> = { role: "assistant", content: toolContent };
         if (toolCalls) {
           message.tool_calls = toolCalls;
@@ -193,7 +213,14 @@ export class QwenWebExecutor extends BaseExecutor {
       });
     }
 
-    const stream = this.buildClientStream(upstream, modelId, hasTools, requestedTools, signal);
+    const stream = this.buildClientStream(
+      upstream,
+      modelId,
+      hasTools,
+      requestedTools,
+      signal,
+      messages
+    );
     return {
       response: new Response(stream, {
         headers: {
@@ -334,11 +361,25 @@ export class QwenWebExecutor extends BaseExecutor {
       }
 
       if (hasTools) {
-        const {
+        let {
           content: toolContent,
           toolCalls,
           finishReason,
-        } = buildToolAwareResult(finalText, requestedTools, "qwen");
+        } = buildRobustToolAwareResult(finalText, requestedTools, "qwen");
+        // LEV fork: Narrated-intent recovery — synthesize Grep if no tool calls
+        if (
+          (!toolCalls || toolCalls.length === 0) &&
+          toolContent &&
+          looksLikeNarratedIntent(toolContent)
+        ) {
+          const lastUserText = extractLastUserText(messages);
+          const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+          if (synthCall) {
+            toolCalls = [synthCall];
+            toolContent = "";
+            finishReason = "tool_calls";
+          }
+        }
         const message: Record<string, unknown> = { role: "assistant", content: toolContent };
         if (toolCalls) {
           message.tool_calls = toolCalls;
@@ -357,7 +398,14 @@ export class QwenWebExecutor extends BaseExecutor {
     }
 
     // Streaming: transform Qwen phase SSE → OpenAI chat.completion.chunk SSE.
-    const stream = this.buildClientStream(upstream, modelId, hasTools, requestedTools, signal);
+    const stream = this.buildClientStream(
+      upstream,
+      modelId,
+      hasTools,
+      requestedTools,
+      signal,
+      messages
+    );
     return {
       response: new Response(stream, {
         headers: {
@@ -491,7 +539,8 @@ export class QwenWebExecutor extends BaseExecutor {
     modelId: string,
     hasTools: boolean,
     requestedTools: unknown,
-    signal: AbortSignal | null | undefined
+    signal: AbortSignal | null | undefined,
+    rawMessages: Array<{ role: string; content: unknown }>
   ): ReadableStream {
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
@@ -580,11 +629,27 @@ export class QwenWebExecutor extends BaseExecutor {
         }
 
         if (hasTools) {
-          const { content, toolCalls, finishReason } = buildToolAwareResult(
+          let { content, toolCalls, finishReason } = buildRobustToolAwareResult(
             fullContent,
             requestedTools,
             "qwen"
           );
+          // LEV fork: Narrated-intent recovery — synthesize Grep if no tool calls
+          if (
+            (!toolCalls || toolCalls.length === 0) &&
+            content &&
+            looksLikeNarratedIntent(content)
+          ) {
+            const lastUserText = extractLastUserText(
+              rawMessages as Array<{ role: string; content: string }>
+            );
+            const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+            if (synthCall) {
+              toolCalls = [synthCall];
+              content = "";
+              finishReason = "tool_calls";
+            }
+          }
           const delta = toolCalls
             ? { role: "assistant", content: null, tool_calls: toolCalls }
             : { role: "assistant", content };

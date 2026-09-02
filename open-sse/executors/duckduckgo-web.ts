@@ -12,7 +12,13 @@ import {
 } from "./duckduckgo-web/models.ts";
 import { BaseExecutor, type ExecuteInput } from "./base.ts";
 import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
-import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
+import { prepareToolMessages } from "../translator/webTools.ts";
+import {
+  buildRobustToolAwareResult,
+  looksLikeNarratedIntent,
+  synthesizeGrepToolCall,
+  extractLastUserText,
+} from "../translator/robustWebTools.ts";
 import type { Session } from "../services/sessionPool/session.ts";
 import { tryBackedChat } from "../services/browserBackedChat.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
@@ -517,7 +523,13 @@ export class DuckDuckGoWebExecutor extends BaseExecutor {
             "Content-Type": result.contentType || "text/event-stream",
           },
         });
-        return await this.processResponse(upstreamResp, isStreaming, hasTools, requestedTools);
+        return await this.processResponse(
+          upstreamResp,
+          isStreaming,
+          hasTools,
+          requestedTools,
+          rawMessages
+        );
       }
       // status 0 means no response captured (selector/navigation error).
       return errorResponse(502, "Browser-backed chat captured no upstream response");
@@ -641,7 +653,13 @@ export class DuckDuckGoWebExecutor extends BaseExecutor {
       if (chatResponse.status === 429) {
         if (pool && session) pool.reportCooldown(session);
         cbRecordFailure();
-        return await this.processResponse(chatResponse, isStreaming, hasTools, requestedTools);
+        return await this.processResponse(
+          chatResponse,
+          isStreaming,
+          hasTools,
+          requestedTools,
+          rawMessages
+        );
       }
 
       if (chatResponse.status === 401 || chatResponse.status === 403) {
@@ -649,7 +667,13 @@ export class DuckDuckGoWebExecutor extends BaseExecutor {
         const freshVqd = await this.acquireAuthHeaders(mergedSignal);
         if (freshVqd.vqd4 || freshVqd.vqdHash1) {
           const retryResponse = await sendChat(freshVqd);
-          return await this.processResponse(retryResponse, isStreaming, hasTools, requestedTools);
+          return await this.processResponse(
+            retryResponse,
+            isStreaming,
+            hasTools,
+            requestedTools,
+            rawMessages
+          );
         }
         return errorResponse(503, "Service unavailable");
       }
@@ -664,7 +688,8 @@ export class DuckDuckGoWebExecutor extends BaseExecutor {
         chatResponse,
         isStreaming,
         hasTools,
-        requestedTools
+        requestedTools,
+        rawMessages
       );
 
       // Report pool status based on response
@@ -865,7 +890,8 @@ export class DuckDuckGoWebExecutor extends BaseExecutor {
     response: Response,
     streaming: boolean,
     hasTools?: boolean,
-    requestedTools?: unknown
+    requestedTools?: unknown,
+    rawMessages?: Array<{ role: string; content: unknown }>
   ): Promise<Response> {
     if (!response.ok) {
       const body = await response.text();
@@ -942,11 +968,27 @@ export class DuckDuckGoWebExecutor extends BaseExecutor {
 
       const openaiResponse = hasTools
         ? (() => {
-            const { content, toolCalls, finishReason } = buildToolAwareResult(
+            let { content, toolCalls, finishReason } = buildRobustToolAwareResult(
               fullContent,
               requestedTools,
               "ddg"
             );
+            // LEV fork: Narrated-intent recovery — synthesize Grep if no tool calls
+            if (
+              (!toolCalls || toolCalls.length === 0) &&
+              content &&
+              looksLikeNarratedIntent(content)
+            ) {
+              const lastUserText = extractLastUserText(
+                (rawMessages ?? []) as Array<{ role: string; content: string }>
+              );
+              const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+              if (synthCall) {
+                toolCalls = [synthCall];
+                content = "";
+                finishReason = "tool_calls";
+              }
+            }
             const message: Record<string, unknown> = { role: "assistant", content };
             if (toolCalls) {
               message.tool_calls = toolCalls;

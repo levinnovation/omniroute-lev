@@ -15,7 +15,13 @@
 
 import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./base.ts";
 import { errorResponse } from "../utils/error.ts";
-import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
+import { prepareToolMessages } from "../translator/webTools.ts";
+import {
+  buildRobustToolAwareResult,
+  looksLikeNarratedIntent,
+  synthesizeGrepToolCall,
+  extractLastUserText,
+} from "../translator/robustWebTools.ts";
 import {
   runBrowserAutomation,
   isBrowserAutomationEnabled,
@@ -464,11 +470,21 @@ export class T3ChatWebExecutor extends BaseExecutor {
 
     const rawContent = await collectStreamContent(upstreamStream);
     if (hasTools) {
-      const { content, toolCalls, finishReason } = buildToolAwareResult(
+      let { content, toolCalls, finishReason } = buildRobustToolAwareResult(
         rawContent,
         requestedTools,
         "t3"
       );
+      // LEV fork: Narrated-intent recovery — synthesize Grep if no tool calls
+      if ((!toolCalls || toolCalls.length === 0) && content && looksLikeNarratedIntent(content)) {
+        const lastUserText = extractLastUserText(rawMessages);
+        const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+        if (synthCall) {
+          toolCalls = [synthCall];
+          content = "";
+          finishReason = "tool_calls";
+        }
+      }
       if (toolCalls) {
         return {
           response: new Response(
@@ -711,11 +727,21 @@ export class T3ChatWebExecutor extends BaseExecutor {
       const rawContent = await collectStreamContent(resp.body);
 
       if (hasTools) {
-        const { content, toolCalls, finishReason } = buildToolAwareResult(
+        let { content, toolCalls, finishReason } = buildRobustToolAwareResult(
           rawContent,
           requestedTools,
           "t3"
         );
+        // LEV fork: Narrated-intent recovery
+        if ((!toolCalls || toolCalls.length === 0) && content && looksLikeNarratedIntent(content)) {
+          const lastUserText = extractLastUserText(rawMessages);
+          const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+          if (synthCall) {
+            toolCalls = [synthCall];
+            content = "";
+            finishReason = "tool_calls";
+          }
+        }
         if (toolCalls) {
           return {
             response: new Response(

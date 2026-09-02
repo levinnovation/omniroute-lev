@@ -4,7 +4,13 @@ import WebSocket from "ws";
 
 import { BaseExecutor, mergeUpstreamExtraHeaders, type ExecuteInput } from "./base.ts";
 import { getRotatingApiKey } from "../services/apiKeyRotator.ts";
-import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
+import { prepareToolMessages } from "../translator/webTools.ts";
+import {
+  buildRobustToolAwareResult,
+  looksLikeNarratedIntent,
+  synthesizeGrepToolCall,
+  extractLastUserText,
+} from "../translator/robustWebTools.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import {
   normalizeSessionCookieHeader,
@@ -1196,7 +1202,8 @@ async function buildSuccessResult(
   headers: Record<string, string>,
   transformedBody: unknown,
   hasTools?: boolean,
-  requestedTools?: unknown
+  requestedTools?: unknown,
+  rawMessages?: Array<Record<string, unknown>>
 ): Promise<MuseSparkExecuteResult> {
   const id = `chatcmpl-meta-${crypto.randomUUID().slice(0, 12)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1218,11 +1225,23 @@ async function buildSuccessResult(
     try {
       const json = JSON.parse(bodyText);
       const rawContent = json?.choices?.[0]?.message?.content || "";
-      const { content, toolCalls, finishReason } = buildToolAwareResult(
+      let { content, toolCalls, finishReason } = buildRobustToolAwareResult(
         rawContent,
         requestedTools,
         "muse"
       );
+      // LEV fork: Narrated-intent recovery — synthesize Grep if no tool calls
+      if ((!toolCalls || toolCalls.length === 0) && content && looksLikeNarratedIntent(content)) {
+        const lastUserText = extractLastUserText(
+          (rawMessages ?? []) as Array<{ role: string; content: string }>
+        );
+        const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+        if (synthCall) {
+          toolCalls = [synthCall];
+          content = "";
+          finishReason = "tool_calls";
+        }
+      }
       if (toolCalls) {
         json.choices[0].message = { role: "assistant", content: null, tool_calls: toolCalls };
         json.choices[0].finish_reason = finishReason;
@@ -1399,6 +1418,15 @@ export class MuseSparkWebExecutor extends BaseExecutor {
     if (content) {
       rememberAssistantTurn(parsed, credentials, model, parsedHistory, conversationContext);
     }
-    return buildSuccessResult(parsed, stream, model, headers, body, hasTools, requestedTools);
+    return buildSuccessResult(
+      parsed,
+      stream,
+      model,
+      headers,
+      body,
+      hasTools,
+      requestedTools,
+      rawMessages
+    );
   }
 }

@@ -6,7 +6,13 @@ import {
 } from "./base.ts";
 import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { normalizeSessionCookieHeader } from "@/lib/providers/webCookieAuth";
-import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
+import { prepareToolMessages } from "../translator/webTools.ts";
+import {
+  buildRobustToolAwareResult,
+  looksLikeNarratedIntent,
+  synthesizeGrepToolCall,
+  extractLastUserText,
+} from "../translator/robustWebTools.ts";
 
 const BLACKBOX_CHAT_API = "https://app.blackbox.ai/api/chat";
 const BLACKBOX_DEFAULT_COOKIE = "next-auth.session-token";
@@ -650,11 +656,23 @@ export class BlackboxWebExecutor extends BaseExecutor {
     const created = Math.floor(Date.now() / 1000);
 
     if (hasTools) {
-      const { content, toolCalls, finishReason } = buildToolAwareResult(
+      let { content, toolCalls, finishReason } = buildRobustToolAwareResult(
         responseText,
         requestedTools,
         "bbx"
       );
+      // LEV fork: Narrated-intent recovery — synthesize Grep if no tool calls
+      if ((!toolCalls || toolCalls.length === 0) && content && looksLikeNarratedIntent(content)) {
+        const lastUserText = extractLastUserText(
+          messages as Array<{ role: string; content: string }>
+        );
+        const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+        if (synthCall) {
+          toolCalls = [synthCall];
+          content = "";
+          finishReason = "tool_calls";
+        }
+      }
       if (toolCalls) {
         const toolResponse = new Response(
           JSON.stringify({

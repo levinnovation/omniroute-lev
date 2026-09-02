@@ -1,5 +1,11 @@
 import { BaseExecutor, type ExecuteInput } from "./base.ts";
-import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
+import { prepareToolMessages } from "../translator/webTools.ts";
+import {
+  buildRobustToolAwareResult,
+  looksLikeNarratedIntent,
+  synthesizeGrepToolCall,
+  extractLastUserText,
+} from "../translator/robustWebTools.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 
 const ADAPTA_APP_URL = "https://agent.adapta.one";
@@ -502,11 +508,23 @@ export class AdaptaWebExecutor extends BaseExecutor {
     }
 
     if (hasTools) {
-      const { content, toolCalls, finishReason } = buildToolAwareResult(
+      let { content, toolCalls, finishReason } = buildRobustToolAwareResult(
         fullText,
         requestedTools,
         "adp"
       );
+      // LEV fork: Narrated-intent recovery — synthesize Grep if no tool calls
+      if ((!toolCalls || toolCalls.length === 0) && content && looksLikeNarratedIntent(content)) {
+        const lastUserText = extractLastUserText(
+          messages as Array<{ role: string; content: string }>
+        );
+        const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+        if (synthCall) {
+          toolCalls = [synthCall];
+          content = "";
+          finishReason = "tool_calls";
+        }
+      }
       if (toolCalls) {
         return {
           response: new Response(

@@ -1060,44 +1060,86 @@ function parseBareJsonToolCalls(
       }
     }
     if (end < 0) {
-      // LEV fork: The model sometimes emits truncated JSON — the stream ends
-      // before the final closing brace(s) are written (e.g., a token boundary
-      // cuts off the last `}`). When this happens at end-of-text, attempt to
-      // auto-close by appending the missing `}` characters for each open depth
-      // level, then retry the parse. This recovers tool calls that would
-      // otherwise be silently dropped.
+      // LEV fork: The model sometimes emits truncated JSON — missing closing
+      // braces, especially when outputting multiple tool calls in sequence.
+      // Two auto-close strategies:
+      // 1. If at end-of-text: append missing `}` for each open depth level
+      // 2. If in middle of text: find the next `{"name"` or newline, take
+      //    everything up to that point, and auto-close it
       const partialRaw = text.slice(i);
       const isAtEndOfText = i + partialRaw.length >= text.length;
-      if (!isAtEndOfText) continue;
-      const autoClosed = partialRaw + "}".repeat(depth);
-      const parsedAuto = parseLooseJsonObject(autoClosed);
-      if (!parsedAuto) continue;
-      const emittedNameAuto =
-        (typeof parsedAuto.name === "string" ? parsedAuto.name : null) ??
-        (typeof parsedAuto.command === "string" ? parsedAuto.command : null) ??
-        (typeof parsedAuto.tool_name === "string" ? parsedAuto.tool_name : null) ??
-        (typeof parsedAuto.tool === "string" ? parsedAuto.tool : null);
-      if (!emittedNameAuto) continue;
-      const nameAuto = resolveRequestedToolName(emittedNameAuto, requested);
-      if (!nameAuto) continue;
-      const argsAuto =
-        parsedAuto.arguments !== undefined
-          ? parsedAuto.arguments
-          : parsedAuto.parameters !== undefined
-            ? parsedAuto.parameters
-            : parsedAuto.args !== undefined
-              ? parsedAuto.args
+
+      // Strategy 1: end-of-text auto-close (original)
+      if (isAtEndOfText) {
+        const autoClosed = partialRaw + "}".repeat(depth);
+        const parsedAuto = parseLooseJsonObject(autoClosed);
+        if (!parsedAuto) continue;
+        const emittedNameAuto =
+          (typeof parsedAuto.name === "string" ? parsedAuto.name : null) ??
+          (typeof parsedAuto.command === "string" ? parsedAuto.command : null) ??
+          (typeof parsedAuto.tool_name === "string" ? parsedAuto.tool_name : null) ??
+          (typeof parsedAuto.tool === "string" ? parsedAuto.tool : null);
+        if (!emittedNameAuto) continue;
+        const nameAuto = resolveRequestedToolName(emittedNameAuto, requested);
+        if (!nameAuto) continue;
+        const argsAuto =
+          parsedAuto.arguments !== undefined
+            ? parsedAuto.arguments
+            : parsedAuto.parameters !== undefined
+              ? parsedAuto.parameters
+              : parsedAuto.args !== undefined
+                ? parsedAuto.args
+                : {};
+        toolCalls.push({
+          id: `${idSeed}_${idx++}`,
+          type: "function",
+          function: {
+            name: nameAuto,
+            arguments: safeArgsString(argsAuto),
+          },
+        });
+        acceptedRanges.push({ start: i, end: text.length });
+        break; // truncated JSON is at end of text, no more candidates
+      }
+
+      // Strategy 2: middle-of-text auto-close — find the next `{"name"` or
+      // newline and treat everything up to that as the JSON object
+      const nextNameIdx = text.indexOf('{"name"', i + 1);
+      const nextNewlineIdx = text.indexOf("\n", i);
+      let boundary = text.length;
+      if (nextNameIdx > 0) boundary = Math.min(boundary, nextNameIdx);
+      if (nextNewlineIdx > 0) boundary = Math.min(boundary, nextNewlineIdx);
+      const midPartial = text.slice(i, boundary);
+      const midAutoClosed = midPartial + "}".repeat(depth);
+      const parsedMid = parseLooseJsonObject(midAutoClosed);
+      if (!parsedMid) continue;
+      const emittedNameMid =
+        (typeof parsedMid.name === "string" ? parsedMid.name : null) ??
+        (typeof parsedMid.command === "string" ? parsedMid.command : null) ??
+        (typeof parsedMid.tool_name === "string" ? parsedMid.tool_name : null) ??
+        (typeof parsedMid.tool === "string" ? parsedMid.tool : null);
+      if (!emittedNameMid) continue;
+      const nameMid = resolveRequestedToolName(emittedNameMid, requested);
+      if (!nameMid) continue;
+      const argsMid =
+        parsedMid.arguments !== undefined
+          ? parsedMid.arguments
+          : parsedMid.parameters !== undefined
+            ? parsedMid.parameters
+            : parsedMid.args !== undefined
+              ? parsedMid.args
               : {};
       toolCalls.push({
         id: `${idSeed}_${idx++}`,
         type: "function",
         function: {
-          name: nameAuto,
-          arguments: safeArgsString(argsAuto),
+          name: nameMid,
+          arguments: safeArgsString(argsMid),
         },
       });
-      acceptedRanges.push({ start: i, end: text.length });
-      break; // truncated JSON is at end of text, no more candidates
+      acceptedRanges.push({ start: i, end: boundary });
+      i = boundary - 1;
+      continue;
     }
 
     const raw = text.slice(i, end);
@@ -1136,6 +1178,50 @@ function parseBareJsonToolCalls(
     acceptedRanges.push({ start: i, end });
     // Skip past this match
     i = end - 1;
+  }
+
+  if (toolCalls.length === 0) {
+    // LEV fork: Strategy 3 — Regex-based fallback for malformed bare JSON.
+    // The model often emits tool calls with missing closing braces, especially
+    // when outputting multiple tool calls in sequence. The brace-matching
+    // strategy above fails on these because depth never reaches 0. This
+    // strategy uses a regex to find `{"name": "..."` patterns and extracts
+    // the tool name + arguments using field-level regexes, which are much
+    // more tolerant of malformed JSON.
+    const BARE_TOOL_RE = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})/gi;
+    let regexMatch: RegExpExecArray | null;
+    BARE_TOOL_RE.lastIndex = 0;
+    while ((regexMatch = BARE_TOOL_RE.exec(text)) !== null) {
+      const matchStart = regexMatch.index;
+      const emittedName = regexMatch[1];
+      const argsRaw = regexMatch[2];
+
+      const name = resolveRequestedToolName(emittedName, requested);
+      if (!name) continue;
+
+      // Try to parse the arguments JSON, with auto-close fallback
+      let args: unknown = {};
+      const parsedArgs = parseLooseJsonObject(argsRaw);
+      if (parsedArgs) {
+        args = parsedArgs;
+      } else {
+        // If arguments didn't parse, try wrapping in an object
+        args = { raw: argsRaw };
+      }
+
+      toolCalls.push({
+        id: `${idSeed}_${idx++}`,
+        type: "function",
+        function: {
+          name,
+          arguments: safeArgsString(args),
+        },
+      });
+      // Strip from the `{` to the next newline or end of text
+      const lineEnd = text.indexOf("\n", matchStart);
+      const matchEnd = lineEnd > 0 ? lineEnd : matchStart + regexMatch[0].length;
+      acceptedRanges.push({ start: matchStart, end: matchEnd });
+    }
   }
 
   if (toolCalls.length === 0) {

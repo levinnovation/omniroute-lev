@@ -12,7 +12,11 @@
 // this module is shared: `buildToolModeResponse()` accepts an `idSeed` so
 // every provider gets its own `tool_calls[].id` prefix.
 
-import { buildToolAwareResult } from "../translator/webTools.ts";
+import {
+  buildRobustToolAwareResult,
+  looksLikeNarratedIntent,
+  synthesizeGrepToolCall,
+} from "../translator/robustWebTools.ts";
 
 const SSE_HEADERS: Record<string, string> = {
   "Content-Type": "text/event-stream",
@@ -38,11 +42,20 @@ async function applyToolCallsToJsonResponse(
   try {
     const json = JSON.parse(bodyText);
     const rawContent = json?.choices?.[0]?.message?.content || "";
-    const { content, toolCalls, finishReason } = buildToolAwareResult(
+    let { content, toolCalls, finishReason } = buildRobustToolAwareResult(
       rawContent,
       requestedTools,
       idSeed
     );
+    // LEV fork: Narrated-intent recovery — synthesize Grep if no tool calls
+    if ((!toolCalls || toolCalls.length === 0) && content && looksLikeNarratedIntent(content)) {
+      const synthCall = synthesizeGrepToolCall(content, requestedTools);
+      if (synthCall) {
+        toolCalls = [synthCall];
+        content = "";
+        finishReason = "tool_calls";
+      }
+    }
     if (toolCalls) {
       json.choices[0].message = { role: "assistant", content: null, tool_calls: toolCalls };
       json.choices[0].finish_reason = finishReason;
