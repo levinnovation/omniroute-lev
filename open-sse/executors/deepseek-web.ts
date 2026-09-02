@@ -810,7 +810,9 @@ async function createSession(accessToken: string, signal?: AbortSignal | null): 
   if (!resp.ok) throw new Error(`chat_session/create HTTP ${resp.status}`);
   const json = await resp.json();
   const bizData = json?.data?.biz_data || json?.biz_data;
-  const id = bizData?.chat_session?.id;
+  // Session ID can be at biz_data.id or biz_data.chat_session.id depending on
+  // whether the response comes from the browser or direct HTTP path.
+  const id = bizData?.id || bizData?.chat_session?.id;
   if (!id) throw new Error(`No session id: code=${json?.code}`);
   return id;
 }
@@ -1157,7 +1159,8 @@ export class DeepSeekWebExecutor extends BaseExecutor {
           if (!sessionResp.ok) return { error: `session_create_${sessionResp.status}` };
           const sessionJson = await sessionResp.json();
           const sessionBizData = sessionJson?.data?.biz_data || sessionJson?.biz_data;
-          const sessionId = sessionBizData?.chat_session?.id;
+          // Session ID can be at biz_data.id (browser path) or biz_data.chat_session.id
+          const sessionId = sessionBizData?.id || sessionBizData?.chat_session?.id;
           if (!sessionId)
             return {
               error: "no_session_id",
@@ -1341,7 +1344,7 @@ export class DeepSeekWebExecutor extends BaseExecutor {
                 if (!sessionResp.ok) return { error: `session_${sessionResp.status}` };
                 const sessionJson = await sessionResp.json();
                 const sessionBizData = sessionJson?.data?.biz_data || sessionJson?.biz_data;
-                const sessionId = sessionBizData?.chat_session?.id;
+                const sessionId = sessionBizData?.id || sessionBizData?.chat_session?.id;
                 if (!sessionId) return { error: "no_session_id" };
 
                 // Get PoW challenge
