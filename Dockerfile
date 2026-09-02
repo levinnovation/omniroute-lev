@@ -60,15 +60,18 @@ ENV NPM_CONFIG_LEGACY_PEER_DEPS=true
 
 # Install deps — no --ignore-scripts here because we need better-sqlite3 native build
 # and tls-client-node postinstall. Run them explicitly to fail loudly.
+# LEV fork: tls-client-node binary is optional — browser-first architecture
+# uses browser automation as primary transport, so TLS-impersonated direct HTTP
+# is fallback only. Don't fail the build if the native binary is unavailable.
 RUN test -f package-lock.json \
   || (echo "package-lock.json is required for reproducible Docker builds" >&2 && exit 1)
 RUN npm ci --include=optional --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
   && (cd node_modules/better-sqlite3 \
       && node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild) \
   && node -e "require('better-sqlite3')(':memory:').close()" \
-  && node node_modules/tls-client-node/scripts/postinstall.js \
+  && (node node_modules/tls-client-node/scripts/postinstall.js || echo "tls-client-node postinstall failed (non-fatal — browser-first architecture)") \
   && (test -n "$(find node_modules/tls-client-node/bin -mindepth 1 -print -quit 2>/dev/null)" \
-      || (echo "tls-client-node native binary missing after postinstall" >&2 && exit 1))
+      || echo "tls-client-node native binary missing (non-fatal — browser-first architecture)")
 
 # Build configuration
 ARG OMNIROUTE_USE_TURBOPACK=1
