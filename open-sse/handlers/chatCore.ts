@@ -283,6 +283,10 @@ import { getExecutionConnectionId } from "./chatCore/executionCredentials.ts";
 import { resolveExecutionCredentials as resolveExecutionCredentialsFor } from "./chatCore/executionCredentials.ts";
 import { resolveExecutorWithProxy as resolveExecutorWithProxyFor } from "./chatCore/executorProxy.ts";
 import { tryLiteLLMDelegate } from "./chatCore/litellmDelegate.ts";
+import {
+  isProviderFailureFallbackable,
+  tryProviderFailureComboFallback,
+} from "./chatCore/providerFailureFallback.ts";
 import type { ClaudeMessage } from "./chatCore/claudeMessageTypes.ts";
 import { normalizeClaudeUpstreamMessages as normalizeClaudeUpstreamMessagesFor } from "./chatCore/claudeUpstreamMessages.ts";
 import {
@@ -5473,6 +5477,74 @@ export async function handleChatCore({
           connectionId: credentials?.connectionId ?? null,
         })
       );
+      if (
+        isProviderFailureFallbackable({ provider, model, isCombo, errorCode: malformed.code, log })
+      ) {
+        const fallbackResult = await tryProviderFailureComboFallback(
+          {
+            provider,
+            model,
+            isCombo,
+            errorCode: malformed.code,
+            errorMessage: malformedMessage,
+            log,
+          },
+          async (comboName) => {
+            try {
+              const { getComboByName } = await import("../../src/lib/localDb");
+              const overflowCombo = await getComboByName(comboName);
+              if (!overflowCombo) return null;
+              const { handleComboChat } = await import("../services/combo.ts");
+              const { getCombosCached } = await import("../../src/lib/localDb");
+              const allCombos = await getCombosCached();
+              return (await handleComboChat({
+                body,
+                combo: overflowCombo as unknown as import("../services/combo/types.ts").ComboLike,
+                handleSingleModel: async (target: unknown) => {
+                  const t = target as { provider: string; model: string };
+                  return handleChatCore({
+                    body,
+                    modelInfo: { provider: t.provider, model: t.model, extendedContext },
+                    credentials,
+                    log,
+                    onCredentialsRefreshed,
+                    onRequestSuccess,
+                    onStreamFailure,
+                    onDisconnect,
+                    clientRawRequest,
+                    connectionId,
+                    apiKeyInfo,
+                    userAgent,
+                    isCombo: true,
+                    comboName,
+                    cachedSettings,
+                    skipUpstreamRetry,
+                    createPiiTransform,
+                    correlationId,
+                    conversationId,
+                    reasoningTransportFallback,
+                    managedLease,
+                  });
+                },
+                isModelAvailable: () => true,
+                log,
+                settings: cachedSettings,
+                allCombos: allCombos as unknown as import("../services/combo/types.ts").ComboLike[],
+                signal: null,
+                apiKeyAllowedConnections: null,
+                sourceFormat,
+                endpointPath,
+                requestHeaders: clientRawRequest?.headers ?? null,
+              })) as unknown as Response;
+            } catch {
+              return null;
+            }
+          }
+        );
+        if (fallbackResult.fallbacked && fallbackResult.handler) {
+          return { success: true, response: await fallbackResult.handler() };
+        }
+      }
       return createErrorResult(
         HTTP_STATUS.BAD_GATEWAY,
         malformedMessage,
@@ -5673,6 +5745,73 @@ export async function handleChatCore({
     // Do NOT call onStreamFailure — a stream stall is an upstream issue,
     // not an account/quota failure. Marking the account unavailable here
     // would lock out legitimate accounts when the upstream hangs.
+    if (
+      isProviderFailureFallbackable({
+        provider,
+        model,
+        isCombo,
+        errorCode: streamReadiness.code,
+        log,
+      })
+    ) {
+      const fallbackResult = await tryProviderFailureComboFallback(
+        { provider, model, isCombo, errorCode: streamReadiness.code, errorMessage: reason, log },
+        async (comboName) => {
+          try {
+            const { getComboByName } = await import("../../src/lib/localDb");
+            const overflowCombo = await getComboByName(comboName);
+            if (!overflowCombo) return null;
+            const { handleComboChat } = await import("../services/combo.ts");
+            const { getCombosCached } = await import("../../src/lib/localDb");
+            const allCombos = await getCombosCached();
+            return (await handleComboChat({
+              body,
+              combo: overflowCombo as unknown as import("../services/combo/types.ts").ComboLike,
+              handleSingleModel: async (target: unknown) => {
+                const t = target as { provider: string; model: string };
+                return handleChatCore({
+                  body,
+                  modelInfo: { provider: t.provider, model: t.model, extendedContext },
+                  credentials,
+                  log,
+                  onCredentialsRefreshed,
+                  onRequestSuccess,
+                  onStreamFailure,
+                  onDisconnect,
+                  clientRawRequest,
+                  connectionId,
+                  apiKeyInfo,
+                  userAgent,
+                  isCombo: true,
+                  comboName,
+                  cachedSettings,
+                  skipUpstreamRetry,
+                  createPiiTransform,
+                  correlationId,
+                  conversationId,
+                  reasoningTransportFallback,
+                  managedLease,
+                });
+              },
+              isModelAvailable: () => true,
+              log,
+              settings: cachedSettings,
+              allCombos: allCombos as unknown as import("../services/combo/types.ts").ComboLike[],
+              signal: null,
+              apiKeyAllowedConnections: null,
+              sourceFormat,
+              endpointPath,
+              requestHeaders: clientRawRequest?.headers ?? null,
+            })) as unknown as Response;
+          } catch {
+            return null;
+          }
+        }
+      );
+      if (fallbackResult.fallbacked && fallbackResult.handler) {
+        return { success: true, response: await fallbackResult.handler() };
+      }
+    }
     return {
       success: false,
       status: failureResponse.status,
