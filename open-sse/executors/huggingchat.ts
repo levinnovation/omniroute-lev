@@ -23,6 +23,7 @@ import {
   mergeAbortSignals,
   mergeUpstreamExtraHeaders,
   type ExecuteInput,
+  type ExecutorExecuteResult,
 } from "./base.ts";
 import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { buildErrorBody, sanitizeErrorMessage } from "../utils/error.ts";
@@ -31,6 +32,10 @@ import { streamJsonlToOpenAi, readJsonlResponse } from "./huggingchat/jsonlStrea
 // LEV fork: WebSessionDriver for robust session management
 import { WebSessionDriver } from "../services/webSessionDriver.ts";
 import { HUGGINGCHAT_SESSION_CONFIG } from "./huggingchat/sessionConfig.ts";
+import {
+  runBrowserAutomation,
+  isBrowserAutomationEnabled,
+} from "./base/browserAutomationFallback.ts";
 
 const HUGGINGFACE_BASE = "https://huggingface.co";
 const CONVERSATION_URL = `${HUGGINGFACE_BASE}/chat/conversation`;
@@ -255,6 +260,117 @@ export class HuggingChatExecutor extends BaseExecutor {
     super("huggingchat", { id: "huggingchat", baseUrl: HUGGINGFACE_BASE });
   }
 
+  private async executeViaBrowser(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
+    if (!isBrowserAutomationEnabled()) return null;
+    const { model, body, stream, credentials, signal, log } = input;
+    const messages = (body as Record<string, unknown>).messages as
+      Array<Record<string, unknown>> | undefined;
+    if (!messages || !Array.isArray(messages) || messages.length === 0) return null;
+    if (isEncryptedCredentialBlob(credentials.apiKey)) return null;
+
+    const cookieHeader = normalizeHuggingChatCookieHeader(credentials.apiKey || "");
+    if (!cookieHeader) return null;
+
+    const resolvedModel = model || DEFAULT_MODEL;
+    const { inputs } = buildConversationPrompt(messages);
+    if (!inputs.trim()) return null;
+
+    const poolKey = `huggingchat:${cookieHeader.slice(0, 24)}`;
+    const result = await runBrowserAutomation({
+      providerName: "huggingchat",
+      poolKey,
+      pageUrl: `${HUGGINGFACE_BASE}/chat`,
+      cookieDomain: "huggingface.co",
+      cookieString: cookieHeader,
+      userAgent: USER_AGENT,
+      inputSelector: "textarea#chat-input, textarea[data-testid='chat-input'], textarea",
+      submitSelector:
+        'button[data-testid="send-button"], button[aria-label="Send"], button[type="submit"]',
+      prompt: inputs,
+      responseUrlMatch: /\/chat\/conversation\/[a-zA-Z0-9]+/,
+      responseTimeoutMs: 60_000,
+      postSubmitWaitMs: 30_000,
+      fillMode: "evaluate",
+      log,
+      signal,
+    });
+    if (!result) return null;
+    if (result.status < 200 || result.status >= 300) {
+      log?.warn?.("HUGGINGCHAT", `Browser automation upstream HTTP ${result.status}`);
+      return null;
+    }
+
+    const messageUrl = `${CONVERSATION_URL}/browser`;
+    const id = `chatcmpl-huggingchat-${crypto.randomUUID().slice(0, 12)}`;
+    const created = Math.floor(Date.now() / 1000);
+
+    const upstreamStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(result.body));
+        controller.close();
+      },
+    });
+
+    if (stream) {
+      const encoder = new TextEncoder();
+      const jsonlStream = streamJsonlToOpenAi(upstreamStream, resolvedModel, id, created, signal);
+      const sseStream = new ReadableStream({
+        async start(controller) {
+          try {
+            for await (const chunk of jsonlStream) {
+              controller.enqueue(encoder.encode(chunk));
+            }
+          } catch (err) {
+            log?.error?.("HUGGINGCHAT", `Stream error: ${err}`);
+          } finally {
+            controller.close();
+          }
+        },
+      });
+      return {
+        response: new Response(sseStream, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+          },
+        }),
+        url: messageUrl,
+        headers: { "X-OmniRoute-Transport": "browser" },
+        transformedBody: { browser_backed: true, model: resolvedModel },
+      };
+    }
+
+    const fullText = await readJsonlResponse(upstreamStream, signal);
+    return {
+      response: new Response(
+        JSON.stringify({
+          id,
+          object: "chat.completion",
+          created,
+          model: resolvedModel,
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: fullText },
+              finish_reason: "stop",
+            },
+          ],
+          usage: {
+            prompt_tokens: estimateTokens(inputs),
+            completion_tokens: estimateTokens(fullText),
+            total_tokens: estimateTokens(inputs) + estimateTokens(fullText),
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      ),
+      url: messageUrl,
+      headers: { "X-OmniRoute-Transport": "browser" },
+      transformedBody: { browser_backed: true, model: resolvedModel },
+    };
+  }
+
   async execute(input: ExecuteInput): Promise<{
     response: Response;
     url: string;
@@ -338,6 +454,15 @@ export class HuggingChatExecutor extends BaseExecutor {
         transformedBody: body,
       };
     }
+
+    const browserResult = await this.executeViaBrowser(input);
+    if (browserResult)
+      return browserResult as {
+        response: Response;
+        url: string;
+        headers: Record<string, string>;
+        transformedBody: unknown;
+      };
 
     const resolvedModel = model || DEFAULT_MODEL;
     const { inputs, systemPrompt } = buildConversationPrompt(messages);

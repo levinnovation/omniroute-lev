@@ -1,0 +1,39 @@
+model_list:
+  - model_name: "groq/*"
+    litellm_params:
+      model: "groq/*"
+      api_base: "https://api.groq.com/openai/v1"
+      api_key: "os.environ/GROQ_API_KEY"
+  - model_name: "gemini/*"
+    litellm_params:
+      model: "gemini/*"
+      api_base: "https://generativelanguage.googleapis.com/v1beta"
+      api_key: "os.environ/GEMINI_API_KEY"
+  - model_name: "openrouter/*"
+    litellm_params:
+      model: "openrouter/*"
+      api_base: "https://openrouter.ai/api/v1"
+      api_key: "os.environ/OPENROUTER_API_KEY"
+  - model_name: "deepinfra/*"
+    litellm_params:
+      model: "deepinfra/*"
+      api_base: "https://api.deepinfra.com/v1"
+      api_key: "os.environ/DEEPINFRA_API_KEY"
+  - model_name: "cohere/*"
+    litellm_params:
+      model: "cohere/*"
+      api_base: "https://api.cohere.ai/v1"
+      api_key: "os.environ/COHERE_API_KEY"
+  - model_name: "freellmapi/*"
+    litellm_params:
+      model: "openai/*"
+      api_base: "http://freellmapi.railway.internal:3001/v1"
+      api_key: "os.environ/FREELLMAPI_KEY"
+
+litellm_settings:
+  drop_params: false
+  telemetry: false
+
+general_settings:
+  master_key: "os.environ/LITELLM_MASTER_KEY"
+  store_model_in_db: false

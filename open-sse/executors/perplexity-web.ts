@@ -6,7 +6,12 @@
  * completions format and Perplexity's internal protocol.
  */
 
-import { BaseExecutor, type ExecuteInput, type ProviderCredentials } from "./base.ts";
+import {
+  BaseExecutor,
+  type ExecuteInput,
+  type ExecutorExecuteResult,
+  type ProviderCredentials,
+} from "./base.ts";
 import {
   tlsFetchPerplexity,
   isCloudflareChallenge,
@@ -30,6 +35,10 @@ import {
   extractContent,
   sseChunk,
 } from "./perplexity-web/protocol.ts";
+import {
+  runBrowserAutomation,
+  isBrowserAutomationEnabled,
+} from "./base/browserAutomationFallback.ts";
 
 // ─── Session continuity ─────────────────────────────────────────────────────
 
@@ -359,6 +368,143 @@ export class PerplexityWebExecutor extends BaseExecutor {
     super("perplexity-web", { id: "perplexity-web", baseUrl: PPLX_SSE_ENDPOINT });
   }
 
+  private async executeViaBrowser(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
+    if (!isBrowserAutomationEnabled()) return null;
+    const { model, body, stream, credentials, signal, log } = input;
+    const bodyObj = (body || {}) as Record<string, unknown>;
+    const rawMessages = bodyObj.messages as Array<Record<string, unknown>> | undefined;
+    if (!rawMessages || !Array.isArray(rawMessages) || rawMessages.length === 0) return null;
+
+    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
+      bodyObj,
+      rawMessages as Array<{ role: string; content: unknown }>
+    );
+    const thinking =
+      bodyObj.thinking === true ||
+      (bodyObj.reasoning_effort != null && bodyObj.reasoning_effort !== "none");
+    let pplxMode: string;
+    let modelPref: string;
+    if (thinking && THINKING_MAP[model]) {
+      pplxMode = "copilot";
+      modelPref = THINKING_MAP[model];
+    } else if (MODEL_MAP[model]) {
+      [pplxMode, modelPref] = MODEL_MAP[model];
+    } else {
+      pplxMode = "copilot";
+      modelPref = model;
+    }
+
+    const parsed = parseOpenAIMessages(effectiveMessages);
+    const query = buildQuery(parsed, null);
+    if (!query.trim()) return null;
+
+    const cookieBlob = credentials.apiKey ?? "";
+    const cookieString = credentials.accessToken
+      ? undefined
+      : cookieBlob
+        ? buildSessionCookieHeader(cookieBlob)
+        : undefined;
+    if (!cookieString && !credentials.accessToken) return null;
+
+    const poolKey = `perplexity-web:${(cookieBlob || credentials.accessToken || "").slice(0, 24)}`;
+    const result = await runBrowserAutomation({
+      providerName: "perplexity-web",
+      poolKey,
+      pageUrl: "https://www.perplexity.ai/",
+      cookieDomain: "www.perplexity.ai",
+      cookieString,
+      userAgent: PPLX_USER_AGENT,
+      inputSelector: "textarea#ask-input, textarea[data-testid='ask-input'], textarea",
+      submitSelector:
+        'button[data-testid="submit-button"], button[aria-label="Submit"], button.submit-btn',
+      prompt: query,
+      responseUrlMatch: /perplexity\.ai.*\/rest\/.*ask|\/api\/.*ask|sse\/rest\/.*ask/i,
+      responseTimeoutMs: 60_000,
+      postSubmitWaitMs: 30_000,
+      fillMode: "evaluate",
+      log,
+      signal,
+    });
+    if (!result) return null;
+    if (result.status < 200 || result.status >= 300) {
+      log?.warn?.("PPLX-WEB", `Browser automation upstream HTTP ${result.status}`);
+      return null;
+    }
+
+    const upstream = new Response(new Uint8Array(Buffer.from(result.body)), {
+      status: result.status,
+      headers: { "Content-Type": result.contentType || "text/event-stream" },
+    });
+
+    const cid = `chatcmpl-pplx-${crypto.randomUUID().slice(0, 12)}`;
+    const created = Math.floor(Date.now() / 1000);
+
+    if (hasTools) {
+      const bufferedJson = await buildNonStreamingResponse(
+        upstream.body ?? new ReadableStream({ start: (c) => c.close() }),
+        model,
+        cid,
+        created,
+        parsed.history,
+        parsed.currentMsg,
+        signal
+      );
+      const finalResponse = await buildToolModeResponse(bufferedJson, requestedTools, stream, {
+        cid,
+        created,
+        model,
+        idSeed: "pplx",
+      });
+      return {
+        response: finalResponse,
+        url: PPLX_SSE_ENDPOINT,
+        headers: { "X-OmniRoute-Transport": "browser" },
+        transformedBody: { browser_backed: true, mode: pplxMode, model_pref: modelPref },
+      };
+    }
+
+    if (stream) {
+      const sseStream = buildStreamingResponse(
+        upstream.body ?? new ReadableStream({ start: (c) => c.close() }),
+        model,
+        cid,
+        created,
+        parsed.history,
+        parsed.currentMsg,
+        signal
+      );
+      return {
+        response: new Response(sseStream, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+          },
+        }),
+        url: PPLX_SSE_ENDPOINT,
+        headers: { "X-OmniRoute-Transport": "browser" },
+        transformedBody: { browser_backed: true, mode: pplxMode, model_pref: modelPref },
+      };
+    }
+
+    const finalResponse = await buildNonStreamingResponse(
+      upstream.body ?? new ReadableStream({ start: (c) => c.close() }),
+      model,
+      cid,
+      created,
+      parsed.history,
+      parsed.currentMsg,
+      signal
+    );
+    return {
+      response: finalResponse,
+      url: PPLX_SSE_ENDPOINT,
+      headers: { "X-OmniRoute-Transport": "browser" },
+      transformedBody: { browser_backed: true, mode: pplxMode, model_pref: modelPref },
+    };
+  }
+
   async execute({
     model,
     body,
@@ -379,6 +525,17 @@ export class PerplexityWebExecutor extends BaseExecutor {
       );
       return { response: errResp, url: PPLX_SSE_ENDPOINT, headers: {}, transformedBody: body };
     }
+
+    const browserResult = await this.executeViaBrowser({
+      model,
+      body,
+      stream,
+      credentials,
+      signal,
+      log,
+      onCredentialsRefreshed,
+    });
+    if (browserResult) return browserResult;
 
     const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
       bodyObj,

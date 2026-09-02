@@ -13,9 +13,13 @@
  * build. The executor discovers it dynamically from the page's JS runtime.
  */
 
-import { BaseExecutor, type ExecuteInput } from "./base.ts";
+import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./base.ts";
 import { errorResponse } from "../utils/error.ts";
 import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
+import {
+  runBrowserAutomation,
+  isBrowserAutomationEnabled,
+} from "./base/browserAutomationFallback.ts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -334,6 +338,204 @@ export class T3ChatWebExecutor extends BaseExecutor {
     }
   }
 
+  private async executeViaBrowser(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
+    if (!isBrowserAutomationEnabled()) return null;
+    const { model, body, stream, credentials, signal, log } = input;
+    const bodyObj = (body || {}) as Record<string, unknown>;
+    const rawMessages = (Array.isArray(bodyObj.messages) ? bodyObj.messages : []) as Array<{
+      role: string;
+      content: string | unknown;
+    }>;
+    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
+      bodyObj,
+      rawMessages
+    );
+    const parsed = parseT3Credentials(credentials);
+    if (!validateT3Credentials(parsed)) return null;
+
+    const cookieHeader = parsed.cookieHeader;
+    const prompt = effectiveMessages
+      .map((m) => {
+        const text =
+          typeof m.content === "string"
+            ? m.content
+            : Array.isArray(m.content)
+              ? (m.content as Array<{ type?: string; text?: string }>)
+                  .filter((p) => p?.type === "text")
+                  .map((p) => p?.text ?? "")
+                  .join("\n")
+              : "";
+        return `${m.role}: ${text}`;
+      })
+      .join("\n\n");
+
+    const poolKey = `t3-web:${cookieHeader.slice(0, 24)}`;
+    const result = await runBrowserAutomation({
+      providerName: "t3-web",
+      poolKey,
+      pageUrl: `${T3_CHAT_BASE}/`,
+      cookieDomain: "t3.chat",
+      cookieString: cookieHeader,
+      userAgent: USER_AGENT,
+      inputSelector: "textarea#chat-input, textarea[data-testid='chat-input'], textarea",
+      submitSelector:
+        'button[data-testid="send-button"], button[aria-label="Send"], button[type="submit"]',
+      prompt,
+      responseUrlMatch: /\/_serverFn\/|\/api\/chat/i,
+      responseTimeoutMs: 60_000,
+      postSubmitWaitMs: 30_000,
+      fillMode: "evaluate",
+      log,
+      signal,
+    });
+    if (!result) return null;
+    if (result.status < 200 || result.status >= 300) {
+      log?.warn?.("T3-CHAT-WEB", `Browser automation upstream HTTP ${result.status}`);
+      return null;
+    }
+
+    const completionUrl = `${T3_CHAT_BASE}/api/chat`;
+    const ct = result.contentType || "";
+    if (ct.includes("application/json") && !ct.includes("ndjson")) {
+      let json: Record<string, unknown>;
+      try {
+        json = JSON.parse(result.body);
+      } catch {
+        return null;
+      }
+      if (json?.error) return null;
+      if (json?.choices) {
+        return {
+          response: new Response(JSON.stringify(json), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+          url: completionUrl,
+          headers: { "X-OmniRoute-Transport": "browser" },
+          transformedBody: { browser_backed: true },
+        };
+      }
+      const content =
+        extractTextFromTSS(json) ?? (json as Record<string, unknown>)?.message?.content ?? "";
+      const openaiResponse = {
+        id: `chatcmpl-t3-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: model || "unknown",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: String(content) },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
+      return {
+        response: new Response(JSON.stringify(openaiResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+        url: completionUrl,
+        headers: { "X-OmniRoute-Transport": "browser" },
+        transformedBody: { browser_backed: true },
+      };
+    }
+
+    const upstreamStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(result.body));
+        controller.close();
+      },
+    });
+
+    if (stream !== false) {
+      const openaiStream = transformTSSStream(upstreamStream, model || "unknown");
+      return {
+        response: new Response(openaiStream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+        }),
+        url: completionUrl,
+        headers: { "X-OmniRoute-Transport": "browser" },
+        transformedBody: { browser_backed: true },
+      };
+    }
+
+    const rawContent = await collectStreamContent(upstreamStream);
+    if (hasTools) {
+      const { content, toolCalls, finishReason } = buildToolAwareResult(
+        rawContent,
+        requestedTools,
+        "t3"
+      );
+      if (toolCalls) {
+        return {
+          response: new Response(
+            JSON.stringify({
+              id: `chatcmpl-t3-${Date.now()}`,
+              object: "chat.completion",
+              created: Math.floor(Date.now() / 1000),
+              model: model || "unknown",
+              choices: [
+                {
+                  index: 0,
+                  message: { role: "assistant", content: null, tool_calls: toolCalls },
+                  finish_reason: finishReason,
+                },
+              ],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          ),
+          url: completionUrl,
+          headers: { "X-OmniRoute-Transport": "browser" },
+          transformedBody: { browser_backed: true },
+        };
+      }
+      const openaiResponse = {
+        id: `chatcmpl-t3-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: model || "unknown",
+        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
+      return {
+        response: new Response(JSON.stringify(openaiResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+        url: completionUrl,
+        headers: { "X-OmniRoute-Transport": "browser" },
+        transformedBody: { browser_backed: true },
+      };
+    }
+
+    const openaiResponse = {
+      id: `chatcmpl-t3-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: model || "unknown",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: rawContent },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    };
+    return {
+      response: new Response(JSON.stringify(openaiResponse), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+      url: completionUrl,
+      headers: { "X-OmniRoute-Transport": "browser" },
+      transformedBody: { browser_backed: true },
+    };
+  }
+
   async execute({ model, body, stream, credentials, signal, log }: ExecuteInput) {
     const bodyObj = (body || {}) as Record<string, unknown>;
     const rawMessages = (Array.isArray(bodyObj.messages) ? bodyObj.messages : []) as Array<{
@@ -359,6 +561,16 @@ export class T3ChatWebExecutor extends BaseExecutor {
         transformedBody: body,
       };
     }
+
+    const browserResult = await this.executeViaBrowser({
+      model,
+      body,
+      stream,
+      credentials,
+      signal,
+      log,
+    });
+    if (browserResult) return browserResult;
 
     const cookieHeader = parsed.cookieHeader;
     const headers = buildServerFnHeaders(cookieHeader);

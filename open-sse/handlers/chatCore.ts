@@ -1194,6 +1194,7 @@ export async function handleChatCore({
       stream: !!stream,
       signal: clientRawRequest?.signal ?? null,
       log,
+      providerApiKey: credentials?.apiKey || null,
     });
     if (litellmResult) return litellmResult;
   }
@@ -2135,22 +2136,21 @@ export async function handleChatCore({
   }
 
   // LEV fork: Mem0 context compaction delegation (Phase 4.1)
-  // When OMNIROUTE_CONTEXT_DELEGATE=mem0 is set and the provider is a web-cookie
-  // provider with a large context (>20 messages or >32K estimated tokens), delegate
-  // compaction to the Mem0 sidecar before the input-token gate check. Protected
-  // content (code blocks, tool results, system prompts) is preserved via the
-  // fidelity gate. Falls back to the existing compression path on failure.
+  // When OMNIROUTE_CONTEXT_DELEGATE=mem0 is set and the request has a large context
+  // (>10 messages or >16K estimated tokens), delegate compaction to the Mem0 sidecar
+  // before the input-token gate check. Applies to all provider types (API-key, OAuth,
+  // and web-cookie). Protected content (code blocks, tool results, system prompts) is
+  // preserved via the fidelity gate. Falls back to the existing compression path on failure.
   let mem0CompactionApplied = false;
   if (
     process.env.OMNIROUTE_CONTEXT_DELEGATE === "mem0" &&
     body &&
     typeof provider === "string" &&
-    provider.endsWith("-web") &&
     Array.isArray(allMessages) &&
     allMessages.length > 0
   ) {
-    const mem0MessageThreshold = 20;
-    const mem0TokenThreshold = 32_000;
+    const mem0MessageThreshold = 10;
+    const mem0TokenThreshold = 16_000;
     const mem0EstimatedTokens = estimateTokens(allMessages);
     const exceedsMessageThreshold = allMessages.length > mem0MessageThreshold;
     const exceedsTokenThreshold = mem0EstimatedTokens > mem0TokenThreshold;

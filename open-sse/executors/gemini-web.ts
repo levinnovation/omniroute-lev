@@ -13,7 +13,7 @@
  * responses, not chunked streams.
  */
 
-import { BaseExecutor, type ExecuteInput } from "./base.ts";
+import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./base.ts";
 import { buildErrorBody, sanitizeErrorMessage } from "../utils/error.ts";
 import { normalizeGeminiCookieInput } from "../utils/geminiCookies.ts";
 import { prepareToolMessages } from "../translator/webTools.ts";
@@ -25,6 +25,8 @@ import {
 // LEV fork: WebSessionDriver for robust cookie-based session management
 import { WebSessionDriver } from "../services/webSessionDriver.ts";
 import { GEMINI_WEB_SESSION_CONFIG } from "./gemini-web/sessionConfig.ts";
+import { acquireBrowserContext, openPage } from "../services/browserPool.ts";
+import { isBrowserAutomationEnabled } from "./base/browserAutomationFallback.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -473,9 +475,219 @@ export class GeminiWebExecutor extends BaseExecutor {
     }
   }
 
+  private async executeViaBrowser(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
+    if (!isBrowserAutomationEnabled()) return null;
+    const { model, body, stream, credentials, signal, log, onCredentialsRefreshed } = input;
+    const requestBody = body as GeminiRequestBody;
+
+    const violation = checkGeminiWebUnsupportedControls(body as Record<string, unknown>);
+    if (violation) return null;
+
+    const cookie = resolveGeminiWebCookie(credentials);
+    if (!cookie) return null;
+
+    const messages = requestBody.messages || [];
+    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
+      body as Record<string, unknown>,
+      messages
+    );
+    const prompt = hasTools
+      ? buildGeminiToolPrompt(effectiveMessages)
+      : buildGeminiPrompt(messages);
+    if (!prompt) return null;
+
+    const poolKey = `gemini-web:${cookie.slice(0, 24)}`;
+    let pooled;
+    try {
+      pooled = await acquireBrowserContext(poolKey, {
+        cookieDomain: ".google.com",
+        cookieString: cookie,
+        warmupUrl: GEMINI_URL,
+        userAgent: GEMINI_USER_AGENT,
+      });
+    } catch (err) {
+      log?.warn?.(
+        "GEMINI-WEB",
+        `Browser automation: context acquire failed: ${sanitizeErrorMessage(err instanceof Error ? err.message : String(err))}`
+      );
+      return null;
+    }
+
+    let page: import("playwright").Page | null = null;
+    try {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      page = await openPage(pooled);
+      await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+
+      const imageMode = (body as Record<string, unknown>)?.x_gemini_web_image_mode === true;
+      let responseText = "";
+      const responseImages: string[] = [];
+      let captured = false;
+      const responsePromise = new Promise<void>((resolve) => {
+        page!.on("response", async (resp) => {
+          if (!resp.url().includes("StreamGenerate")) return;
+          if (!imageMode && captured) return;
+          if (imageMode) {
+            try {
+              const raw = await resp.text();
+              const text = parseStreamResponse(raw);
+              if (text) responseText = text;
+              for (const url of parseStreamResponseImages(raw)) {
+                if (!responseImages.includes(url)) responseImages.push(url);
+              }
+            } catch {
+              // ignore
+            }
+            if (responseImages.length > 0) resolve();
+          } else {
+            captured = true;
+            try {
+              const raw = await resp.text();
+              responseText = parseStreamResponse(raw);
+            } catch {
+              // ignore
+            }
+            resolve();
+          }
+        });
+      });
+
+      const inputEl = await page.waitForSelector(".ql-editor, [contenteditable='true']", {
+        timeout: 10_000,
+      });
+      await inputEl.click();
+      await page.evaluate((text) => {
+        const editor = document.querySelector(".ql-editor, [contenteditable='true']");
+        if (!editor) return;
+        const dataTransfer = new DataTransfer();
+        dataTransfer.setData("text/plain", text);
+        const event = new ClipboardEvent("paste", {
+          clipboardData: dataTransfer,
+          bubbles: true,
+          cancelable: true,
+        });
+        editor.dispatchEvent(event);
+      }, prompt);
+      await page.keyboard.press("Enter");
+
+      const responseWaitMs = imageMode ? 90000 : hasTools ? 60000 : 30000;
+      await Promise.race([responsePromise, page.waitForTimeout(responseWaitMs)]);
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+
+      await this.persistRotatedCookies(
+        pooled.context,
+        cookie,
+        credentials,
+        onCredentialsRefreshed,
+        log
+      );
+
+      if (imageMode) {
+        const modelId = model || "gemini-2.5-pro";
+        return {
+          response: new Response(
+            JSON.stringify({
+              ...formatChatCompletion(responseText, modelId),
+              x_gemini_web_image_urls: responseImages,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          ),
+          url: GEMINI_URL,
+          headers: {},
+          transformedBody: body,
+        };
+      }
+
+      if (!responseText) return null;
+
+      const modelId = model || "gemini-2.5-pro";
+      if (hasTools) {
+        const cid = `chatcmpl-gwe-${crypto.randomUUID().slice(0, 12)}`;
+        const created = Math.floor(Date.now() / 1000);
+        const toolResponse = await buildGeminiToolResponse(
+          responseText,
+          requestedTools,
+          Boolean(stream),
+          modelId,
+          cid,
+          created
+        );
+        return {
+          response: toolResponse,
+          url: GEMINI_URL,
+          headers: {},
+          transformedBody: body,
+        };
+      }
+
+      if (stream) {
+        const encoder = new TextEncoder();
+        const readable = new ReadableStream(
+          {
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify(formatStreamChunk(responseText, modelId))}\n\n`
+                )
+              );
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify(formatStreamChunk("", modelId, "stop"))}\n\n`
+                )
+              );
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              controller.close();
+            },
+          },
+          { highWaterMark: 16384 }
+        );
+        return {
+          response: new Response(readable, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            },
+          }),
+          url: GEMINI_URL,
+          headers: {},
+          transformedBody: body,
+        };
+      }
+
+      return {
+        response: new Response(JSON.stringify(formatChatCompletion(responseText, modelId)), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+        url: GEMINI_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") throw err;
+      log?.warn?.(
+        "GEMINI-WEB",
+        `Browser automation failed: ${sanitizeErrorMessage(err instanceof Error ? err.message : String(err))}`
+      );
+      return null;
+    } finally {
+      try {
+        if (page) await page.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   async execute(input: ExecuteInput) {
     const { model, body, stream, credentials, signal, log, onCredentialsRefreshed } = input;
     const requestBody = body as GeminiRequestBody;
+
+    const browserResult = await this.executeViaBrowser(input);
+    if (browserResult) return browserResult;
 
     // #9356: fail fast on controls this provider cannot honor (reasoning_effort
     // above "minimal", forced tool_choice). Runs before the credential check and

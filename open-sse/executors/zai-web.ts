@@ -10,7 +10,7 @@
  * client version param, causing "client version (unknown) is outdated" errors.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { BaseExecutor, type ExecuteInput } from "./base.ts";
+import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./base.ts";
 import { configureZaiBrowserRequest } from "./zai-web/browserAutomation.ts";
 import {
   asRecord,
@@ -62,6 +62,10 @@ import {
 // LEV fork: WebSessionDriver for robust cookie-based session management
 import { WebSessionDriver } from "../services/webSessionDriver.ts";
 import { ZAI_WEB_SESSION_CONFIG } from "./zai-web/sessionConfig.ts";
+import {
+  runBrowserAutomation,
+  isBrowserAutomationEnabled,
+} from "./base/browserAutomationFallback.ts";
 
 export {
   buildZaiSignature,
@@ -701,6 +705,200 @@ export class ZaiWebExecutor extends BaseExecutor {
     };
   }
 
+  private async executeViaBrowser(
+    input: ExecuteInput,
+    request: ZaiResolvedRequest
+  ): Promise<ExecutorExecuteResult | null> {
+    if (!isBrowserAutomationEnabled()) return null;
+    if (request.imageUrls.length > 0) return null;
+    const { body, signal, stream: wantStream, log } = input;
+    const { messages, modelId, thinkingConfig, token, vlmConfig } = request;
+    const poolKey = `zai-web:${createHash("sha256").update(token).digest("hex").slice(0, 24)}`;
+    const prompt = browserPrompt(messages);
+
+    const result = await runBrowserAutomation({
+      providerName: "zai-web",
+      poolKey,
+      pageUrl: `${ZAI_BASE_URL}/?model=${encodeURIComponent(browserModelName(modelId))}`,
+      cookieDomain: "chat.z.ai",
+      localStorage: { token },
+      localStorageOrigin: ZAI_BASE_URL,
+      userAgent: ZAI_USER_AGENT,
+      locale: "en-US",
+      timezone: "Asia/Seoul",
+      inputSelector: "#chat-input",
+      submitSelector: '[aria-label="Send Message"] button:not([disabled])',
+      submitButtonMode: "dom",
+      prompt,
+      responseUrlMatch: /\/api\/chat\/completions|\/api\/v1\/chats\/new/,
+      responseTimeoutMs: 30_000,
+      postSubmitWaitMs: 30_000,
+      fillMode: "evaluate",
+      beforeSubmit: (page) =>
+        configureZaiBrowserRequest(page, {
+          modelId,
+          thinking: thinkingConfig,
+          vlm: vlmConfig,
+        }),
+      log,
+      signal,
+    });
+    if (!result) return null;
+    if (result.status < 200 || result.status >= 300) {
+      log?.warn?.("ZAI-WEB", `Browser automation upstream HTTP ${result.status}`);
+      return null;
+    }
+
+    const contentType = result.contentType || "";
+    if (contentType.includes("application/json") || result.body.trim().startsWith("{")) {
+      let chatId = "";
+      try {
+        const chatData = JSON.parse(result.body);
+        chatId = typeof chatData?.id === "string" ? chatData.id : "";
+      } catch {
+        // not JSON
+      }
+      if (!chatId) return null;
+      const frontendVersion = await this.resolveFrontendVersion(signal);
+      const clientVersion = await this.resolveClientVersion(signal);
+      const completionUrl = buildZaiCompletionUrl({
+        requestId: randomUUID(),
+        timestamp: Date.now(),
+        token,
+        userId: extractZaiUserId(token),
+        clientVersion,
+      });
+      const reqHeaders = buildZaiHeaders(token, {
+        accept: "text/event-stream",
+        frontendVersion,
+        clientVersion,
+      });
+      const reqBody = buildZaiRequestBody({
+        body: (body || {}) as Record<string, unknown>,
+        captchaVerifyParam: "",
+        chatId,
+        clientVersion,
+        messages,
+        modelId,
+        prompt,
+        userMessageId: randomUUID(),
+        enableThinking: thinkingConfig.enabled,
+        reasoningEffort: thinkingConfig.effort,
+        reasoningEffortSupported: thinkingConfig.effortSupported,
+        vlmConfig,
+      });
+      const streamResponse = await fetch(completionUrl, {
+        method: "POST",
+        headers: reqHeaders,
+        body: JSON.stringify(reqBody),
+        signal,
+      });
+      if (!streamResponse.ok) return null;
+      return await this.buildZaiResultFromUpstream(
+        streamResponse,
+        wantStream,
+        modelId,
+        { Authorization: "Bearer [REDACTED]", "X-OmniRoute-Transport": "browser+direct" },
+        buildZaiBrowserAuditBody({
+          messages,
+          modelId,
+          thinkingConfig,
+          vlmConfig,
+          imageCount: 0,
+        }),
+        body
+      );
+    }
+
+    const upstream = new Response(new Uint8Array(Buffer.from(result.body)), {
+      status: result.status,
+      headers: { "Content-Type": result.contentType || "text/event-stream" },
+    });
+    return await this.buildZaiResultFromUpstream(
+      upstream,
+      wantStream,
+      modelId,
+      { Authorization: "Bearer [REDACTED]", "X-OmniRoute-Transport": "browser" },
+      buildZaiBrowserAuditBody({
+        messages,
+        modelId,
+        thinkingConfig,
+        vlmConfig,
+        imageCount: 0,
+      }),
+      body
+    );
+  }
+
+  private async buildZaiResultFromUpstream(
+    upstream: Response,
+    wantStream: boolean,
+    modelId: string,
+    auditHeaders: Record<string, string>,
+    auditBody: Record<string, unknown>,
+    body: unknown
+  ): Promise<ExecutorExecuteResult> {
+    const id = `chatcmpl-zai-${Date.now()}`;
+    const created = Math.floor(Date.now() / 1000);
+    const sourceBody =
+      upstream.body ?? new ReadableStream({ start: (controller) => controller.close() });
+    const emitChunk = makeZaiChunkEmitter(id, created, modelId);
+    if (wantStream) {
+      const outStream = buildZaiStreamingBody(sourceBody, emitChunk, null, () =>
+        this.invalidateClientVersion()
+      );
+      return {
+        response: new Response(outStream, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          },
+        }),
+        url: ZAI_CHAT_URL,
+        headers: auditHeaders,
+        transformedBody: auditBody,
+      };
+    }
+    const collected = await collectZaiNonStreaming(sourceBody);
+    const answer = collected.answer;
+    const reasoning = collected.reasoning;
+    if (isZaiVersionOutdatedError(answer)) {
+      this.invalidateClientVersion();
+      return makeErrorResult(
+        426,
+        "Z.ai rejected the request: client version is outdated.",
+        body,
+        ZAI_CHAT_URL
+      );
+    }
+    if (!answer && !reasoning) {
+      return makeErrorResult(
+        503,
+        "Z.ai web session returned an empty response — the session is likely expired.",
+        body,
+        ZAI_CHAT_URL
+      );
+    }
+    const message: Record<string, unknown> = { role: "assistant", content: answer };
+    if (reasoning) message.reasoning_content = reasoning;
+    const completion = {
+      id,
+      object: "chat.completion",
+      created,
+      model: modelId,
+      choices: [{ index: 0, message, finish_reason: "stop" }],
+    };
+    return {
+      response: new Response(JSON.stringify(completion), {
+        headers: { "Content-Type": "application/json" },
+      }),
+      url: ZAI_CHAT_URL,
+      headers: auditHeaders,
+      transformedBody: auditBody,
+    };
+  }
+
   async execute(input: ExecuteInput) {
     const { body, signal, stream: wantStream } = input;
 
@@ -708,6 +906,9 @@ export class ZaiWebExecutor extends BaseExecutor {
     if ("errorResult" in resolved) return resolved.errorResult;
     const request = resolved.request;
     const { imageUrls, messages, modelId, thinkingConfig, token, vlmConfig } = request;
+
+    const browserResult = await this.executeViaBrowser(input, request);
+    if (browserResult) return browserResult;
 
     // LEV fork: Pre-dispatch session validation.
     // Refuse to route to a dead session instead of producing a silent 200

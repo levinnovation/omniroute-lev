@@ -1,4 +1,4 @@
-import { BaseExecutor, type ExecuteInput } from "./base.ts";
+import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./base.ts";
 import { solveDeepSeekPowAsync } from "../lib/deepseek-pow.ts";
 import { type OpenAIToolCall } from "../translator/webTools.ts";
 import {
@@ -30,6 +30,10 @@ import {
   FALLBACK_MAX_SYSTEM_CHARS,
   FALLBACK_MAX_CURRENT_MSG_CHARS,
 } from "../services/tokenBudget.ts";
+import {
+  runBrowserAutomation,
+  isBrowserAutomationEnabled,
+} from "./base/browserAutomationFallback.ts";
 
 export const DEEPSEEK_WEB_BASE = "https://chat.deepseek.com";
 const DEEPSEEK_API_BASE = `${DEEPSEEK_WEB_BASE}/api`;
@@ -934,8 +938,142 @@ export class DeepSeekWebExecutor extends BaseExecutor {
     }
   }
 
+  private async executeViaBrowser(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
+    if (!isBrowserAutomationEnabled()) return null;
+    const { model, body, stream, credentials, signal, log } = input;
+    const bodyObj = (body || {}) as Record<string, unknown>;
+    const rawCreds = credentials as unknown as Record<string, unknown>;
+    const userToken = extractUserToken(rawCreds);
+    if (!userToken) return null;
+
+    const messages = (Array.isArray(bodyObj.messages) ? bodyObj.messages : []) as Array<{
+      role: string;
+      content: string;
+    }>;
+    const {
+      modelType,
+      thinkingEnabled: _thinkingEnabled,
+      searchEnabled: _searchEnabled,
+    } = resolveModelOptions(model as string, bodyObj);
+    const psd = (rawCreds.providerSpecificData ?? {}) as Record<string, unknown>;
+    const historyWindow =
+      typeof psd.historyWindow === "number" && psd.historyWindow > 0 ? psd.historyWindow : 0;
+    const requestedTools = bodyObj.tools;
+    const hasTools = Array.isArray(requestedTools) && requestedTools.length > 0;
+    const toolSystemPrompt = hasTools ? serializeDeepSeekToolPrompt(requestedTools) : "";
+    const promptMessages = toolSystemPrompt
+      ? [{ role: "system", content: toolSystemPrompt }, ...messages]
+      : messages;
+    let prompt = hasTools
+      ? buildToolConversationPrompt(messages, toolSystemPrompt)
+      : messagesToPrompt(promptMessages, historyWindow);
+
+    const dsBudget = getBudgetForProvider("deepseek-web", model as string);
+    const promptTokenEstimate = estimateTextTokens(prompt);
+    if (promptTokenEstimate === 0 && prompt.length > FALLBACK_MAX_CURRENT_MSG_CHARS) {
+      const charBudget = dsBudget.maxInputTokens * 4;
+      prompt = prompt.slice(0, Math.max(1, charBudget)) + "\n[...truncated...]";
+    } else if (promptTokenEstimate > dsBudget.maxInputTokens) {
+      prompt = tokenAwareTruncate(prompt, dsBudget.maxInputTokens);
+    }
+
+    const poolKey = `deepseek-web:${userToken.slice(0, 24)}`;
+    const cookieString = `userToken=${userToken}`;
+    const result = await runBrowserAutomation({
+      providerName: "deepseek-web",
+      poolKey,
+      pageUrl: `${DEEPSEEK_WEB_BASE}/`,
+      cookieDomain: "chat.deepseek.com",
+      cookieString,
+      inputSelector: "#chat-input, textarea[data-testid='chat-input'], textarea",
+      submitSelector: 'button[data-testid="send-button"], button[aria-label="Send"]',
+      prompt,
+      responseUrlMatch: /\/api\/v0\/chat\/completion/,
+      responseTimeoutMs: 60_000,
+      postSubmitWaitMs: 30_000,
+      fillMode: "evaluate",
+      log,
+      signal,
+    });
+    if (!result) return null;
+    if (result.status < 200 || result.status >= 300) {
+      log?.warn?.("DEEPSEEK-WEB", `Browser automation upstream HTTP ${result.status}`);
+      return null;
+    }
+
+    const clientModel = typeof model === "string" && model.trim() ? model.trim() : "deepseek-web";
+    const upstreamStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(result.body));
+        controller.close();
+      },
+    });
+
+    if (hasTools) {
+      let { content, reasoningContent } = await collectSSEContent(upstreamStream, clientModel);
+      let { content: cleanedContent, toolCalls } = parseDeepSeekToolCalls(
+        content,
+        `call-${Date.now()}`,
+        requestedTools
+      );
+      return buildToolAwareResult({
+        stream: stream !== false,
+        clientModel,
+        content: cleanedContent,
+        reasoningContent,
+        toolCalls,
+        reqHeaders: { "X-OmniRoute-Transport": "browser" },
+        requestPayload: { browser_backed: true, model_type: modelType, prompt },
+      });
+    }
+
+    if (stream !== false) {
+      const openaiStream = transformSSE(upstreamStream, clientModel);
+      return {
+        response: new Response(openaiStream, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+        }),
+        url: COMPLETION_URL,
+        headers: { "X-OmniRoute-Transport": "browser" },
+        transformedBody: { browser_backed: true, model_type: modelType, prompt },
+      };
+    }
+
+    const { content, reasoningContent } = await collectSSEContent(upstreamStream, clientModel);
+    const message: Record<string, string> = { role: "assistant", content };
+    if (reasoningContent) message.reasoning_content = reasoningContent;
+    const openaiResponse = {
+      id: `chatcmpl-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: model || modelType,
+      choices: [{ index: 0, message, finish_reason: "stop" }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    };
+    return {
+      response: new Response(JSON.stringify(openaiResponse), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+      url: COMPLETION_URL,
+      headers: { "X-OmniRoute-Transport": "browser" },
+      transformedBody: { browser_backed: true, model_type: modelType, prompt },
+    };
+  }
+
   async execute({ model, body, stream, credentials, signal, log }: ExecuteInput) {
     const bodyObj = (body || {}) as Record<string, unknown>;
+
+    const browserResult = await this.executeViaBrowser({
+      model,
+      body,
+      stream,
+      credentials,
+      signal,
+      log,
+    });
+    if (browserResult) return browserResult;
 
     // chat.deepseek.com's web API only accepts {prompt, ref_file_ids,
     // thinking_enabled, search_enabled} - no native tools field. Instead of failing

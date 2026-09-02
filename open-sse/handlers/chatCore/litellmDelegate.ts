@@ -20,6 +20,7 @@ export interface LiteLLMDelegateArgs {
   stream: boolean;
   signal?: AbortSignal | null;
   log?: { debug?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void } | null;
+  providerApiKey?: string | null;
 }
 
 export interface LiteLLMDelegateResult {
@@ -62,7 +63,11 @@ export async function tryLiteLLMDelegate(
     headers["Authorization"] = `Bearer ${config.apiKey}`;
   }
 
-  const forwardBody = { ...args.body, stream: args.stream };
+  const forwardBody = {
+    ...args.body,
+    stream: args.stream,
+    ...(args.providerApiKey ? { api_key: args.providerApiKey } : {}),
+  };
 
   try {
     const controller = new AbortController();

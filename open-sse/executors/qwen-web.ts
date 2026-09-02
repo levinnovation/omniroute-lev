@@ -26,10 +26,14 @@
  *       `token`, also mirrored to a `token` cookie).
  * Format: OpenAI-compatible (translated from Qwen's phase protocol).
  */
-import { BaseExecutor, type ExecuteInput } from "./base.ts";
+import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./base.ts";
 import { makeExecutorErrorResult as makeErrorResult } from "../utils/error.ts";
 import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
 import { buildQwenCookieHeader, extractQwenToken } from "@/lib/providers/webCookieAuth";
+import {
+  runBrowserAutomation,
+  isBrowserAutomationEnabled,
+} from "./base/browserAutomationFallback.ts";
 
 const BASE_URL = "https://chat.qwen.ai";
 const CHATS_NEW_URL = `${BASE_URL}/api/v2/chats/new`;
@@ -117,9 +121,99 @@ export class QwenWebExecutor extends BaseExecutor {
     return headers;
   }
 
+  private async executeViaBrowser(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
+    if (!isBrowserAutomationEnabled()) return null;
+    const { body, credentials, signal, stream: wantStream, log } = input;
+    const bodyObj = (body || {}) as Record<string, unknown>;
+    const rawCred = String(credentials?.apiKey ?? "").trim();
+    const cookieHeader = buildQwenCookieHeader(rawCred);
+    let token = extractQwenToken(rawCred);
+    if (!token && credentials?.accessToken) token = String(credentials.accessToken).trim();
+    if (!token && !cookieHeader) return null;
+
+    const messages = (bodyObj.messages as Array<{ role: string; content: string }>) || [];
+    const requestedModel = (bodyObj.model as string) || DEFAULT_MODEL;
+    const modelId = mapModel(requestedModel);
+    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(bodyObj, messages);
+    const prompt = this.foldMessages(effectiveMessages);
+
+    const poolKey = `qwen-web:${token.slice(0, 24)}`;
+    const result = await runBrowserAutomation({
+      providerName: "qwen-web",
+      poolKey,
+      pageUrl: `${BASE_URL}/`,
+      cookieDomain: "chat.qwen.ai",
+      cookieString: cookieHeader,
+      userAgent: USER_AGENT,
+      inputSelector: "textarea#chat-input, textarea[data-testid='chat-input'], textarea",
+      submitSelector:
+        'button[data-testid="send-button"], button[aria-label="Send"], button.send-btn',
+      prompt,
+      responseUrlMatch: /\/api\/v2\/chat\/completions/,
+      responseTimeoutMs: 60_000,
+      postSubmitWaitMs: 30_000,
+      fillMode: "evaluate",
+      log,
+      signal,
+    });
+    if (!result) return null;
+    if (result.status < 200 || result.status >= 300) {
+      log?.warn?.("QWEN-WEB", `Browser automation upstream HTTP ${result.status}`);
+      return null;
+    }
+
+    const upstream = new Response(new Uint8Array(Buffer.from(result.body)), {
+      status: result.status,
+      headers: { "Content-Type": result.contentType || "text/event-stream" },
+    });
+    const completionUrl = `${CHAT_COMPLETIONS_URL}?chat_id=browser`;
+
+    if (!wantStream) {
+      const { content, reasoning } = await this.collectStream(upstream);
+      if (!content.trim() && !reasoning.trim()) return null;
+      if (hasTools) {
+        const {
+          content: toolContent,
+          toolCalls,
+          finishReason,
+        } = buildToolAwareResult(content, requestedTools, "qwen");
+        const message: Record<string, unknown> = { role: "assistant", content: toolContent };
+        if (toolCalls) {
+          message.tool_calls = toolCalls;
+          message.content = null;
+        }
+        return this.jsonResponse(modelId, message, finishReason, completionUrl, {
+          browser_backed: true,
+          model: modelId,
+        });
+      }
+      return this.jsonResponse(modelId, { role: "assistant", content }, "stop", completionUrl, {
+        browser_backed: true,
+        model: modelId,
+      });
+    }
+
+    const stream = this.buildClientStream(upstream, modelId, hasTools, requestedTools, signal);
+    return {
+      response: new Response(stream, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        },
+      }),
+      url: completionUrl,
+      headers: { "X-OmniRoute-Transport": "browser" },
+      transformedBody: { browser_backed: true, model: modelId },
+    };
+  }
+
   async execute(input: ExecuteInput) {
     const { body, credentials, signal, stream: wantStream } = input;
     const bodyObj = (body || {}) as Record<string, unknown>;
+
+    const browserResult = await this.executeViaBrowser(input);
+    if (browserResult) return browserResult;
 
     const rawCred = String(credentials?.apiKey ?? "").trim();
     const cookieHeader = buildQwenCookieHeader(rawCred);
