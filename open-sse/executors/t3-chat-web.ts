@@ -553,15 +553,15 @@ export class T3ChatWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    // Direct HTTP is primary; browser automation is fallback only
-    const directResult = await this.executeViaDirectHttp(input);
-    if (directResult) return directResult;
-
+    // LEV fork: Browser automation is PRIMARY (like deepseek-web).
     const browserResult = await this.executeViaBrowser(input);
     if (browserResult) return browserResult;
 
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
+
     return {
-      response: buildErrorResponse(502, "t3.chat: both direct HTTP and browser automation failed"),
+      response: buildErrorResponse(502, "t3.chat: both browser automation and direct HTTP failed"),
       url: `${SERVER_FN_PREFIX}...`,
       headers: {},
       transformedBody: input.body,

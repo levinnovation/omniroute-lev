@@ -236,16 +236,19 @@ export class QwenWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    // Direct HTTP is primary; browser automation is fallback only
-    const directResult = await this.executeViaDirectHttp(input);
-    if (directResult) return directResult;
-
+    // LEV fork: Browser automation is PRIMARY (like deepseek-web). The browser
+    // path uses runBrowserAutomation with real cookies, giving us proper WAF
+    // bypass, fingerprint, and session validation. Falls back to direct HTTP
+    // only when browser automation is unavailable or fails.
     const browserResult = await this.executeViaBrowser(input);
     if (browserResult) return browserResult;
 
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
+
     return makeErrorResult(
       502,
-      "Qwen-web: both direct HTTP and browser automation failed",
+      "Qwen-web: both browser automation and direct HTTP failed",
       (input.body || {}) as Record<string, unknown>,
       CHATS_NEW_URL
     );

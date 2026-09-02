@@ -900,19 +900,18 @@ export class ZaiWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    // Direct HTTP is primary; browser automation is fallback only
-    const directResult = await this.executeViaDirectHttp(input);
-    if (directResult) return directResult;
-
-    // Browser fallback — needs the resolved request
+    // LEV fork: Browser automation is PRIMARY (like deepseek-web).
     const resolved = resolveZaiRequest(input);
     if ("errorResult" in resolved) return resolved.errorResult;
     const browserResult = await this.executeViaBrowser(input, resolved.request);
     if (browserResult) return browserResult;
 
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
+
     return makeErrorResult(
       502,
-      "Z.ai: both direct HTTP and browser automation failed",
+      "Z.ai: both browser automation and direct HTTP failed",
       input.body,
       ZAI_CHAT_URL
     );

@@ -505,18 +505,18 @@ export class PerplexityWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    // Direct HTTP is primary; browser automation is fallback only
-    const directResult = await this.executeViaDirectHttp(input);
-    if (directResult) return directResult;
-
+    // LEV fork: Browser automation is PRIMARY (like deepseek-web).
     const browserResult = await this.executeViaBrowser(input);
     if (browserResult) return browserResult;
+
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
 
     return {
       response: new Response(
         JSON.stringify({
           error: {
-            message: "Perplexity-web: both direct HTTP and browser automation failed",
+            message: "Perplexity-web: both browser automation and direct HTTP failed",
             type: "upstream_error",
           },
         }),

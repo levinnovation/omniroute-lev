@@ -683,17 +683,20 @@ export class GeminiWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    // Direct HTTP is primary; browser automation is fallback only
-    const directResult = await this.executeViaDirectHttp(input);
-    if (directResult) return directResult;
-
+    // LEV fork: Browser automation is PRIMARY (like deepseek-web). The browser
+    // path uses a real Playwright browser context with Google cookies, giving
+    // us proper session validation and Cloudflare bypass. Falls back to direct
+    // HTTP only when browser automation is unavailable or fails.
     const browserResult = await this.executeViaBrowser(input);
     if (browserResult) return browserResult;
+
+    const directResult = await this.executeViaDirectHttp(input);
+    if (directResult) return directResult;
 
     return {
       response: new Response(
         JSON.stringify({
-          error: "Gemini-web: both direct HTTP and browser automation failed",
+          error: "Gemini-web: both browser automation and direct HTTP failed",
         }),
         { status: 502, headers: { "Content-Type": "application/json" } }
       ),
