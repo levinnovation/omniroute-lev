@@ -128,14 +128,25 @@ export class QwenWebExecutor extends BaseExecutor {
   }
 
   private async executeViaBrowser(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
-    if (!isBrowserAutomationEnabled()) return null;
+    if (!isBrowserAutomationEnabled()) {
+      input.log?.info?.("QWEN-WEB", "Browser path skipped: browser automation disabled");
+      return null;
+    }
     const { body, credentials, signal, stream: wantStream, log } = input;
     const bodyObj = (body || {}) as Record<string, unknown>;
     const rawCred = String(credentials?.apiKey ?? "").trim();
     const cookieHeader = buildQwenCookieHeader(rawCred);
     let token = extractQwenToken(rawCred);
     if (!token && credentials?.accessToken) token = String(credentials.accessToken).trim();
-    if (!token && !cookieHeader) return null;
+    if (!token && !cookieHeader) {
+      log?.info?.("QWEN-WEB", "Browser path skipped: no token and no cookie header");
+      return null;
+    }
+
+    log?.info?.(
+      "QWEN-WEB",
+      `Browser path: attempting browser automation (token=${token ? "yes" : "no"}, cookie=${cookieHeader ? "yes" : "no"})`
+    );
 
     const messages = (bodyObj.messages as Array<{ role: string; content: string }>) || [];
     const requestedModel = (bodyObj.model as string) || DEFAULT_MODEL;
@@ -162,7 +173,10 @@ export class QwenWebExecutor extends BaseExecutor {
       log,
       signal,
     });
-    if (!result) return null;
+    if (!result) {
+      log?.warn?.("QWEN-WEB", "Browser path: runBrowserAutomation returned null");
+      return null;
+    }
     if (result.status < 200 || result.status >= 300) {
       log?.warn?.("QWEN-WEB", `Browser automation upstream HTTP ${result.status}`);
       return null;
