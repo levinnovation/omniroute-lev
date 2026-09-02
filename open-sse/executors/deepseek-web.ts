@@ -1037,38 +1037,31 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       // The browser's fetch() will automatically include cookies, origin, and
       // the correct fingerprint headers that DeepSeek's bot detection checks.
       const refFileIds = Array.isArray(bodyObj.ref_file_ids) ? bodyObj.ref_file_ids : [];
-      const completionPayload = {
-        prompt,
-        modelType,
-        thinkingEnabled,
-        searchEnabled,
-        refFileIds,
-        userToken,
-      };
 
       log?.info?.(
         "DEEPSEEK-WEB",
         `Browser-backed API execution: model_type=${modelType}, thinking=${thinkingEnabled}, prompt_len=${prompt.length}`
       );
 
-      const apiResult = await page.evaluate(async (payload) => {
+      // Phase 1: Acquire token, create session, get PoW challenge — all in the
+      // browser context so requests carry real cookies, origin, and fingerprint.
+      const phase1 = await page.evaluate(async (userToken: string) => {
         const API_BASE = "https://chat.deepseek.com/api";
-        const COMPLETION_URL = `${API_BASE}/v0/chat/completion`;
 
-        // Step 1: Acquire access token — needs Authorization: Bearer <userToken>
+        // Step 1: Acquire access token
         const tokenResp = await fetch(`${API_BASE}/v0/users/current`, {
           method: "GET",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${payload.userToken}`,
+            Authorization: `Bearer ${userToken}`,
           },
           credentials: "include",
         });
-        if (!tokenResp.ok) return { error: `token_acquire_${tokenResp.status}`, body: "" };
+        if (!tokenResp.ok) return { error: `token_acquire_${tokenResp.status}` };
         const tokenJson = await tokenResp.json();
-        const bizData = tokenJson?.data?.biz_data || tokenJson?.biz_data;
-        const accessToken = bizData?.token;
-        if (!accessToken) return { error: "no_access_token", body: "" };
+        const tokenBizData = tokenJson?.data?.biz_data || tokenJson?.biz_data;
+        const accessToken = tokenBizData?.token;
+        if (!accessToken) return { error: "no_access_token" };
 
         // Step 2: Create chat session
         const sessionResp = await fetch(`${API_BASE}/v0/chat_session/create`, {
@@ -1078,12 +1071,13 @@ export class DeepSeekWebExecutor extends BaseExecutor {
             Authorization: `Bearer ${accessToken}`,
           },
           credentials: "include",
-          body: JSON.stringify({ agent: "chat" }),
+          body: JSON.stringify({}),
         });
-        if (!sessionResp.ok) return { error: `session_create_${sessionResp.status}`, body: "" };
-        const session = await sessionResp.json();
-        const sessionId = session?.biz_data?.id;
-        if (!sessionId) return { error: "no_session_id", body: "" };
+        if (!sessionResp.ok) return { error: `session_create_${sessionResp.status}` };
+        const sessionJson = await sessionResp.json();
+        const sessionBizData = sessionJson?.data?.biz_data || sessionJson?.biz_data;
+        const sessionId = sessionBizData?.chat_session?.id;
+        if (!sessionId) return { error: "no_session_id" };
 
         // Step 3: Get PoW challenge
         const powResp = await fetch(`${API_BASE}/v0/chat/create_pow_challenge`, {
@@ -1093,49 +1087,56 @@ export class DeepSeekWebExecutor extends BaseExecutor {
             Authorization: `Bearer ${accessToken}`,
           },
           credentials: "include",
-          body: JSON.stringify({ chat_session_id: sessionId }),
+          body: JSON.stringify({ target_path: "/api/v0/chat/completion" }),
         });
-        if (!powResp.ok) return { error: `pow_challenge_${powResp.status}`, body: "" };
-        const powData = await powResp.json();
-        const challenge = powData?.biz_data?.challenge;
-        if (!challenge) return { error: "no_pow_challenge", body: "" };
+        if (!powResp.ok) return { error: `pow_challenge_${powResp.status}` };
+        const powJson = await powResp.json();
+        const powBizData = powJson?.data?.biz_data || powJson?.biz_data;
+        const challenge = powBizData?.challenge;
+        if (!challenge) return { error: "no_pow_challenge" };
 
-        // Step 4: Solve PoW (DeepSeekHashV1)
-        // The PoW algorithm is: find a nonce where SHA256(challenge + nonce) starts with N zeros
-        const { algorithm, challenge: challengeStr, target } = challenge;
-        let powAnswer = "";
-        if (algorithm === "DeepSeekHashV1") {
-          const targetZeros = parseInt(target) || 4;
-          const encoder = new TextEncoder();
-          for (let nonce = 0; nonce < 1_000_000; nonce++) {
-            const data = encoder.encode(`${challengeStr}_${nonce}`);
-            const hash = await crypto.subtle.digest("SHA-256", data);
-            const hashBytes = new Uint8Array(hash);
-            let zeros = 0;
-            for (let i = 0; i < hashBytes.length; i++) {
-              if (hashBytes[i] === 0) zeros++;
-              else break;
-            }
-            // Each zero byte = 2 hex zeros, target is in hex zeros
-            if (zeros * 2 >= targetZeros) {
-              powAnswer = `${nonce}`;
-              break;
-            }
-          }
-        }
+        return { error: null, accessToken, sessionId, challenge };
+      }, userToken);
 
-        // Step 5: Send completion request
+      if (!phase1 || phase1.error) {
+        log?.warn?.(
+          "DEEPSEEK-WEB",
+          `Browser-backed API phase1 failed: ${phase1?.error || "no result"}`
+        );
+        return null;
+      }
+
+      // Phase 2: Solve PoW server-side using the proven solveDeepSeekPowAsync
+      // solver, then send the completion request from within the browser.
+      const powChallenge = phase1.challenge as PowChallenge;
+      const powAnswer = await solvePow(powChallenge);
+
+      // Phase 3: Send completion request from the browser with the PoW answer
+      const completionPayload = {
+        prompt,
+        modelType,
+        thinkingEnabled,
+        searchEnabled,
+        refFileIds,
+        accessToken: phase1.accessToken,
+        sessionId: phase1.sessionId,
+        powAnswer,
+      };
+
+      const apiResult = await page.evaluate(async (payload) => {
+        const COMPLETION_URL = "https://chat.deepseek.com/api/v0/chat/completion";
+
         const completionResp = await fetch(COMPLETION_URL, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${accessToken}`,
-            "X-Ds-Pow-Response": powAnswer,
+            Authorization: `Bearer ${payload.accessToken}`,
+            "X-Ds-Pow-Response": payload.powAnswer,
             "X-Client-Timezone-Offset": String(new Date().getTimezoneOffset() * -60),
           },
           credentials: "include",
           body: JSON.stringify({
-            chat_session_id: sessionId,
+            chat_session_id: payload.sessionId,
             parent_message_id: null,
             model_type: payload.modelType,
             prompt: payload.prompt,

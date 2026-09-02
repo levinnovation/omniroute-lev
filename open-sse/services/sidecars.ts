@@ -190,5 +190,7 @@ export function getBrowserlessWsUrl(): string | null {
   // so they must use ws:// (not wss://) to avoid SSL protocol errors.
   const wsUrl = config.url.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
   const tokenParam = config.apiKey ? `?token=${config.apiKey}` : "";
-  return `${wsUrl}/chromium${tokenParam}`;
+  // Browserless v2: ghcr.io/browserless/chrome exposes the CDP WebSocket at
+  // /chrome (not /chromium). connectOverCDP uses this endpoint.
+  return `${wsUrl}/chrome${tokenParam}`;
 }
