@@ -787,9 +787,16 @@ function parseDeepSeekErrorPayload(payload: unknown): { code?: number; message: 
   const msg = record.msg;
   const data = record.data as Record<string, unknown> | undefined;
   const bizMsg = data?.biz_msg;
+  const bizCodeRaw = data?.biz_code;
+  const bizCode = typeof bizCodeRaw === "number" ? bizCodeRaw : undefined;
   const messageRaw = typeof msg === "string" ? msg : typeof bizMsg === "string" ? bizMsg : "";
   if (code !== undefined && code !== 0) {
     return { code, message: messageRaw || `DeepSeek error ${code}` };
+  }
+  // LEV fork: DeepSeek wraps errors as {code: 0, data: {biz_code: 5, biz_msg: "user is muted"}}
+  // The outer code is 0 but biz_code carries the actual error.
+  if (bizCode !== undefined && bizCode !== 0) {
+    return { code: bizCode, message: messageRaw || `DeepSeek biz_error ${bizCode}` };
   }
   return null;
 }
@@ -1272,13 +1279,39 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       );
 
       // LEV fork: If the browser response is too small or contains a DeepSeek
-      // error JSON (not actual SSE content), fall back to direct HTTP.
+      // error JSON (not actual SSE content), fall back to direct HTTP — UNLESS
+      // the error is "user is muted", which is account-wide and will also fail
+      // on direct HTTP. In that case, return a 429 rate-limit error so the
+      // system can try a different account or return a clear error.
       const bodyStr = apiResult.body || "";
       const isDeepSeekError =
         bodyStr.length < 500 &&
         (bodyStr.includes('"biz_code"') ||
           bodyStr.includes('"biz_msg"') ||
           bodyStr.includes('"is_muted"'));
+      const isMuted = bodyStr.includes('"is_muted"') || bodyStr.includes('"user is muted"');
+      if (isMuted) {
+        let muteUntilMs = Date.now() + 3600_000;
+        try {
+          const muteMatch = /"mute_until"\s*:\s*([\d.]+)/.exec(bodyStr);
+          if (muteMatch) muteUntilMs = Math.floor(parseFloat(muteMatch[1]) * 1000);
+        } catch {}
+        log?.warn?.(
+          "DEEPSEEK-WEB",
+          `Browser-backed API: account is muted by DeepSeek until ${new Date(muteUntilMs).toISOString()} — returning 429 (not falling back to direct HTTP)`
+        );
+        return {
+          response: errorResponse(
+            429,
+            `[deepseek-web] Account is muted by DeepSeek until ${new Date(muteUntilMs).toISOString()}. Try a different account or wait.`
+          ),
+          url: "https://chat.deepseek.com/api/v0/chat/completion",
+          headers: {
+            "X-OmniRoute-Transport": "browser",
+            "Retry-After": String(Math.max(1, Math.ceil((muteUntilMs - Date.now()) / 1000))),
+          },
+        };
+      }
       if (!bodyStr || bodyStr.length < 50 || isDeepSeekError) {
         log?.warn?.(
           "DEEPSEEK-WEB",
@@ -1837,7 +1870,9 @@ export class DeepSeekWebExecutor extends BaseExecutor {
           if (parsed) {
             const errMsg = `DeepSeek error ${parsed.code}: ${parsed.message}`;
             log?.warn?.("DEEPSEEK-WEB", errMsg);
-            const status = parsed.code === 40003 ? 401 : parsed.code === 40002 ? 429 : 502;
+            // LEV fork: biz_code 5 = "user is muted" → 429 rate limit
+            const status =
+              parsed.code === 40003 ? 401 : parsed.code === 40002 || parsed.code === 5 ? 429 : 502;
             if (parsed.code === 40003) {
               tokenCache.delete(userToken);
             }
