@@ -420,6 +420,86 @@ function looksLikeNarratedIntent(content: string): boolean {
   return NARRATED_INTENT_RE.test(tail);
 }
 
+// LEV fork: Synthesize a Grep tool call from narrated intent when the model
+// says "I need to find..." but never emits a <tool> block. Extracted as a
+// shared helper so both the direct-HTTP and browser-backed paths can use it.
+function synthesizeGrepToolCall(
+  lastUserText: string,
+  requestedTools: unknown[]
+): OpenAIToolCall | null {
+  const hasGrep = requestedTools.some(
+    (t) =>
+      (t as { function?: { name?: string } })?.function?.name === "Grep" ||
+      (t as { function?: { name?: string } })?.function?.name === "grep"
+  );
+  if (!hasGrep || !lastUserText) return null;
+  const pageMatch = /\/(\w+)\/?$/.exec(lastUserText);
+  const pattern = pageMatch
+    ? pageMatch[1]
+    : lastUserText
+        .replace(/[<>\[\]{}]/g, "")
+        .split(/\s+/)
+        .filter(
+          (w) =>
+            w.length > 3 &&
+            !/^(the|this|that|with|from|have|your|into|page|table|header|glass|seems|broken|aligned|look|need|find|code|unified|understand|issue|alignment|not|properly)$/i.test(
+              w
+            )
+        )
+        .slice(0, 3)
+        .join("|");
+  if (!pattern) return null;
+  return {
+    id: `call-${Date.now()}`,
+    type: "function" as const,
+    function: {
+      name: "Grep",
+      arguments: JSON.stringify({
+        pattern,
+        output_mode: "files_with_matches",
+      }),
+    },
+  };
+}
+
+// LEV fork: Build the minimal corrective retry prompt for narrated-intent
+// recovery. Shared between direct-HTTP and browser-backed paths.
+function buildCorrectiveRetryPrompt(
+  toolSystemPrompt: string,
+  lastUserText: string,
+  cleanedContent: string
+): string {
+  return (
+    toolSystemPrompt +
+    "\n\n---\nPrevious task context (last user request):\n" +
+    tokenAwareTruncate(lastUserText, 2_000) +
+    '\n\n---\nIMPORTANT: Your previous response was: "' +
+    cleanedContent.slice(0, 200) +
+    '" — you narrated intent to use a tool but did NOT emit a <tool> block. ' +
+    "You MUST emit the <tool> block NOW. Do not describe what you will do — " +
+    'do it by outputting the <tool>{"name": ..., "arguments": ..., "_nonce": ...}</tool> block immediately. ' +
+    "For example, to find relevant files, emit: " +
+    '<tool>{"name": "Grep", "arguments": {"pattern": "reposicion", "output_mode": "files_with_matches"}, "_nonce": "..."}</tool>'
+  );
+}
+
+// LEV fork: Extract the last user message text from the messages array.
+// Shared between direct-HTTP and browser-backed paths for narrated-intent recovery.
+function extractLastUserText(messages: Array<{ role: string; content: string }>): string {
+  const lastUserMsg = messages.filter((m) => m.role === "user").pop();
+  if (!lastUserMsg) return "";
+  const extractedQuery = extractUserQuery(lastUserMsg.content);
+  if (extractedQuery) return extractedQuery;
+  if (typeof lastUserMsg.content === "string") return lastUserMsg.content;
+  if (Array.isArray(lastUserMsg.content)) {
+    return (lastUserMsg.content as Array<{ type?: string; text?: string }>)
+      .filter((p) => p?.type === "text")
+      .map((p) => p?.text ?? "")
+      .join("\n");
+  }
+  return "";
+}
+
 async function collectSSEContent(
   deepseekStream: ReadableStream,
   model: string
@@ -1185,6 +1265,196 @@ export class DeepSeekWebExecutor extends BaseExecutor {
           `call-${Date.now()}`,
           requestedTools
         );
+
+        // LEV fork: Narrated-intent detector — same logic as direct HTTP path.
+        // The model says "Let me read X" but stops without emitting a <tool>
+        // block, killing the agent loop. Retry with a minimal corrective prompt
+        // sent through the browser, then synthesize a Grep call if retry fails.
+        if (
+          (!toolCalls || toolCalls.length === 0) &&
+          cleanedContent &&
+          looksLikeNarratedIntent(cleanedContent)
+        ) {
+          log?.warn?.(
+            "DEEPSEEK-WEB",
+            "Browser path: narrated intent without tool block — retrying with minimal corrective prompt"
+          );
+          const lastUserText = extractLastUserText(messages);
+          const minimalRetryPrompt = buildCorrectiveRetryPrompt(
+            toolSystemPrompt,
+            lastUserText,
+            cleanedContent
+          );
+
+          // Retry through the browser: create a new session + PoW + completion
+          try {
+            const retryPhase1 = await page.evaluate(
+              async (args: {
+                userToken: string;
+                retryPrompt: string;
+                modelType: string;
+                thinkingEnabled: boolean;
+                searchEnabled: boolean;
+              }) => {
+                const API_BASE = "https://chat.deepseek.com/api";
+
+                // Acquire access token
+                const tokenResp = await fetch(`${API_BASE}/v0/users/current`, {
+                  method: "GET",
+                  headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${args.userToken}`,
+                  },
+                  credentials: "include",
+                });
+                if (!tokenResp.ok) return { error: `token_${tokenResp.status}` };
+                const tokenJson = await tokenResp.json();
+                const tokenBizData = tokenJson?.data?.biz_data || tokenJson?.biz_data;
+                const accessToken = tokenBizData?.token;
+                if (!accessToken) return { error: "no_access_token" };
+
+                // Create chat session
+                const sessionResp = await fetch(`${API_BASE}/v0/chat_session/create`, {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${accessToken}`,
+                  },
+                  credentials: "include",
+                  body: JSON.stringify({}),
+                });
+                if (!sessionResp.ok) return { error: `session_${sessionResp.status}` };
+                const sessionJson = await sessionResp.json();
+                const sessionBizData = sessionJson?.data?.biz_data || sessionJson?.biz_data;
+                const sessionId = sessionBizData?.chat_session?.id;
+                if (!sessionId) return { error: "no_session_id" };
+
+                // Get PoW challenge
+                const powResp = await fetch(`${API_BASE}/v0/chat/create_pow_challenge`, {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${accessToken}`,
+                  },
+                  credentials: "include",
+                  body: JSON.stringify({ target_path: "/api/v0/chat/completion" }),
+                });
+                if (!powResp.ok) return { error: `pow_${powResp.status}` };
+                const powJson = await powResp.json();
+                const powBizData = powJson?.data?.biz_data || powJson?.biz_data;
+                const challenge = powBizData?.challenge;
+                if (!challenge) return { error: "no_pow_challenge" };
+
+                return { error: null, accessToken, sessionId, challenge };
+              },
+              {
+                userToken,
+                retryPrompt: minimalRetryPrompt,
+                modelType,
+                thinkingEnabled,
+                searchEnabled,
+              }
+            );
+
+            if (retryPhase1 && !retryPhase1.error) {
+              // Solve PoW server-side
+              const retryPowChallenge = retryPhase1.challenge as PowChallenge;
+              const retryPowAnswer = await solvePow(retryPowChallenge);
+
+              // Send retry completion through the browser
+              const retryResult = await page.evaluate(
+                async (payload: {
+                  accessToken: string;
+                  sessionId: string;
+                  powAnswer: string;
+                  prompt: string;
+                  modelType: string;
+                  thinkingEnabled: boolean;
+                  searchEnabled: boolean;
+                }) => {
+                  const COMPLETION_URL = "https://chat.deepseek.com/api/v0/chat/completion";
+                  const resp = await fetch(COMPLETION_URL, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      Authorization: `Bearer ${payload.accessToken}`,
+                      "X-Ds-Pow-Response": payload.powAnswer,
+                      "X-Client-Timezone-Offset": String(new Date().getTimezoneOffset() * -60),
+                    },
+                    credentials: "include",
+                    body: JSON.stringify({
+                      chat_session_id: payload.sessionId,
+                      parent_message_id: null,
+                      model_type: payload.modelType,
+                      prompt: payload.prompt,
+                      ref_file_ids: [],
+                      thinking_enabled: payload.thinkingEnabled,
+                      search_enabled: payload.searchEnabled,
+                      preempt: false,
+                    }),
+                  });
+                  if (!resp.ok) return { error: `completion_${resp.status}`, body: "" };
+                  const body = await resp.text();
+                  return { error: null, body };
+                },
+                {
+                  accessToken: retryPhase1.accessToken,
+                  sessionId: retryPhase1.sessionId,
+                  powAnswer: retryPowAnswer,
+                  prompt: minimalRetryPrompt,
+                  modelType,
+                  thinkingEnabled,
+                  searchEnabled,
+                }
+              );
+
+              if (retryResult && !retryResult.error) {
+                const retryStream = new ReadableStream<Uint8Array>({
+                  start(controller) {
+                    controller.enqueue(new TextEncoder().encode(retryResult.body));
+                    controller.close();
+                  },
+                });
+                const retryContent = await collectSSEContent(retryStream, clientModel);
+                const retryParsed = parseDeepSeekToolCalls(
+                  retryContent.content,
+                  `call-${Date.now()}`,
+                  requestedTools
+                );
+                if (retryParsed.toolCalls && retryParsed.toolCalls.length > 0) {
+                  content = retryContent.content;
+                  reasoningContent = retryContent.reasoningContent;
+                  cleanedContent = retryParsed.content;
+                  toolCalls = retryParsed.toolCalls;
+                  log?.info?.(
+                    "DEEPSEEK-WEB",
+                    "Browser path: narrated-intent retry succeeded — tool calls recovered"
+                  );
+                }
+              }
+            }
+          } catch (retryErr) {
+            log?.warn?.(
+              "DEEPSEEK-WEB",
+              `Browser path: narrated-intent retry failed: ${sanitizeErrorMessage(retryErr instanceof Error ? retryErr.message : String(retryErr))}`
+            );
+          }
+
+          // LEV fork: If retry also failed, synthesize a Grep tool call
+          if (!toolCalls || toolCalls.length === 0) {
+            const lastUserText = extractLastUserText(messages);
+            const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+            if (synthCall) {
+              log?.warn?.(
+                "DEEPSEEK-WEB",
+                `Browser path: synthesizing Grep tool call after narrated-intent retry failed`
+              );
+              toolCalls = [synthCall];
+              cleanedContent = "";
+            }
+          }
+        }
+
         return buildToolAwareResult({
           stream: stream !== false,
           clientModel,
@@ -1587,35 +1857,12 @@ export class DeepSeekWebExecutor extends BaseExecutor {
             "Narrated intent without tool block — retrying with minimal corrective prompt"
           );
           const retrySession = await createSession(accessToken, signal);
-          // Build a minimal prompt: tool contract + extracted user query + nudge.
-          // Use extractUserQuery to get just the actual task (without image
-          // descriptions, DOM dumps, etc.) for a cleaner, more focused retry.
-          const lastUserMsg = messages.filter((m) => m.role === "user").pop();
-          const extractedQuery = lastUserMsg ? extractUserQuery(lastUserMsg.content) : "";
-          // Fallback to raw text if extractUserQuery returns empty (no <user_query> tag)
-          let lastUserText = extractedQuery;
-          if (!lastUserText && lastUserMsg) {
-            lastUserText =
-              typeof lastUserMsg.content === "string"
-                ? lastUserMsg.content
-                : Array.isArray(lastUserMsg.content)
-                  ? (lastUserMsg.content as Array<{ type?: string; text?: string }>)
-                      .filter((p) => p?.type === "text")
-                      .map((p) => p?.text ?? "")
-                      .join("\n")
-                  : "";
-          }
-          const minimalRetryPrompt =
-            toolSystemPrompt +
-            "\n\n---\nPrevious task context (last user request):\n" +
-            tokenAwareTruncate(lastUserText, 2_000) +
-            '\n\n---\nIMPORTANT: Your previous response was: "' +
-            cleanedContent.slice(0, 200) +
-            '" — you narrated intent to use a tool but did NOT emit a <tool> block. ' +
-            "You MUST emit the <tool> block NOW. Do not describe what you will do — " +
-            'do it by outputting the <tool>{"name": ..., "arguments": ..., "_nonce": ...}</tool> block immediately. ' +
-            "For example, to find relevant files, emit: " +
-            '<tool>{"name": "Grep", "arguments": {"pattern": "reposicion", "output_mode": "files_with_matches"}, "_nonce": "..."}</tool>';
+          const lastUserText = extractLastUserText(messages);
+          const minimalRetryPrompt = buildCorrectiveRetryPrompt(
+            toolSystemPrompt,
+            lastUserText,
+            cleanedContent
+          );
           const retryResp = await performCompletion(retrySession, minimalRetryPrompt);
           deleteSessionOnDeepSeek(accessToken, retrySession).catch(() => {});
           if (retryResp.resp.ok) {
@@ -1644,47 +1891,14 @@ export class DeepSeekWebExecutor extends BaseExecutor {
           // Grep tool call from the narrated intent to keep the agent loop
           // alive. The model said "I need to find..." — give it a search.
           if (!toolCalls || toolCalls.length === 0) {
-            const hasGrep = requestedTools.some(
-              (t) => t?.function?.name === "Grep" || t?.function?.name === "grep"
-            );
-            if (hasGrep && lastUserText) {
-              // Extract a search pattern from the user query — look for
-              // quoted strings, page names, or key terms.
-              const pageMatch = /\/(\w+)\/?$/.exec(lastUserText);
-              const pattern = pageMatch
-                ? pageMatch[1]
-                : lastUserText
-                    .replace(/[<>\[\]{}]/g, "")
-                    .split(/\s+/)
-                    .filter(
-                      (w) =>
-                        w.length > 3 &&
-                        !/^(the|this|that|with|from|have|your|into|page|table|header|glass|seems|broken|aligned|look|need|find|code|unified|understand|issue|alignment|not|properly)$/i.test(
-                          w
-                        )
-                    )
-                    .slice(0, 3)
-                    .join("|");
-              if (pattern) {
-                log?.warn?.(
-                  "DEEPSEEK-WEB",
-                  `Narrated intent retry also failed — synthesizing Grep tool call with pattern: ${pattern}`
-                );
-                toolCalls = [
-                  {
-                    id: `call-${Date.now()}`,
-                    type: "function" as const,
-                    function: {
-                      name: "Grep",
-                      arguments: JSON.stringify({
-                        pattern,
-                        output_mode: "files_with_matches",
-                      }),
-                    },
-                  },
-                ];
-                cleanedContent = "";
-              }
+            const synthCall = synthesizeGrepToolCall(lastUserText, requestedTools);
+            if (synthCall) {
+              log?.warn?.(
+                "DEEPSEEK-WEB",
+                `Narrated intent retry also failed — synthesizing Grep tool call`
+              );
+              toolCalls = [synthCall];
+              cleanedContent = "";
             }
           }
         }
