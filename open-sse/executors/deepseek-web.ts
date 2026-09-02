@@ -1265,8 +1265,21 @@ export class DeepSeekWebExecutor extends BaseExecutor {
 
       log?.info?.(
         "DEEPSEEK-WEB",
-        `Browser-backed API success: ${apiResult.body?.length || 0} bytes`
+        `Browser-backed API success: ${apiResult.body?.length || 0} bytes` +
+          (apiResult.body && apiResult.body.length < 500
+            ? ` | body: ${apiResult.body.slice(0, 200)}`
+            : "")
       );
+
+      // LEV fork: If the browser response is too small, it's likely a DeepSeek
+      // error JSON (not actual SSE content). Fall back to direct HTTP.
+      if (!apiResult.body || apiResult.body.length < 50) {
+        log?.warn?.(
+          "DEEPSEEK-WEB",
+          `Browser-backed API returned suspiciously small response (${apiResult.body?.length || 0} bytes) — falling back to direct HTTP`
+        );
+        return null;
+      }
 
       const clientModel = typeof model === "string" && model.trim() ? model.trim() : "deepseek-web";
       const upstreamStream = new ReadableStream<Uint8Array>({
