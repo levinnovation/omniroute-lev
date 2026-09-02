@@ -1127,61 +1127,76 @@ export class DeepSeekWebExecutor extends BaseExecutor {
       // browser context so requests carry real cookies, origin, and fingerprint.
       const phase1 = await page.evaluate(async (userToken: string) => {
         const API_BASE = "https://chat.deepseek.com/api";
+        try {
+          // Step 1: Acquire access token
+          const tokenResp = await fetch(`${API_BASE}/v0/users/current`, {
+            method: "GET",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${userToken}`,
+            },
+            credentials: "include",
+          });
+          if (!tokenResp.ok) return { error: `token_acquire_${tokenResp.status}` };
+          const tokenJson = await tokenResp.json();
+          const tokenBizData = tokenJson?.data?.biz_data || tokenJson?.biz_data;
+          const accessToken = tokenBizData?.token;
+          if (!accessToken)
+            return { error: "no_access_token", tokenJson: JSON.stringify(tokenJson).slice(0, 200) };
 
-        // Step 1: Acquire access token
-        const tokenResp = await fetch(`${API_BASE}/v0/users/current`, {
-          method: "GET",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${userToken}`,
-          },
-          credentials: "include",
-        });
-        if (!tokenResp.ok) return { error: `token_acquire_${tokenResp.status}` };
-        const tokenJson = await tokenResp.json();
-        const tokenBizData = tokenJson?.data?.biz_data || tokenJson?.biz_data;
-        const accessToken = tokenBizData?.token;
-        if (!accessToken) return { error: "no_access_token" };
+          // Step 2: Create chat session
+          const sessionResp = await fetch(`${API_BASE}/v0/chat_session/create`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${accessToken}`,
+            },
+            credentials: "include",
+            body: JSON.stringify({}),
+          });
+          if (!sessionResp.ok) return { error: `session_create_${sessionResp.status}` };
+          const sessionJson = await sessionResp.json();
+          const sessionBizData = sessionJson?.data?.biz_data || sessionJson?.biz_data;
+          const sessionId = sessionBizData?.chat_session?.id;
+          if (!sessionId)
+            return {
+              error: "no_session_id",
+              sessionJson: JSON.stringify(sessionJson).slice(0, 200),
+            };
 
-        // Step 2: Create chat session
-        const sessionResp = await fetch(`${API_BASE}/v0/chat_session/create`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${accessToken}`,
-          },
-          credentials: "include",
-          body: JSON.stringify({}),
-        });
-        if (!sessionResp.ok) return { error: `session_create_${sessionResp.status}` };
-        const sessionJson = await sessionResp.json();
-        const sessionBizData = sessionJson?.data?.biz_data || sessionJson?.biz_data;
-        const sessionId = sessionBizData?.chat_session?.id;
-        if (!sessionId) return { error: "no_session_id" };
+          // Step 3: Get PoW challenge
+          const powResp = await fetch(`${API_BASE}/v0/chat/create_pow_challenge`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${accessToken}`,
+            },
+            credentials: "include",
+            body: JSON.stringify({ target_path: "/api/v0/chat/completion" }),
+          });
+          if (!powResp.ok)
+            return { error: `pow_challenge_${powResp.status}`, powStatus: powResp.status };
+          const powJson = await powResp.json();
+          const powBizData = powJson?.data?.biz_data || powJson?.biz_data;
+          const challenge = powBizData?.challenge;
+          if (!challenge)
+            return { error: "no_pow_challenge", powJson: JSON.stringify(powJson).slice(0, 200) };
 
-        // Step 3: Get PoW challenge
-        const powResp = await fetch(`${API_BASE}/v0/chat/create_pow_challenge`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${accessToken}`,
-          },
-          credentials: "include",
-          body: JSON.stringify({ target_path: "/api/v0/chat/completion" }),
-        });
-        if (!powResp.ok) return { error: `pow_challenge_${powResp.status}` };
-        const powJson = await powResp.json();
-        const powBizData = powJson?.data?.biz_data || powJson?.biz_data;
-        const challenge = powBizData?.challenge;
-        if (!challenge) return { error: "no_pow_challenge" };
-
-        return { error: null, accessToken, sessionId, challenge };
+          return { error: null, accessToken, sessionId, challenge };
+        } catch (e) {
+          return { error: `phase1_exception: ${e instanceof Error ? e.message : String(e)}` };
+        }
       }, userToken);
 
       if (!phase1 || phase1.error) {
+        const diag = phase1
+          ? JSON.stringify(
+              Object.fromEntries(Object.entries(phase1).filter(([k]) => k !== "error"))
+            ).slice(0, 300)
+          : "null";
         log?.warn?.(
           "DEEPSEEK-WEB",
-          `Browser-backed API phase1 failed: ${phase1?.error || "no result"}`
+          `Browser-backed API phase1 failed: ${phase1?.error || "no result"} | diag: ${diag}`
         );
         return null;
       }
