@@ -1,3 +1,9 @@
+---
+title: "Web Provider Browser Architecture"
+version: 3.8.51
+lastUpdated: 2026-09-02
+---
+
 # Web Provider Browser Architecture
 
 > **Architecture specification for web-cookie provider executors in the LEV fork.**

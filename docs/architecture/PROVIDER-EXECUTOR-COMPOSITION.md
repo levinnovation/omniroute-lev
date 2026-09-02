@@ -1,3 +1,9 @@
+---
+title: "Provider Executor Composition Guide"
+version: 3.8.51
+lastUpdated: 2026-09-02
+---
+
 # Provider Executor Composition Guide
 
 > **How to build and maintain provider executors using composition over

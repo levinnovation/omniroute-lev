@@ -1,3 +1,9 @@
+---
+title: "LEV Fork Constitution"
+version: 3.8.51
+lastUpdated: 2026-09-02
+---
+
 # LEV Fork Constitution
 
 > **Governing document for the `levinnovation/omniroute-lev` fork.**
