@@ -156,6 +156,10 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     }
     const body = await response.text().catch(() => "");
     const contentType = headers["content-type"] || "text/event-stream";
+    // Diagnostic: log captured response details to help debug empty responses.
+    console.error(
+      `[zai-web-v2] submitAndCapture: url=${response.url()} status=${status} ct=${contentType} bodyLen=${body.length} bodyPreview=${body.slice(0, 200)}`
+    );
     return { status, headers, body, contentType };
   }
 
