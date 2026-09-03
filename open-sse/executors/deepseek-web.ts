@@ -933,18 +933,28 @@ function buildToolAwareResult(opts: {
         if (reasoningContent) emit(controller, { reasoning_content: reasoningContent }, null);
         // LEV fork: Empty-content watchdog. If both content and tool calls are
         // empty, DeepSeek returned nothing — likely because the prompt was too
-        // large or the session expired. Emit an error message instead of a
-        // silent empty response that kills the agent loop.
+        // large or the session expired. Return a proper error response instead
+        // of embedding the error in the assistant content (which confuses
+        // agentic clients like Zed/Cursor that treat it as a real response).
         if (!content && !hasCalls) {
-          emit(
-            controller,
-            {
-              content:
-                "[DeepSeek error] Empty response from upstream — the prompt may be too large " +
-                "or the session may be expired. Try reducing context or re-authenticating.",
-            },
-            null
-          );
+          controller.close();
+          return {
+            response: new Response(
+              JSON.stringify({
+                error: {
+                  message:
+                    "DeepSeek returned an empty response — the prompt may be too large " +
+                    "or the session may be expired. Try reducing context or re-authenticating.",
+                  type: "upstream_error",
+                  code: "empty_response",
+                },
+              }),
+              { status: 502, headers: { "Content-Type": "application/json" } }
+            ),
+            url: COMPLETION_URL,
+            headers: reqHeaders,
+            transformedBody: requestPayload,
+          };
         }
         if (content) emit(controller, { content }, null);
         if (hasCalls) {
@@ -977,16 +987,33 @@ function buildToolAwareResult(opts: {
     };
   }
 
+  // LEV fork: Empty-content watchdog for non-streaming tool path.
+  // Return a proper 502 error instead of embedding the error in content.
+  if (!content && !hasCalls) {
+    return {
+      response: new Response(
+        JSON.stringify({
+          error: {
+            message:
+              "DeepSeek returned an empty response — the prompt may be too large " +
+              "or the session may be expired. Try reducing context or re-authenticating.",
+            type: "upstream_error",
+            code: "empty_response",
+          },
+        }),
+        { status: 502, headers: { "Content-Type": "application/json" } }
+      ),
+      url: COMPLETION_URL,
+      headers: reqHeaders,
+      transformedBody: requestPayload,
+    };
+  }
+
   const message: Record<string, unknown> = { role: "assistant", content: content || "" };
   if (reasoningContent) message.reasoning_content = reasoningContent;
   if (hasCalls) {
     message.tool_calls = toolCalls;
     if (!content) message.content = null;
-  } else if (!content) {
-    // LEV fork: Empty-content watchdog for non-streaming tool path.
-    message.content =
-      "[DeepSeek error] Empty response from upstream — the prompt may be too large " +
-      "or the session may be expired. Try reducing context or re-authenticating.";
   }
   const openaiResponse = {
     id,
