@@ -21,6 +21,8 @@ import {
   buildZaiHeaders,
   buildZaiRequestBody,
   ZAI_BASE_URL,
+  ZAI_DEFAULT_CLIENT_VERSION,
+  ZAI_DEFAULT_FE_VERSION,
   ZAI_DEFAULT_MODEL,
   ZAI_USER_AGENT,
 } from "./zai-web/protocol.ts";
@@ -228,18 +230,18 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       timestamp,
       token,
       userId: "",
-      clientVersion: "",
+      clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
     });
     const reqHeaders = buildZaiHeaders(token, {
       accept: "text/event-stream",
-      frontendVersion: "",
-      clientVersion: "",
+      frontendVersion: ZAI_DEFAULT_FE_VERSION,
+      clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
     });
     const reqBody = buildZaiRequestBody({
       body: {},
       captchaVerifyParam: "",
       chatId,
-      clientVersion: "",
+      clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
       messages: this.currentMessages,
       modelId: this.currentModel,
       prompt: browserPrompt(this.currentMessages),
