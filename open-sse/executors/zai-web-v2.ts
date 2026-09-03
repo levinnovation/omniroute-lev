@@ -102,6 +102,17 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const prompt = browserPrompt(messages);
     const input = page.locator(INPUT_SELECTOR).first();
     await input.waitFor({ state: "visible", timeout: 10_000 });
+    // Diagnostic: log the input element tag name and type
+    const tagInfo = await input
+      .evaluate((el) => ({
+        tag: el.tagName,
+        type: (el as HTMLInputElement).type,
+        isContentEditable: el.isContentEditable,
+      }))
+      .catch(() => ({ tag: "unknown", type: "unknown", isContentEditable: false }));
+    console.error(
+      `[zai-web-v2] fillPrompt: tag=${tagInfo.tag} type=${tagInfo.type} editable=${tagInfo.isContentEditable} promptLen=${prompt.length}`
+    );
     // Use evaluate mode to set the textarea value and dispatch Svelte-reactive
     // input/change events. keyboard.type() is slow for long prompts and may
     // not trigger Svelte's reactivity properly, leaving the submit button
@@ -116,11 +127,27 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     } catch {
       await input.fill(prompt);
     }
+    // Diagnostic: verify the value was set
+    const setValue = await input
+      .evaluate((el) => (el as HTMLTextAreaElement).value)
+      .catch(() => "ERROR");
+    console.error(
+      `[zai-web-v2] fillPrompt: setValue len=${String(setValue).length} preview=${String(setValue).slice(0, 50)}`
+    );
   }
 
   async submitAndCapture(page: Page): Promise<WebCookieRawResponse> {
     const submit = page.locator(SUBMIT_SELECTOR).first();
     await submit.waitFor({ state: "visible", timeout: 15_000 });
+
+    // Diagnostic: log submit button state
+    const submitCount = await page.locator(SUBMIT_SELECTOR).count();
+    const submitDisabled = await submit
+      .evaluate((el) => (el as HTMLButtonElement).disabled)
+      .catch(() => "ERROR");
+    console.error(
+      `[zai-web-v2] submitAndCapture: submitCount=${submitCount} disabled=${submitDisabled}`
+    );
 
     // Wait for Svelte to react to the prompt fill and enable the submit button.
     // The v1 executor waits 800ms after fillPrompt before clicking.
