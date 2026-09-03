@@ -296,13 +296,14 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       // Execute the completions fetch from within the browser page context.
       // This ensures the request uses the browser's cookies, origin, and
       // session context — which a Node-side fetch lacks, causing 404.
+      // Playwright's page.evaluate accepts a single arg, so wrap in an object.
       const result = await page.evaluate(
-        async (url: string, headers: Record<string, string>, body: string) => {
+        async (params: { url: string; headers: Record<string, string>; body: string }) => {
           try {
-            const resp = await fetch(url, {
+            const resp = await fetch(params.url, {
               method: "POST",
-              headers,
-              body,
+              headers: params.headers,
+              body: params.body,
               credentials: "include",
             });
             const text = await resp.text();
@@ -325,9 +326,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
             };
           }
         },
-        completionUrl,
-        reqHeaders,
-        JSON.stringify(reqBody)
+        { url: completionUrl, headers: reqHeaders, body: JSON.stringify(reqBody) }
       );
 
       console.error(
