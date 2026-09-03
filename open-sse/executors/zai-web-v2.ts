@@ -23,6 +23,7 @@ import type { ProviderCredentials, ExecuteInput } from "../base.ts";
 import {
   browserModelName,
   browserPrompt,
+  buildZaiNewChatBody,
   ZAI_BASE_URL,
   ZAI_DEFAULT_MODEL,
   ZAI_USER_AGENT,
@@ -162,6 +163,16 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const prompt = browserPrompt(this.currentMessages);
     const messages = this.currentMessages;
 
+    // Build the proper chats/new body using the v1 protocol helper.
+    // Z.ai expects a complex chat object with history, messages, models, etc.
+    const { userMessageId, payload: newChatPayload } = buildZaiNewChatBody(
+      messages,
+      modelId,
+      false,
+      "high",
+      { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false }
+    );
+
     // Execute the entire two-step flow from within the browser page context.
     // This uses the browser's cookies, origin, and localStorage token.
     const result = await page.evaluate(
@@ -170,11 +181,12 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         token: string;
         model: string;
         prompt: string;
-        messages: Array<{ role: string; content: unknown }>;
+        newChatPayload: Record<string, unknown>;
+        userMessageId: string;
       }) => {
-        const { baseUrl, token, model, prompt, messages } = params;
+        const { baseUrl, token, model, prompt, newChatPayload, userMessageId } = params;
 
-        // Step 1: Create a new chat
+        // Step 1: Create a new chat with the proper body structure
         let chatId = "";
         try {
           const newChatResp = await fetch(`${baseUrl}/api/v1/chats/new`, {
@@ -183,11 +195,10 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
               "Content-Type": "application/json",
               Authorization: `Bearer ${token}`,
             },
-            body: JSON.stringify({ model }),
+            body: JSON.stringify(newChatPayload),
             credentials: "include",
           });
           const newChatText = await newChatResp.text();
-          console.log(`chats/new status=${newChatResp.status} body=${newChatText.slice(0, 200)}`);
           if (newChatResp.ok && newChatText.trim().startsWith("{")) {
             const chatData = JSON.parse(newChatText);
             chatId = typeof chatData?.id === "string" ? chatData.id : "";
@@ -221,10 +232,10 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         const reqBody = {
           stream: true,
           model,
-          messages,
+          messages: [],
           chat_id: chatId,
           id: crypto.randomUUID(),
-          current_user_message_id: crypto.randomUUID(),
+          current_user_message_id: userMessageId,
           current_user_message_parent_id: null,
           signature_prompt: prompt,
           params: {},
@@ -306,7 +317,8 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         token,
         model: browserModel,
         prompt,
-        messages,
+        newChatPayload,
+        userMessageId,
       }
     );
 
