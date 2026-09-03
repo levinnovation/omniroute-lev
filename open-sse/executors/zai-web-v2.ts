@@ -5,6 +5,7 @@
  * reimplementing the browser lifecycle. Used when OMNIROUTE_EXECUTOR_V2=on;
  * the original zai-web.ts remains the default fallback.
  */
+import { randomUUID } from "node:crypto";
 import type { Page } from "playwright";
 import {
   WebCookieExecutorBase,
@@ -12,10 +13,13 @@ import {
   type WebCookieParsedResponse,
 } from "./base/WebCookieExecutorBase.ts";
 import type { BrowserPoolContextOptions } from "../services/browserPool.ts";
-import type { ProviderCredentials } from "../base.ts";
+import type { ProviderCredentials, ExecuteInput } from "../base.ts";
 import {
   browserModelName,
   browserPrompt,
+  buildZaiCompletionUrl,
+  buildZaiHeaders,
+  buildZaiRequestBody,
   ZAI_BASE_URL,
   ZAI_DEFAULT_MODEL,
   ZAI_USER_AGENT,
@@ -31,6 +35,11 @@ const MODEL_SELECTOR = '[aria-label="Select a model"]';
 
 export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
   private sessionDriver = new WebSessionDriver(ZAI_WEB_SESSION_CONFIG);
+  /** Stored per-request for use in submitAndCapture's two-step flow. */
+  private currentToken = "";
+  private currentModel = "";
+  private currentMessages: Array<{ role: string; content: unknown }> = [];
+  private currentSignal: AbortSignal | null = null;
 
   constructor() {
     super(
@@ -54,6 +63,26 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         streamWatchdogMs: ZAI_WEB_SESSION_CONFIG.streamWatchdogMs,
       }
     );
+  }
+
+  /**
+   * Override execute to capture request context (token, model, messages, signal)
+   * before the base class runs. submitAndCapture needs these for the two-step
+   * Z.ai flow: capture chats/new from the browser, then direct-fetch the SSE
+   * stream from /api/chat/completions.
+   */
+  async execute(input: ExecuteInput): Promise<import("../base.ts").ExecutorExecuteResult> {
+    this.currentToken = String(
+      input.credentials?.apiKey ?? input.credentials?.accessToken ?? ""
+    ).trim();
+    this.currentModel = input.model || ZAI_DEFAULT_MODEL;
+    this.currentMessages =
+      ((input.body as Record<string, unknown> | null)?.messages as Array<{
+        role: string;
+        content: unknown;
+      }>) || [];
+    this.currentSignal = input.signal ?? null;
+    return super.execute(input);
   }
 
   getProviderUrl(): string {
@@ -102,17 +131,6 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const prompt = browserPrompt(messages);
     const input = page.locator(INPUT_SELECTOR).first();
     await input.waitFor({ state: "visible", timeout: 10_000 });
-    // Diagnostic: log the input element tag name and type
-    const tagInfo = await input
-      .evaluate((el) => ({
-        tag: el.tagName,
-        type: (el as HTMLInputElement).type,
-        isContentEditable: el.isContentEditable,
-      }))
-      .catch(() => ({ tag: "unknown", type: "unknown", isContentEditable: false }));
-    console.error(
-      `[zai-web-v2] fillPrompt: tag=${tagInfo.tag} type=${tagInfo.type} editable=${tagInfo.isContentEditable} promptLen=${prompt.length}`
-    );
     // Use evaluate mode to set the textarea value and dispatch Svelte-reactive
     // input/change events. keyboard.type() is slow for long prompts and may
     // not trigger Svelte's reactivity properly, leaving the submit button
@@ -127,40 +145,26 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     } catch {
       await input.fill(prompt);
     }
-    // Diagnostic: verify the value was set
-    const setValue = await input
-      .evaluate((el) => (el as HTMLTextAreaElement).value)
-      .catch(() => "ERROR");
-    console.error(
-      `[zai-web-v2] fillPrompt: setValue len=${String(setValue).length} preview=${String(setValue).slice(0, 50)}`
-    );
   }
 
   async submitAndCapture(page: Page): Promise<WebCookieRawResponse> {
     const submit = page.locator(SUBMIT_SELECTOR).first();
     await submit.waitFor({ state: "visible", timeout: 15_000 });
 
-    // Diagnostic: log submit button state
-    const submitCount = await page.locator(SUBMIT_SELECTOR).count();
-    const submitDisabled = await submit
-      .evaluate((el) => (el as HTMLButtonElement).disabled)
-      .catch(() => "ERROR");
-    console.error(
-      `[zai-web-v2] submitAndCapture: submitCount=${submitCount} disabled=${submitDisabled}`
-    );
-
     // Wait for Svelte to react to the prompt fill and enable the submit button.
-    // The v1 executor waits 800ms after fillPrompt before clicking.
     await page.waitForTimeout(800);
 
+    // Z.ai two-step flow:
+    // 1. Browser POSTs to /api/v1/chats/new → returns JSON with chat ID
+    // 2. Direct HTTP fetch to /api/chat/completions with chat ID → SSE stream
+    // The v1 executor does the same; the browser's SSE response is not reliably
+    // capturable via Playwright's waitForResponse.
     const responsePromise = page.waitForResponse(
-      (r) => r.request().method() === "POST" && r.url().includes("/api/chat/completions"),
+      (r) => r.request().method() === "POST" && r.url().includes("/api/v1/chats/new"),
       { timeout: 30_000 }
     );
 
-    // Use evaluate-based click to avoid coordinate interception by the
-    // landing-page hero animation overlay (matches v1 submitButtonMode: "dom").
-    // Fall back to Enter key if the submit button is disabled or not found.
+    // Click submit via evaluate (avoids hero animation overlay interception).
     if ((await submit.count()) > 0) {
       try {
         await submit.evaluate((el) => (el as HTMLElement).click());
@@ -171,34 +175,105 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       await page.keyboard.press("Enter");
     }
 
-    let response: Awaited<typeof responsePromise>;
+    // Step 1: Capture chats/new response to get the chat ID.
+    let chatId = "";
     try {
-      response = await responsePromise;
+      const response = await responsePromise;
+      await Promise.race([
+        response.finished().then(() => undefined),
+        new Promise((resolve) => setTimeout(resolve, 10_000)),
+      ]);
+      const body = await response.text().catch(() => "");
+      console.error(
+        `[zai-web-v2] chats/new: status=${response.status()} bodyLen=${body.length} preview=${body.slice(0, 200)}`
+      );
+      if (body.trim().startsWith("{")) {
+        try {
+          const chatData = JSON.parse(body);
+          chatId = typeof chatData?.id === "string" ? chatData.id : "";
+        } catch {
+          // parse error
+        }
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "submit capture failed";
+      const message = error instanceof Error ? error.message : "chats/new capture failed";
+      console.error(`[zai-web-v2] chats/new failed: ${message}`);
       return { status: 502, headers: {}, body: message, contentType: "text/plain" };
     }
 
-    // Wait for the SSE stream to finish before reading the body.
-    // response.text() on an unfinished streaming response returns an empty
-    // string. The v1 executor uses response.finished() + postSubmitWaitMs.
-    await Promise.race([
-      response.finished().then(() => undefined),
-      new Promise((resolve) => setTimeout(resolve, 30_000)),
-    ]);
-
-    const status = response.status();
-    const headers: Record<string, string> = {};
-    for (const [name, value] of Object.entries(response.headers())) {
-      headers[name] = value;
+    if (!chatId) {
+      return {
+        status: 502,
+        headers: {},
+        body: "chats/new returned no chat id",
+        contentType: "text/plain",
+      };
     }
-    const body = await response.text().catch(() => "");
-    const contentType = headers["content-type"] || "text/event-stream";
-    // Diagnostic: log captured response details to help debug empty responses.
-    console.error(
-      `[zai-web-v2] submitAndCapture: url=${response.url()} status=${status} ct=${contentType} bodyLen=${body.length} bodyPreview=${body.slice(0, 200)}`
-    );
-    return { status, headers, body, contentType };
+
+    // Step 2: Direct HTTP fetch to /api/chat/completions for the SSE stream.
+    const token = this.currentToken;
+    if (!token) {
+      return {
+        status: 401,
+        headers: {},
+        body: "no token for direct completion fetch",
+        contentType: "text/plain",
+      };
+    }
+
+    const timestamp = Date.now();
+    const requestId = randomUUID();
+    const completionUrl = buildZaiCompletionUrl({
+      requestId,
+      timestamp,
+      token,
+      userId: "",
+      clientVersion: "",
+    });
+    const reqHeaders = buildZaiHeaders(token, {
+      accept: "text/event-stream",
+      frontendVersion: "",
+      clientVersion: "",
+    });
+    const reqBody = buildZaiRequestBody({
+      body: {},
+      captchaVerifyParam: "",
+      chatId,
+      clientVersion: "",
+      messages: this.currentMessages,
+      modelId: this.currentModel,
+      prompt: browserPrompt(this.currentMessages),
+      userMessageId: randomUUID(),
+      enableThinking: false,
+      reasoningEffort: "high",
+      reasoningEffortSupported: false,
+      vlmConfig: { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false },
+    });
+
+    try {
+      const streamResponse = await fetch(completionUrl, {
+        method: "POST",
+        headers: reqHeaders,
+        body: JSON.stringify(reqBody),
+        signal: this.currentSignal ?? undefined,
+      });
+
+      const status = streamResponse.status;
+      const headers: Record<string, string> = {};
+      streamResponse.headers.forEach((value, name) => {
+        headers[name] = value;
+      });
+      const body = await streamResponse.text().catch(() => "");
+      const contentType = headers["content-type"] || "text/event-stream";
+      console.error(
+        `[zai-web-v2] completions: status=${status} bodyLen=${body.length} preview=${body.slice(0, 200)}`
+      );
+      return { status, headers, body, contentType };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "direct completion fetch failed";
+      console.error(`[zai-web-v2] completions failed: ${message}`);
+      return { status: 502, headers: {}, body: message, contentType: "text/plain" };
+    }
   }
 
   async parseResponse(raw: WebCookieRawResponse): Promise<WebCookieParsedResponse> {
