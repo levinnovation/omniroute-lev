@@ -160,12 +160,33 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     }) => {
       const method = response.request().method();
       const url = response.url();
-      if (url.includes("chat.z.ai") || url.includes("z.ai")) {
+      if (url.includes("chat.z.ai/api") || url.includes("z.ai/api")) {
         allResponses.push({ url, status: response.status(), method });
-        console.error(`[zai-web-v2] RESPONSE: ${method} ${url} -> ${response.status()}`);
+        console.error(`[zai-web-v2] API: ${method} ${url} -> ${response.status()}`);
       }
     };
     page.on("response", responseListener);
+
+    // Also monitor WebSocket connections — z.ai may have switched to WS for streaming
+    page.on("websocket", (ws) => {
+      console.error(`[zai-web-v2] WEBSOCKET opened: ${ws.url()}`);
+      ws.on("framesent", (frame) => {
+        const payload = String(frame.payload).slice(0, 300);
+        console.error(`[zai-web-v2] WS SENT: ${payload}`);
+      });
+      ws.on("framereceived", (frame) => {
+        const payload = String(frame.payload).slice(0, 300);
+        console.error(`[zai-web-v2] WS RECV: ${payload}`);
+      });
+    });
+
+    // Use keyboard.type() instead of evaluate to ensure Svelte reactivity.
+    // The evaluate approach sets textarea.value but may not trigger Svelte's
+    // bind:value properly, so the submit doesn't send the message content.
+    const input = page.locator(INPUT_SELECTOR).first();
+    await input.click();
+    await page.keyboard.type(browserPrompt(this.currentMessages), { delay: 5 });
+    await page.waitForTimeout(500);
 
     // Click submit via evaluate (avoids hero animation overlay interception).
     if ((await submit.count()) > 0) {
@@ -179,12 +200,12 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     }
 
     // Wait for responses to come in (chats/new + completions)
-    await page.waitForTimeout(15000);
+    await page.waitForTimeout(20000);
     page.off("response", responseListener);
 
-    console.error(`[zai-web-v2] Captured ${allResponses.length} responses total`);
+    console.error(`[zai-web-v2] Captured ${allResponses.length} API responses total`);
     for (const r of allResponses) {
-      console.error(`[zai-web-v2] FINAL: ${r.method} ${r.url} -> ${r.status}`);
+      console.error(`[zai-web-v2] FINAL API: ${r.method} ${r.url} -> ${r.status}`);
     }
 
     // Return a placeholder error for now — we're in discovery mode
