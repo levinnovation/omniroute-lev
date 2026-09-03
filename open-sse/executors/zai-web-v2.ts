@@ -11,6 +11,8 @@ import {
   type WebCookieRawResponse,
   type WebCookieParsedResponse,
 } from "./base/WebCookieExecutorBase.ts";
+import type { BrowserPoolContextOptions } from "../services/browserPool.ts";
+import type { ProviderCredentials } from "../base.ts";
 import { getProviderUrl } from "../config/providerVersions.ts";
 import {
   browserModelName,
@@ -57,6 +59,24 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
 
   getProviderUrl(): string {
     return getProviderUrl("zai-web");
+  }
+
+  /**
+   * Override buildContextOptions to inject the JWT token into localStorage.
+   *
+   * Z.ai's web app reads `localStorage.token` at boot to authenticate. The
+   * base class only handles cookie strings (looking for `=`), but zai-web
+   * credentials are JWT tokens (containing `.`), so the base class leaves
+   * them un-injected. Without this override, the browser navigates to
+   * chat.z.ai with no auth and lands on the login wall.
+   */
+  protected buildContextOptions(credentials: ProviderCredentials): BrowserPoolContextOptions {
+    const base = super.buildContextOptions(credentials);
+    const token = String(credentials.apiKey ?? credentials.accessToken ?? "").trim();
+    if (token) {
+      base.localStorage = { ...(base.localStorage ?? {}), token };
+    }
+    return base;
   }
 
   async selectModel(page: Page, model: string): Promise<void> {
