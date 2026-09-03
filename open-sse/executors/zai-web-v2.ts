@@ -20,6 +20,7 @@ import {
   buildZaiCompletionUrl,
   buildZaiHeaders,
   buildZaiRequestBody,
+  buildZaiSignature,
   ZAI_BASE_URL,
   ZAI_DEFAULT_CLIENT_VERSION,
   ZAI_DEFAULT_FE_VERSION,
@@ -225,6 +226,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
 
     const timestamp = Date.now();
     const requestId = randomUUID();
+    const prompt = browserPrompt(this.currentMessages);
     const completionUrl = buildZaiCompletionUrl({
       requestId,
       timestamp,
@@ -232,10 +234,17 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       userId: "",
       clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
     });
+    const signature = buildZaiSignature({
+      prompt,
+      requestId,
+      timestamp,
+      userId: "",
+    });
     const reqHeaders = buildZaiHeaders(token, {
       accept: "text/event-stream",
       frontendVersion: ZAI_DEFAULT_FE_VERSION,
       clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
+      signature,
     });
     const reqBody = buildZaiRequestBody({
       body: {},
@@ -244,7 +253,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
       messages: this.currentMessages,
       modelId: this.currentModel,
-      prompt: browserPrompt(this.currentMessages),
+      prompt,
       userMessageId: randomUUID(),
       enableThinking: false,
       reasoningEffort: "high",
