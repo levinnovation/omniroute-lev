@@ -123,7 +123,9 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     await submit.waitFor({ state: "visible", timeout: 15_000 });
 
     const responsePromise = page.waitForResponse(
-      (r) => r.url().includes("/api/chat/completions") || r.url().includes("/api/v1/chats/new"),
+      (r) =>
+        r.request().method() === "POST" &&
+        (r.url().includes("/api/chat/completions") || r.url().includes("/api/v1/chats/new")),
       { timeout: 30_000 }
     );
 
@@ -138,6 +140,14 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       const message = error instanceof Error ? error.message : "submit capture failed";
       return { status: 502, headers: {}, body: message, contentType: "text/plain" };
     }
+
+    // Wait for the SSE stream to finish before reading the body.
+    // response.text() on an unfinished streaming response returns an empty
+    // string. The v1 executor uses response.finished() + postSubmitWaitMs.
+    await Promise.race([
+      response.finished().then(() => undefined),
+      new Promise((resolve) => setTimeout(resolve, 30_000)),
+    ]);
 
     const status = response.status();
     const headers: Record<string, string> = {};
