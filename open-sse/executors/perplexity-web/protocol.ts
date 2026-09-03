@@ -1,6 +1,6 @@
 // Pure Perplexity wire protocol: consts, types, SSE parsing, request/query building,
 // content extraction. Extracted verbatim from perplexity-web.ts. No host state/fetch/auth.
-import { randomUUID } from "crypto";
+// crypto.randomUUID is used via the global crypto object below
 
 export const PPLX_SSE_ENDPOINT = "https://www.perplexity.ai/rest/sse/perplexity_ask";
 // Perplexity's current request schema version (sent in params.version). Perplexity rejects
@@ -292,12 +292,59 @@ export function parseOpenAIMessages(messages: Array<Record<string, unknown>>): P
         .map((c) => String(c.text || ""))
         .join(" ");
     }
+
+    // LEV fork: Extract tool_calls from assistant messages.
+    // Agentic coding clients (Cursor, Cline, etc.) send tool_calls as a
+    // separate field on assistant messages. Without this, the conversation
+    // transcript loses all context about what tools were called and the
+    // model can't "continue" because it doesn't know what it was doing.
+    if (role === "assistant" && Array.isArray(msg.tool_calls)) {
+      const toolCallSummary = (msg.tool_calls as Array<Record<string, unknown>>)
+        .map((tc) => {
+          const fn =
+            typeof tc.function === "object" && tc.function !== null
+              ? (tc.function as Record<string, unknown>)
+              : {};
+          const name = String(fn?.name || "unknown");
+          let args = "";
+          try {
+            args = String(fn?.arguments || "");
+          } catch {
+            args = "";
+          }
+          // Truncate tool arguments to avoid blowing up the transcript
+          if (args.length > 500) args = args.slice(0, 500) + "...[truncated]";
+          return `[Tool call: ${name}(${args})]`;
+        })
+        .join("\n");
+      if (toolCallSummary) {
+        content = content ? `${content}\n${toolCallSummary}` : toolCallSummary;
+      }
+    }
+
+    // LEV fork: Extract tool result content from tool/function messages.
+    // These contain the output of tool calls (file reads, shell output, etc.)
+    // and are critical for the model to understand what happened in the
+    // agentic loop. Without them, "pls continue" has no context.
+    if ((role === "tool" || role === "function") && !content.trim()) {
+      const toolContent = typeof msg.content === "string" ? msg.content : "";
+      if (toolContent) {
+        // Truncate tool results to avoid blowing up the transcript
+        content =
+          toolContent.length > 2000
+            ? `[Tool result: ${toolContent.slice(0, 2000)}...[truncated]]`
+            : `[Tool result: ${toolContent}]`;
+      }
+    }
+
     if (!content.trim()) continue;
 
     if (role === "system") {
       systemMsg += content + "\n";
-    } else if (role === "user" || role === "assistant") {
-      history.push({ role, content });
+    } else if (role === "user" || role === "assistant" || role === "tool" || role === "function") {
+      // Map tool/function roles to assistant for the transcript
+      const transcriptRole = role === "tool" || role === "function" ? "assistant" : role;
+      history.push({ role: transcriptRole, content });
     }
   }
 
@@ -306,24 +353,34 @@ export function parseOpenAIMessages(messages: Array<Record<string, unknown>>): P
     currentMsg = history.pop()!.content;
   }
 
-  // LEV fork: Fold preceding user messages (Cursor context: user_info,
-  // git_status, agent_transcripts, etc.) into the current message so they
-  // are included in dsl_query. Without this, Perplexity only sees the last
-  // user message and loses all IDE context (open files, git state, etc.).
-  // Assistant messages are excluded from the fold because Perplexity's web
-  // API doesn't support multi-turn conversations via dsl_query — only the
-  // user's accumulated context matters.
+  // LEV fork: Fold the FULL conversation history (assistant responses, tool
+  // calls, tool results, AND preceding user messages) into the current
+  // message so they are included in dsl_query. Without this, Perplexity only
+  // sees the last user message and loses ALL conversation context — the model
+  // can't "continue" because it doesn't know what it was doing.
   //
-  // The actual user query is placed FIRST, then the context block is appended.
+  // The conversation transcript is formatted as:
+  //   <user_query>pls continue</user_query>
+  //
+  //   --- Conversation history ---
+  //   [User]: <user_info>...
+  //   [User]: <agent_transcripts>...
+  //   [Assistant]: I'll fix the imports...
+  //   [Tool call: Read(path)]
+  //   [Tool result: file contents...]
+  //   [Assistant]: Now let me edit...
+  //
+  // The current user query is placed FIRST, then the transcript follows.
   // This is critical because dsl_query is truncated at MAX_DSL_LEN (16K chars)
-  // with slice(0, N) — keeping the beginning and dropping the end. If the
-  // context block were prepended, the large IDE context (user_info, git_status,
-  // agent_transcripts, rules) would push the actual user query past the
-  // truncation point, causing Perplexity to never see the real question.
-  const precedingUserMsgs = history.filter((h) => h.role === "user");
-  if (precedingUserMsgs.length > 0 && currentMsg) {
-    const contextBlock = precedingUserMsgs.map((m) => m.content).join("\n\n");
-    currentMsg = `${currentMsg}\n\n--- IDE context ---\n${contextBlock}`;
+  // with slice(0, N) — keeping the beginning and dropping the end.
+  if (history.length > 0 && currentMsg) {
+    const transcript = history
+      .map((m) => {
+        const label = m.role === "assistant" ? "Assistant" : "User";
+        return `[${label}]: ${m.content}`;
+      })
+      .join("\n\n");
+    currentMsg = `${currentMsg}\n\n--- Conversation history ---\n${transcript}`;
   }
 
   return { systemMsg, history, currentMsg };
@@ -441,16 +498,25 @@ export function buildQuery(parsed: ParsedMessages, followUpUuid: string | null):
     obj.query = "";
   }
 
-  // LEV fork: Preserve system prompt + current message, truncate history
-  // from the front (oldest first) if total exceeds the limit. The previous
-  // slice(-96000) cut off the system prompt at the beginning, causing the
-  // model to lose all context about its operating environment.
+  // LEV fork: The full conversation transcript (assistant responses, tool
+  // calls, tool results, preceding user messages) is already folded into
+  // parsed.currentMsg by parseOpenAIMessages, and becomes dsl_query. Do NOT
+  // duplicate it as a top-level history field — that doubles the payload and
+  // can trigger Perplexity's "Input token limit exceeded" error. The history
+  // array is kept empty since the transcript is in the query field.
   const MAX_QUERY_LEN = 48_000;
-  let history = parsed.history;
-  let json = JSON.stringify({ ...obj, history });
-  while (json.length > MAX_QUERY_LEN && history.length > 0) {
-    history = history.slice(1);
-    json = JSON.stringify({ ...obj, history });
+  let json = JSON.stringify({ ...obj, history: [] });
+  // If still too long, truncate the query from the front (oldest context first)
+  while (json.length > MAX_QUERY_LEN && typeof obj.query === "string" && obj.query.length > 1000) {
+    // Remove oldest conversation history from the transcript
+    const cutPoint = obj.query.indexOf("\n\n[", 1000);
+    if (cutPoint > 0) {
+      obj.query = obj.query.slice(0, cutPoint) + "\n[...earlier history truncated...]";
+      json = JSON.stringify({ ...obj, history: [] });
+    } else {
+      obj.query = (obj.query as string).slice(0, Math.floor((obj.query as string).length * 0.8));
+      json = JSON.stringify({ ...obj, history: [] });
+    }
   }
   return json;
 }

@@ -237,7 +237,7 @@ test("PPLX parseOpenAIMessages handles array content parts", async () => {
   );
 });
 
-test("PPLX parseOpenAIMessages excludes assistant messages from context fold", async () => {
+test("PPLX parseOpenAIMessages includes assistant messages in conversation transcript", async () => {
   const { parseOpenAIMessages } =
     await import("../../open-sse/executors/perplexity-web/protocol.ts");
 
@@ -256,8 +256,17 @@ test("PPLX parseOpenAIMessages excludes assistant messages from context fold", a
     parsed.currentMsg.includes("Second user message"),
     "Latest user message should be included"
   );
+  // LEV fork: Assistant messages ARE now included in the conversation transcript
+  // so the model has context about what it was doing (e.g. "pls continue").
   assert.ok(
-    !parsed.currentMsg.includes("Assistant response"),
-    "Assistant messages should NOT be folded into currentMsg"
+    parsed.currentMsg.includes("Assistant response"),
+    "Assistant messages should be folded into currentMsg for conversation context"
+  );
+  // The actual query must come BEFORE the transcript for truncation safety
+  const queryIdx = parsed.currentMsg.indexOf("Second user message");
+  const assistantIdx = parsed.currentMsg.indexOf("Assistant response");
+  assert.ok(
+    queryIdx < assistantIdx,
+    "Latest user query should come before conversation history (truncation safety)"
   );
 });

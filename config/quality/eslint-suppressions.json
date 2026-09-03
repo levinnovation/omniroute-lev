@@ -184,11 +184,6 @@
       "count": 2
     }
   },
-  "open-sse/executors/perplexity-web/protocol.ts": {
-    "@typescript-eslint/no-unused-vars": {
-      "count": 1
-    }
-  },
   "open-sse/executors/pollinations.ts": {
     "@typescript-eslint/no-explicit-any": {
       "count": 7
