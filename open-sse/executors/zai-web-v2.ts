@@ -24,6 +24,7 @@ import {
   browserModelName,
   browserPrompt,
   buildZaiNewChatBody,
+  buildZaiRequestBody,
   ZAI_BASE_URL,
   ZAI_DEFAULT_CLIENT_VERSION,
   ZAI_DEFAULT_FE_VERSION,
@@ -161,7 +162,6 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     }
 
     const modelId = this.currentModel || ZAI_DEFAULT_MODEL;
-    const browserModel = browserModelName(modelId);
     const prompt = browserPrompt(this.currentMessages);
     const messages = this.currentMessages;
 
@@ -206,29 +206,36 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false }
     );
 
+    // Build the completions request body using the v1 protocol helper.
+    // This includes foldMessages, proper model ID, version, features, etc.
+    const completionsBody = buildZaiRequestBody({
+      body: {},
+      captchaVerifyParam: "",
+      chatId: "", // Will be set inside page.evaluate after chats/new
+      clientVersion,
+      messages,
+      modelId,
+      prompt,
+      userMessageId,
+      enableThinking: false,
+      reasoningEffort: "high",
+      reasoningEffortSupported: false,
+      vlmConfig: { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false },
+    });
+
     // Execute the entire two-step flow from within the browser page context.
     // This uses the browser's cookies, origin, and localStorage token.
     const result = await page.evaluate(
       async (params: {
         baseUrl: string;
         token: string;
-        model: string;
-        prompt: string;
         newChatPayload: Record<string, unknown>;
-        userMessageId: string;
+        completionsBody: Record<string, unknown>;
         frontendVersion: string;
         clientVersion: string;
       }) => {
-        const {
-          baseUrl,
-          token,
-          model,
-          prompt,
-          newChatPayload,
-          userMessageId,
-          frontendVersion,
-          clientVersion,
-        } = params;
+        const { baseUrl, token, newChatPayload, completionsBody, frontendVersion, clientVersion } =
+          params;
 
         // Step 1: Create a new chat with the proper body structure
         let chatId = "";
@@ -275,36 +282,9 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
           `${baseUrl}/api/v2/chat/completions`,
         ];
 
-        const reqBody = {
-          stream: true,
-          model,
-          version: clientVersion,
-          messages: [],
-          chat_id: chatId,
-          id: crypto.randomUUID(),
-          current_user_message_id: userMessageId,
-          current_user_message_parent_id: null,
-          signature_prompt: prompt,
-          params: {},
-          extra: {},
-          features: {
-            image_generation: false,
-            web_search: false,
-            auto_web_search: false,
-            preview_mode: true,
-            flags: [],
-            vlm_tools_enable: false,
-            vlm_web_search_enable: false,
-            vlm_website_mode: false,
-            enable_thinking: false,
-          },
-          variables: {},
-          background_tasks: {
-            title_generation: true,
-            tags_generation: true,
-          },
-          captcha_verify_param: "",
-        };
+        // Use the pre-built completions body from buildZaiRequestBody,
+        // just set the chat_id from the newly created chat.
+        const reqBody = { ...completionsBody, chat_id: chatId };
 
         let lastError = "";
         for (const endpoint of endpoints) {
@@ -364,10 +344,8 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       {
         baseUrl: ZAI_BASE_URL,
         token,
-        model: browserModel,
-        prompt,
         newChatPayload,
-        userMessageId,
+        completionsBody,
         frontendVersion,
         clientVersion,
       }
