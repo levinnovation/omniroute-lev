@@ -122,6 +122,10 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const submit = page.locator(SUBMIT_SELECTOR).first();
     await submit.waitFor({ state: "visible", timeout: 15_000 });
 
+    // Wait for Svelte to react to the prompt fill and enable the submit button.
+    // The v1 executor waits 800ms after fillPrompt before clicking.
+    await page.waitForTimeout(800);
+
     const responsePromise = page.waitForResponse(
       (r) => r.request().method() === "POST" && r.url().includes("/api/chat/completions"),
       { timeout: 30_000 }
@@ -129,7 +133,16 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
 
     // Use evaluate-based click to avoid coordinate interception by the
     // landing-page hero animation overlay (matches v1 submitButtonMode: "dom").
-    await submit.evaluate((el) => (el as HTMLElement).click());
+    // Fall back to Enter key if the submit button is disabled or not found.
+    if ((await submit.count()) > 0) {
+      try {
+        await submit.evaluate((el) => (el as HTMLElement).click());
+      } catch {
+        await page.keyboard.press("Enter");
+      }
+    } else {
+      await page.keyboard.press("Enter");
+    }
 
     let response: Awaited<typeof responsePromise>;
     try {
