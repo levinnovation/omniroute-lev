@@ -20,7 +20,6 @@ import {
   buildZaiCompletionUrl,
   buildZaiHeaders,
   buildZaiRequestBody,
-  buildZaiSignature,
   ZAI_BASE_URL,
   ZAI_DEFAULT_CLIENT_VERSION,
   ZAI_DEFAULT_FE_VERSION,
@@ -234,17 +233,13 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       userId: "",
       clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
     });
-    const signature = buildZaiSignature({
-      prompt,
-      requestId,
-      timestamp,
-      userId: "",
-    });
+    // Note: The v1 browser transport path does NOT pass a signature.
+    // The signature is only used in the direct HTTP path. Passing a wrong
+    // signature may cause z.ai to reject the request.
     const reqHeaders = buildZaiHeaders(token, {
       accept: "text/event-stream",
       frontendVersion: ZAI_DEFAULT_FE_VERSION,
       clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
-      signature,
     });
     const reqBody = buildZaiRequestBody({
       body: {},
