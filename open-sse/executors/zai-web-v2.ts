@@ -5,7 +5,6 @@
  * reimplementing the browser lifecycle. Used when OMNIROUTE_EXECUTOR_V2=on;
  * the original zai-web.ts remains the default fallback.
  */
-import { randomUUID } from "node:crypto";
 import type { Page } from "playwright";
 import {
   WebCookieExecutorBase,
@@ -17,12 +16,7 @@ import type { ProviderCredentials, ExecuteInput } from "../base.ts";
 import {
   browserModelName,
   browserPrompt,
-  buildZaiCompletionUrl,
-  buildZaiHeaders,
-  buildZaiRequestBody,
   ZAI_BASE_URL,
-  ZAI_DEFAULT_CLIENT_VERSION,
-  ZAI_DEFAULT_FE_VERSION,
   ZAI_DEFAULT_MODEL,
   ZAI_USER_AGENT,
 } from "./zai-web/protocol.ts";
@@ -156,15 +150,22 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     // Wait for Svelte to react to the prompt fill and enable the submit button.
     await page.waitForTimeout(800);
 
-    // Z.ai two-step flow:
-    // 1. Browser POSTs to /api/v1/chats/new → returns JSON with chat ID
-    // 2. Direct HTTP fetch to /api/chat/completions with chat ID → SSE stream
-    // The v1 executor does the same; the browser's SSE response is not reliably
-    // capturable via Playwright's waitForResponse.
-    const responsePromise = page.waitForResponse(
-      (r) => r.request().method() === "POST" && r.url().includes("/api/v1/chats/new"),
-      { timeout: 30_000 }
-    );
+    // Capture ALL POST responses to discover z.ai's current API endpoints.
+    // The /api/chat/completions path returns 404, meaning z.ai changed their API.
+    const allResponses: Array<{ url: string; status: number; method: string }> = [];
+    const responseListener = (response: {
+      request(): { method(): string };
+      url(): string;
+      status(): number;
+    }) => {
+      const method = response.request().method();
+      const url = response.url();
+      if (url.includes("chat.z.ai") || url.includes("z.ai")) {
+        allResponses.push({ url, status: response.status(), method });
+        console.error(`[zai-web-v2] RESPONSE: ${method} ${url} -> ${response.status()}`);
+      }
+    };
+    page.on("response", responseListener);
 
     // Click submit via evaluate (avoids hero animation overlay interception).
     if ((await submit.count()) > 0) {
@@ -177,167 +178,22 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       await page.keyboard.press("Enter");
     }
 
-    // Step 1: Capture chats/new response to get the chat ID.
-    let chatId = "";
-    try {
-      const response = await responsePromise;
-      await Promise.race([
-        response.finished().then(() => undefined),
-        new Promise((resolve) => setTimeout(resolve, 10_000)),
-      ]);
-      const body = await response.text().catch(() => "");
-      console.error(
-        `[zai-web-v2] chats/new: status=${response.status()} bodyLen=${body.length} preview=${body.slice(0, 200)}`
-      );
-      if (body.trim().startsWith("{")) {
-        try {
-          const chatData = JSON.parse(body);
-          chatId = typeof chatData?.id === "string" ? chatData.id : "";
-        } catch {
-          // parse error
-        }
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "chats/new capture failed";
-      console.error(`[zai-web-v2] chats/new failed: ${message}`);
-      return { status: 502, headers: {}, body: message, contentType: "text/plain" };
+    // Wait for responses to come in (chats/new + completions)
+    await page.waitForTimeout(15000);
+    page.off("response", responseListener);
+
+    console.error(`[zai-web-v2] Captured ${allResponses.length} responses total`);
+    for (const r of allResponses) {
+      console.error(`[zai-web-v2] FINAL: ${r.method} ${r.url} -> ${r.status}`);
     }
 
-    if (!chatId) {
-      return {
-        status: 502,
-        headers: {},
-        body: "chats/new returned no chat id",
-        contentType: "text/plain",
-      };
-    }
-
-    // Step 2: Direct HTTP fetch to /api/chat/completions for the SSE stream.
-    const token = this.currentToken;
-    if (!token) {
-      return {
-        status: 401,
-        headers: {},
-        body: "no token for direct completion fetch",
-        contentType: "text/plain",
-      };
-    }
-
-    const timestamp = Date.now();
-    const requestId = randomUUID();
-    const prompt = browserPrompt(this.currentMessages);
-
-    // Resolve client/frontend versions from the browser page's loaded HTML.
-    // The v1 executor fetches the homepage and parses versions; we can extract
-    // them from the already-loaded page more efficiently.
-    let clientVersion = ZAI_DEFAULT_CLIENT_VERSION;
-    let frontendVersion = ZAI_DEFAULT_FE_VERSION;
-    try {
-      const pageVersions = await page.evaluate(() => {
-        const feMatch = document.documentElement.outerHTML.match(
-          /\/frontend\/(prod-fe-\d+(?:\.\d+)*)\/assets\//
-        );
-        const feVersion = feMatch?.[1] ?? null;
-        // Look for client version in script tags or meta tags
-        const scripts = Array.from(document.querySelectorAll("script"));
-        let cv: string | null = null;
-        for (const s of scripts) {
-          const text = s.textContent || "";
-          const match = text.match(/["']?version["']?\s*[:=]\s*["'](\d+\.\d+\.\d+)["']/);
-          if (match) {
-            cv = match[1];
-            break;
-          }
-        }
-        return { feVersion, cv };
-      });
-      if (pageVersions.feVersion) frontendVersion = pageVersions.feVersion;
-      if (pageVersions.cv) clientVersion = pageVersions.cv;
-      console.error(
-        `[zai-web-v2] resolved versions: fe=${frontendVersion} client=${clientVersion}`
-      );
-    } catch {
-      // Use defaults
-    }
-
-    const completionUrl = buildZaiCompletionUrl({
-      requestId,
-      timestamp,
-      token,
-      userId: "",
-      clientVersion,
-    });
-    // Note: The v1 browser transport path does NOT pass a signature.
-    // The signature is only used in the direct HTTP path. Passing a wrong
-    // signature may cause z.ai to reject the request.
-    const reqHeaders = buildZaiHeaders(token, {
-      accept: "text/event-stream",
-      frontendVersion,
-      clientVersion,
-    });
-    const reqBody = buildZaiRequestBody({
-      body: {},
-      captchaVerifyParam: "",
-      chatId,
-      clientVersion,
-      messages: this.currentMessages,
-      modelId: this.currentModel,
-      prompt,
-      userMessageId: randomUUID(),
-      enableThinking: false,
-      reasoningEffort: "high",
-      reasoningEffortSupported: false,
-      vlmConfig: { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false },
-    });
-
-    try {
-      console.error(`[zai-web-v2] completions URL: ${completionUrl.slice(0, 100)}...`);
-
-      // Execute the completions fetch from within the browser page context.
-      // This ensures the request uses the browser's cookies, origin, and
-      // session context — which a Node-side fetch lacks, causing 404.
-      // Playwright's page.evaluate accepts a single arg, so wrap in an object.
-      const result = await page.evaluate(
-        async (params: { url: string; headers: Record<string, string>; body: string }) => {
-          try {
-            const resp = await fetch(params.url, {
-              method: "POST",
-              headers: params.headers,
-              body: params.body,
-              credentials: "include",
-            });
-            const text = await resp.text();
-            const respHeaders: Record<string, string> = {};
-            resp.headers.forEach((value, name) => {
-              respHeaders[name] = value;
-            });
-            return {
-              status: resp.status,
-              headers: respHeaders,
-              body: text,
-              contentType: respHeaders["content-type"] || "text/event-stream",
-            };
-          } catch (err) {
-            return {
-              status: 502,
-              headers: {} as Record<string, string>,
-              body: err instanceof Error ? err.message : "browser fetch failed",
-              contentType: "text/plain",
-            };
-          }
-        },
-        { url: completionUrl, headers: reqHeaders, body: JSON.stringify(reqBody) }
-      );
-
-      console.error(
-        `[zai-web-v2] completions: status=${result.status} bodyLen=${result.body.length} preview=${result.body.slice(0, 200)}`
-      );
-      return result;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "browser completion fetch failed";
-      console.error(`[zai-web-v2] completions failed: ${message}`);
-      return { status: 502, headers: {}, body: message, contentType: "text/plain" };
-    }
+    // Return a placeholder error for now — we're in discovery mode
+    return {
+      status: 502,
+      headers: {},
+      body: "Endpoint discovery mode — check logs for z.ai current API endpoints",
+      contentType: "text/plain",
+    };
   }
 
   async parseResponse(raw: WebCookieRawResponse): Promise<WebCookieParsedResponse> {
