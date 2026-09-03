@@ -201,25 +201,47 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const submit = page.locator(SUBMIT_SELECTOR).first();
     const input = page.locator(INPUT_SELECTOR).first();
 
+    // Diagnostic: check the current state of the input and submit button
+    const inputCount = await input.count();
+    const submitCount = await submit.count();
+    const inputValue =
+      inputCount > 0
+        ? await input.evaluate((el) => (el as HTMLTextAreaElement).value).catch(() => "<error>")
+        : "<no input>";
+    console.error(
+      `[zai-web-v2] submit diag: inputCount=${inputCount} submitCount=${submitCount} inputValueLen=${typeof inputValue === "string" ? inputValue.length : 0} preview=${typeof inputValue === "string" ? inputValue.slice(0, 50) : ""}`
+    );
+
     // Try clicking the submit button first
     let submitted = false;
-    if ((await submit.count()) > 0) {
+    if (submitCount > 0) {
       try {
         await submit.click({ timeout: 5_000 });
         submitted = true;
+        console.error(`[zai-web-v2] submit: clicked button`);
       } catch {
         // Click failed — try evaluate-based click
         try {
           await submit.evaluate((el) => (el as HTMLElement).click());
           submitted = true;
+          console.error(`[zai-web-v2] submit: evaluate-clicked button`);
         } catch {
-          // Fall through to Enter key
+          console.error(`[zai-web-v2] submit: button click failed, trying Enter`);
         }
       }
     }
 
     if (!submitted) {
       // Focus the input and press Enter
+      await input.click().catch(() => {});
+      await page.keyboard.press("Enter");
+      console.error(`[zai-web-v2] submit: pressed Enter`);
+    }
+
+    // Also try pressing Enter in the input as a fallback if no response after 5s
+    await page.waitForTimeout(5000);
+    if (!capturedResponse) {
+      console.error(`[zai-web-v2] no response after 5s, trying Enter fallback`);
       await input.click().catch(() => {});
       await page.keyboard.press("Enter");
     }
