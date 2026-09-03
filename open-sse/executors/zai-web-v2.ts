@@ -23,12 +23,7 @@ import type { ProviderCredentials, ExecuteInput } from "../base.ts";
 import {
   browserModelName,
   browserPrompt,
-  buildZaiNewChatBody,
-  buildZaiRequestBody,
-  resolveZaiCaptchaVerifyParam,
   ZAI_BASE_URL,
-  ZAI_DEFAULT_CLIENT_VERSION,
-  ZAI_DEFAULT_FE_VERSION,
   ZAI_DEFAULT_MODEL,
   ZAI_USER_AGENT,
 } from "./zai-web/protocol.ts";
@@ -132,14 +127,17 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
   }
 
   /**
-   * No-op prompt fill. The prompt is sent directly via the API request body
-   * in submitAndCapture, not through the UI textarea.
+   * Fill the prompt using keyboard.type() to ensure Svelte reactivity.
+   * The evaluate-based approach sets textarea.value but doesn't trigger
+   * Svelte's bind:value, so the submit button stays disabled.
    */
-  async fillPrompt(
-    _page: Page,
-    _messages: Array<{ role: string; content: unknown }>
-  ): Promise<void> {
-    // Intentionally empty — prompt is sent via API, not UI.
+  async fillPrompt(page: Page, messages: Array<{ role: string; content: unknown }>): Promise<void> {
+    const prompt = browserPrompt(messages);
+    const input = page.locator(INPUT_SELECTOR).first();
+    await input.waitFor({ state: "visible", timeout: 15_000 });
+    await input.click();
+    await page.keyboard.type(prompt, { delay: 5 });
+    await page.waitForTimeout(500);
   }
 
   /**
@@ -154,230 +152,91 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
    * multiple path variants to find the working one.
    */
   async submitAndCapture(page: Page): Promise<WebCookieRawResponse> {
-    const token = this.currentToken;
-    if (!token) {
-      return {
-        status: 401,
-        headers: {},
-        body: "no token for z.ai completion",
-        contentType: "text/plain",
-      };
-    }
+    // Set up a response listener to capture the completions SSE response.
+    // Z.ai's frontend sends the completions request with a CAPTCHA proof
+    // that we can't generate ourselves. By using the browser UI to submit,
+    // the frontend handles CAPTCHA naturally.
+    let capturedResponse: {
+      status: number;
+      headers: Record<string, string>;
+      body: string;
+      contentType: string;
+    } | null = null;
 
-    const modelId = this.currentModel || ZAI_DEFAULT_MODEL;
-    const prompt = browserPrompt(this.currentMessages);
-    const messages = this.currentMessages;
-
-    // Resolve captcha_verify_param from credentials. Z.ai now requires this
-    // for completions; without it, the response is FRONTEND_CAPTCHA_REQUIRED.
-    const captchaVerifyParam = this.currentCredentials
-      ? resolveZaiCaptchaVerifyParam(this.currentCredentials, {})
-      : "";
-
-    // Also try to extract captcha_verify_param from the browser's cookies.
-    let browserCaptchaParam = "";
-    try {
-      const cookies = await page.context().cookies(ZAI_BASE_URL);
-      const captchaCookie = cookies.find((c) => c.name === "captcha_verify_param");
-      if (captchaCookie) browserCaptchaParam = captchaCookie.value;
-    } catch {
-      // Ignore
-    }
-    const finalCaptchaParam = captchaVerifyParam || browserCaptchaParam;
-    console.error(
-      `[zai-web-v2] captcha: cred=${captchaVerifyParam ? "yes" : "no"} cookie=${browserCaptchaParam ? "yes" : "no"} final=${finalCaptchaParam ? "yes" : "no"}`
-    );
-
-    // Resolve client/frontend versions from the browser page's loaded HTML.
-    // Z.ai rejects completions without X-Client-Version and X-FE-Version headers.
-    let clientVersion = ZAI_DEFAULT_CLIENT_VERSION;
-    let frontendVersion = ZAI_DEFAULT_FE_VERSION;
-    try {
-      const pageVersions = await page.evaluate(() => {
-        const feMatch = document.documentElement.outerHTML.match(
-          /\/frontend\/(prod-fe-\d+(?:\.\d+)*)\/assets\//
+    const responsePromise = page
+      .waitForResponse(
+        (r) =>
+          r.request().method() === "POST" &&
+          (r.url().includes("/api/v1/chat/completions") ||
+            r.url().includes("/api/chat/completions") ||
+            r.url().includes("/api/v2/chat/completions")),
+        { timeout: 60_000 }
+      )
+      .then(async (response) => {
+        const status = response.status();
+        const respHeaders: Record<string, string> = {};
+        response.headers().forEach((value, name) => {
+          respHeaders[name] = value;
+        });
+        // Wait for the response body to finish streaming
+        await Promise.race([
+          response.finished().then(() => undefined),
+          new Promise((resolve) => setTimeout(resolve, 30_000)),
+        ]);
+        const body = await response.text().catch(() => "");
+        const contentType = respHeaders["content-type"] || "text/event-stream";
+        console.error(
+          `[zai-web-v2] captured completions: status=${status} bodyLen=${body.length} preview=${body.slice(0, 200)}`
         );
-        const feVersion = feMatch?.[1] ?? null;
-        const scripts = Array.from(document.querySelectorAll("script"));
-        let cv: string | null = null;
-        for (const s of scripts) {
-          const text = s.textContent || "";
-          const match = text.match(/["']?version["']?\s*[:=]\s*["'](\d+\.\d+\.\d+)["']/);
-          if (match) {
-            cv = match[1];
-            break;
-          }
-        }
-        return { feVersion, cv };
+        capturedResponse = { status, headers: respHeaders, body, contentType };
+      })
+      .catch((err) => {
+        console.error(
+          `[zai-web-v2] completions capture failed: ${err instanceof Error ? err.message : String(err)}`
+        );
       });
-      if (pageVersions.feVersion) frontendVersion = pageVersions.feVersion;
-      if (pageVersions.cv) clientVersion = pageVersions.cv;
-      console.error(
-        `[zai-web-v2] resolved versions: fe=${frontendVersion} client=${clientVersion}`
-      );
-    } catch {
-      // Use defaults
+
+    // Submit the prompt via the UI. The browser's frontend will handle
+    // CAPTCHA, cookies, and session context naturally.
+    const submit = page.locator(SUBMIT_SELECTOR).first();
+    const input = page.locator(INPUT_SELECTOR).first();
+
+    // Try clicking the submit button first
+    let submitted = false;
+    if ((await submit.count()) > 0) {
+      try {
+        await submit.click({ timeout: 5_000 });
+        submitted = true;
+      } catch {
+        // Click failed — try evaluate-based click
+        try {
+          await submit.evaluate((el) => (el as HTMLElement).click());
+          submitted = true;
+        } catch {
+          // Fall through to Enter key
+        }
+      }
     }
 
-    // Build the proper chats/new body using the v1 protocol helper.
-    // Z.ai expects a complex chat object with history, messages, models, etc.
-    const { userMessageId, payload: newChatPayload } = buildZaiNewChatBody(
-      messages,
-      modelId,
-      false,
-      "high",
-      { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false }
-    );
+    if (!submitted) {
+      // Focus the input and press Enter
+      await input.click().catch(() => {});
+      await page.keyboard.press("Enter");
+    }
 
-    // Build the completions request body using the v1 protocol helper.
-    // This includes foldMessages, proper model ID, version, features, etc.
-    const completionsBody = buildZaiRequestBody({
-      body: {},
-      captchaVerifyParam: finalCaptchaParam,
-      chatId: "", // Will be set inside page.evaluate after chats/new
-      clientVersion,
-      messages,
-      modelId,
-      prompt,
-      userMessageId,
-      enableThinking: false,
-      reasoningEffort: "high",
-      reasoningEffortSupported: false,
-      vlmConfig: { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false },
-    });
+    // Wait for the completions response
+    await responsePromise;
 
-    // Execute the entire two-step flow from within the browser page context.
-    // This uses the browser's cookies, origin, and localStorage token.
-    const result = await page.evaluate(
-      async (params: {
-        baseUrl: string;
-        token: string;
-        newChatPayload: Record<string, unknown>;
-        completionsBody: Record<string, unknown>;
-        frontendVersion: string;
-        clientVersion: string;
-      }) => {
-        const { baseUrl, token, newChatPayload, completionsBody, frontendVersion, clientVersion } =
-          params;
+    if (capturedResponse) {
+      return capturedResponse;
+    }
 
-        // Step 1: Create a new chat with the proper body structure
-        let chatId = "";
-        try {
-          const newChatResp = await fetch(`${baseUrl}/api/v1/chats/new`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${token}`,
-              "X-FE-Version": frontendVersion,
-              "X-Client-Version": clientVersion,
-            },
-            body: JSON.stringify(newChatPayload),
-            credentials: "include",
-          });
-          const newChatText = await newChatResp.text();
-          if (newChatResp.ok && newChatText.trim().startsWith("{")) {
-            const chatData = JSON.parse(newChatText);
-            chatId = typeof chatData?.id === "string" ? chatData.id : "";
-          }
-        } catch (err) {
-          return {
-            status: 502,
-            headers: {} as Record<string, string>,
-            body: `chats/new failed: ${err instanceof Error ? err.message : String(err)}`,
-            contentType: "text/plain",
-          };
-        }
-
-        if (!chatId) {
-          return {
-            status: 502,
-            headers: {} as Record<string, string>,
-            body: "chats/new returned no chat id",
-            contentType: "text/plain",
-          };
-        }
-
-        // Step 2: Try multiple completions endpoint variants.
-        // Z.ai has changed this endpoint multiple times.
-        const endpoints = [
-          `${baseUrl}/api/v1/chat/completions`,
-          `${baseUrl}/api/chat/completions`,
-          `${baseUrl}/api/v2/chat/completions`,
-        ];
-
-        // Use the pre-built completions body from buildZaiRequestBody,
-        // just set the chat_id from the newly created chat.
-        const reqBody = { ...completionsBody, chat_id: chatId };
-
-        let lastError = "";
-        for (const endpoint of endpoints) {
-          try {
-            const resp = await fetch(endpoint, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Accept: "text/event-stream",
-                Authorization: `Bearer ${token}`,
-                "X-FE-Version": frontendVersion,
-                "X-Client-Version": clientVersion,
-              },
-              body: JSON.stringify(reqBody),
-              credentials: "include",
-            });
-            const text = await resp.text();
-            const respHeaders: Record<string, string> = {};
-            resp.headers.forEach((value, name) => {
-              respHeaders[name] = value;
-            });
-
-            if (resp.ok) {
-              return {
-                status: resp.status,
-                headers: respHeaders,
-                body: text,
-                contentType: respHeaders["content-type"] || "text/event-stream",
-              };
-            }
-
-            // If we get a non-404 error, it means the endpoint exists but
-            // rejected our request — return that error rather than trying
-            // other endpoints.
-            if (resp.status !== 404) {
-              return {
-                status: resp.status,
-                headers: respHeaders,
-                body: text,
-                contentType: respHeaders["content-type"] || "application/json",
-              };
-            }
-
-            lastError = `${endpoint} -> ${resp.status}: ${text.slice(0, 100)}`;
-          } catch (err) {
-            lastError = `${endpoint} fetch failed: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        }
-
-        return {
-          status: 404,
-          headers: {} as Record<string, string>,
-          body: `All completions endpoints returned 404. Last: ${lastError}`,
-          contentType: "text/plain",
-        };
-      },
-      {
-        baseUrl: ZAI_BASE_URL,
-        token,
-        newChatPayload,
-        completionsBody,
-        frontendVersion,
-        clientVersion,
-      }
-    );
-
-    console.error(
-      `[zai-web-v2] completions: status=${result.status} bodyLen=${result.body.length} preview=${result.body.slice(0, 200)}`
-    );
-    return result;
+    return {
+      status: 502,
+      headers: {},
+      body: "No completions response captured — the browser may not have sent the message",
+      contentType: "text/plain",
+    };
   }
 
   async parseResponse(raw: WebCookieRawResponse): Promise<WebCookieParsedResponse> {
