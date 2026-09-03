@@ -102,20 +102,34 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const prompt = browserPrompt(messages);
     const input = page.locator(INPUT_SELECTOR).first();
     await input.waitFor({ state: "visible", timeout: 10_000 });
-    await input.click();
-    await page.keyboard.type(prompt, { delay: 5 });
+    // Use evaluate mode to set the textarea value and dispatch Svelte-reactive
+    // input/change events. keyboard.type() is slow for long prompts and may
+    // not trigger Svelte's reactivity properly, leaving the submit button
+    // disabled. This matches the v1 executor's fillMode: "evaluate".
+    try {
+      await input.evaluate((el, text) => {
+        const textarea = el as HTMLTextAreaElement;
+        textarea.value = text;
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+      }, prompt);
+    } catch {
+      await input.fill(prompt);
+    }
   }
 
   async submitAndCapture(page: Page): Promise<WebCookieRawResponse> {
     const submit = page.locator(SUBMIT_SELECTOR).first();
-    await submit.waitFor({ state: "visible", timeout: 10_000 });
+    await submit.waitFor({ state: "visible", timeout: 15_000 });
 
     const responsePromise = page.waitForResponse(
       (r) => r.url().includes("/api/chat/completions") || r.url().includes("/api/v1/chats/new"),
       { timeout: 30_000 }
     );
 
-    await submit.click();
+    // Use evaluate-based click to avoid coordinate interception by the
+    // landing-page hero animation overlay (matches v1 submitButtonMode: "dom").
+    await submit.evaluate((el) => (el as HTMLElement).click());
 
     let response: Awaited<typeof responsePromise>;
     try {
