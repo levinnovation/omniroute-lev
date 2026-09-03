@@ -25,6 +25,8 @@ import {
   browserPrompt,
   buildZaiNewChatBody,
   ZAI_BASE_URL,
+  ZAI_DEFAULT_CLIENT_VERSION,
+  ZAI_DEFAULT_FE_VERSION,
   ZAI_DEFAULT_MODEL,
   ZAI_USER_AGENT,
 } from "./zai-web/protocol.ts";
@@ -163,6 +165,37 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const prompt = browserPrompt(this.currentMessages);
     const messages = this.currentMessages;
 
+    // Resolve client/frontend versions from the browser page's loaded HTML.
+    // Z.ai rejects completions without X-Client-Version and X-FE-Version headers.
+    let clientVersion = ZAI_DEFAULT_CLIENT_VERSION;
+    let frontendVersion = ZAI_DEFAULT_FE_VERSION;
+    try {
+      const pageVersions = await page.evaluate(() => {
+        const feMatch = document.documentElement.outerHTML.match(
+          /\/frontend\/(prod-fe-\d+(?:\.\d+)*)\/assets\//
+        );
+        const feVersion = feMatch?.[1] ?? null;
+        const scripts = Array.from(document.querySelectorAll("script"));
+        let cv: string | null = null;
+        for (const s of scripts) {
+          const text = s.textContent || "";
+          const match = text.match(/["']?version["']?\s*[:=]\s*["'](\d+\.\d+\.\d+)["']/);
+          if (match) {
+            cv = match[1];
+            break;
+          }
+        }
+        return { feVersion, cv };
+      });
+      if (pageVersions.feVersion) frontendVersion = pageVersions.feVersion;
+      if (pageVersions.cv) clientVersion = pageVersions.cv;
+      console.error(
+        `[zai-web-v2] resolved versions: fe=${frontendVersion} client=${clientVersion}`
+      );
+    } catch {
+      // Use defaults
+    }
+
     // Build the proper chats/new body using the v1 protocol helper.
     // Z.ai expects a complex chat object with history, messages, models, etc.
     const { userMessageId, payload: newChatPayload } = buildZaiNewChatBody(
@@ -183,8 +216,19 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         prompt: string;
         newChatPayload: Record<string, unknown>;
         userMessageId: string;
+        frontendVersion: string;
+        clientVersion: string;
       }) => {
-        const { baseUrl, token, model, prompt, newChatPayload, userMessageId } = params;
+        const {
+          baseUrl,
+          token,
+          model,
+          prompt,
+          newChatPayload,
+          userMessageId,
+          frontendVersion,
+          clientVersion,
+        } = params;
 
         // Step 1: Create a new chat with the proper body structure
         let chatId = "";
@@ -194,6 +238,8 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
             headers: {
               "Content-Type": "application/json",
               Authorization: `Bearer ${token}`,
+              "X-FE-Version": frontendVersion,
+              "X-Client-Version": clientVersion,
             },
             body: JSON.stringify(newChatPayload),
             credentials: "include",
@@ -232,6 +278,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         const reqBody = {
           stream: true,
           model,
+          version: clientVersion,
           messages: [],
           chat_id: chatId,
           id: crypto.randomUUID(),
@@ -268,6 +315,8 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
                 "Content-Type": "application/json",
                 Accept: "text/event-stream",
                 Authorization: `Bearer ${token}`,
+                "X-FE-Version": frontendVersion,
+                "X-Client-Version": clientVersion,
               },
               body: JSON.stringify(reqBody),
               credentials: "include",
@@ -319,6 +368,8 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         prompt,
         newChatPayload,
         userMessageId,
+        frontendVersion,
+        clientVersion,
       }
     );
 
