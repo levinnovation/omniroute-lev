@@ -85,6 +85,11 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
 
   async selectModel(page: Page, model: string): Promise<void> {
     const modelName = browserModelName(model || ZAI_DEFAULT_MODEL);
+    // Wait for the SPA to render the chat UI before trying to interact.
+    // The base class navigates with waitUntil:"domcontentloaded" which fires
+    // before the Svelte app hydrates and renders the model selector.
+    await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+    await page.locator(INPUT_SELECTOR).first().waitFor({ state: "visible", timeout: 15_000 });
     await configureZaiBrowserRequest(page, {
       modelId: model || ZAI_DEFAULT_MODEL,
       thinking: { enabled: false, supported: false, effortSupported: false, effort: "high" },
