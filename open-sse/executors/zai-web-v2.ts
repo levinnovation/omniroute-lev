@@ -25,6 +25,7 @@ import {
   browserPrompt,
   buildZaiNewChatBody,
   buildZaiRequestBody,
+  resolveZaiCaptchaVerifyParam,
   ZAI_BASE_URL,
   ZAI_DEFAULT_CLIENT_VERSION,
   ZAI_DEFAULT_FE_VERSION,
@@ -46,6 +47,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
   private currentModel = "";
   private currentMessages: Array<{ role: string; content: unknown }> = [];
   private currentSignal: AbortSignal | null = null;
+  private currentCredentials: ProviderCredentials | null = null;
 
   constructor() {
     super(
@@ -81,6 +83,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     this.currentToken = String(
       input.credentials?.apiKey ?? input.credentials?.accessToken ?? ""
     ).trim();
+    this.currentCredentials = input.credentials ?? null;
     this.currentModel = input.model || ZAI_DEFAULT_MODEL;
     this.currentMessages =
       ((input.body as Record<string, unknown> | null)?.messages as Array<{
@@ -165,6 +168,26 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const prompt = browserPrompt(this.currentMessages);
     const messages = this.currentMessages;
 
+    // Resolve captcha_verify_param from credentials. Z.ai now requires this
+    // for completions; without it, the response is FRONTEND_CAPTCHA_REQUIRED.
+    const captchaVerifyParam = this.currentCredentials
+      ? resolveZaiCaptchaVerifyParam(this.currentCredentials, {})
+      : "";
+
+    // Also try to extract captcha_verify_param from the browser's cookies.
+    let browserCaptchaParam = "";
+    try {
+      const cookies = await page.context().cookies(ZAI_BASE_URL);
+      const captchaCookie = cookies.find((c) => c.name === "captcha_verify_param");
+      if (captchaCookie) browserCaptchaParam = captchaCookie.value;
+    } catch {
+      // Ignore
+    }
+    const finalCaptchaParam = captchaVerifyParam || browserCaptchaParam;
+    console.error(
+      `[zai-web-v2] captcha: cred=${captchaVerifyParam ? "yes" : "no"} cookie=${browserCaptchaParam ? "yes" : "no"} final=${finalCaptchaParam ? "yes" : "no"}`
+    );
+
     // Resolve client/frontend versions from the browser page's loaded HTML.
     // Z.ai rejects completions without X-Client-Version and X-FE-Version headers.
     let clientVersion = ZAI_DEFAULT_CLIENT_VERSION;
@@ -210,7 +233,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     // This includes foldMessages, proper model ID, version, features, etc.
     const completionsBody = buildZaiRequestBody({
       body: {},
-      captchaVerifyParam: "",
+      captchaVerifyParam: finalCaptchaParam,
       chatId: "", // Will be set inside page.evaluate after chats/new
       clientVersion,
       messages,
