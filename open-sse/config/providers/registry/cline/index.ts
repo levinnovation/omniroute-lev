@@ -36,6 +36,15 @@ export const clineProvider: RegistryEntry = {
       maxOutputTokens: 128000,
     },
     {
+      id: "z-ai/glm-5.3-flash",
+      name: "GLM 5.3 Flash",
+      toolCalling: true,
+      supportsReasoning: true,
+      contextLength: 1040000,
+      maxInputTokens: 1040000,
+      maxOutputTokens: 128000,
+    },
+    {
       id: "x-ai/grok-4.5",
       name: "Grok 4.5",
       toolCalling: true,
