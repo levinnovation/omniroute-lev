@@ -13,7 +13,6 @@ import {
 } from "./base/WebCookieExecutorBase.ts";
 import type { BrowserPoolContextOptions } from "../services/browserPool.ts";
 import type { ProviderCredentials } from "../base.ts";
-import { getProviderUrl } from "../config/providerVersions.ts";
 import {
   browserModelName,
   browserPrompt,
@@ -58,7 +57,12 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
   }
 
   getProviderUrl(): string {
-    return getProviderUrl("zai-web");
+    // Navigate to the chat page with a model query param, not the bare root.
+    // The bare root (https://chat.z.ai) matches loginRedirectPatterns and
+    // causes validateSession() to falsely report a login wall even when the
+    // token is valid. The v1 executor navigates to /?model=... for the same
+    // reason.
+    return `${ZAI_BASE_URL}/?model=${encodeURIComponent(browserModelName(ZAI_DEFAULT_MODEL))}`;
   }
 
   /**
