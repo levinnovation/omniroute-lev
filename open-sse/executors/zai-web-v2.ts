@@ -174,10 +174,13 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       )
       .then(async (response) => {
         const status = response.status();
+        // Playwright's response.headers() returns a plain object, not a Headers
+        // object with .forEach(). Use Object.entries instead.
         const respHeaders: Record<string, string> = {};
-        response.headers().forEach((value, name) => {
+        const headersObj = response.headers();
+        for (const [name, value] of Object.entries(headersObj)) {
           respHeaders[name] = value;
-        });
+        }
         // Wait for the response body to finish streaming
         await Promise.race([
           response.finished().then(() => undefined),
@@ -198,33 +201,51 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
 
     // Submit the prompt via the UI. The browser's frontend will handle
     // CAPTCHA, cookies, and session context naturally.
-    const submit = page.locator(SUBMIT_SELECTOR).first();
+    // Try multiple submit methods: button click, Enter, Ctrl+Enter
+    const submitSelectors = [
+      SUBMIT_SELECTOR,
+      'button[type="submit"]',
+      'button[aria-label*="Send"]',
+      'button[data-testid*="submit"]',
+      "button.send-btn",
+      "form button:not([disabled])",
+    ];
     const input = page.locator(INPUT_SELECTOR).first();
 
     // Diagnostic: check the current state of the input and submit button
     const inputCount = await input.count();
-    const submitCount = await submit.count();
+    let submitCount = 0;
+    let matchedSelector = "";
+    for (const sel of submitSelectors) {
+      const count = await page.locator(sel).count();
+      if (count > 0) {
+        submitCount = count;
+        matchedSelector = sel;
+        break;
+      }
+    }
     const inputValue =
       inputCount > 0
         ? await input.evaluate((el) => (el as HTMLTextAreaElement).value).catch(() => "<error>")
         : "<no input>";
     console.error(
-      `[zai-web-v2] submit diag: inputCount=${inputCount} submitCount=${submitCount} inputValueLen=${typeof inputValue === "string" ? inputValue.length : 0} preview=${typeof inputValue === "string" ? inputValue.slice(0, 50) : ""}`
+      `[zai-web-v2] submit diag: inputCount=${inputCount} submitCount=${submitCount} matchedSel=${matchedSelector || "none"} inputValueLen=${typeof inputValue === "string" ? inputValue.length : 0} preview=${typeof inputValue === "string" ? inputValue.slice(0, 50) : ""}`
     );
 
     // Try clicking the submit button first
     let submitted = false;
-    if (submitCount > 0) {
+    if (submitCount > 0 && matchedSelector) {
+      const submit = page.locator(matchedSelector).first();
       try {
         await submit.click({ timeout: 5_000 });
         submitted = true;
-        console.error(`[zai-web-v2] submit: clicked button`);
+        console.error(`[zai-web-v2] submit: clicked button (${matchedSelector})`);
       } catch {
         // Click failed — try evaluate-based click
         try {
           await submit.evaluate((el) => (el as HTMLElement).click());
           submitted = true;
-          console.error(`[zai-web-v2] submit: evaluate-clicked button`);
+          console.error(`[zai-web-v2] submit: evaluate-clicked button (${matchedSelector})`);
         } catch {
           console.error(`[zai-web-v2] submit: button click failed, trying Enter`);
         }
@@ -238,10 +259,17 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       console.error(`[zai-web-v2] submit: pressed Enter`);
     }
 
-    // Also try pressing Enter in the input as a fallback if no response after 5s
+    // Also try Ctrl+Enter and Enter again as fallbacks if no response after 5s
     await page.waitForTimeout(5000);
     if (!capturedResponse) {
-      console.error(`[zai-web-v2] no response after 5s, trying Enter fallback`);
+      console.error(`[zai-web-v2] no response after 5s, trying Ctrl+Enter fallback`);
+      await input.click().catch(() => {});
+      await page.keyboard.press("Control+Enter");
+    }
+
+    await page.waitForTimeout(5000);
+    if (!capturedResponse) {
+      console.error(`[zai-web-v2] no response after 10s, trying Enter again`);
       await input.click().catch(() => {});
       await page.keyboard.press("Enter");
     }
