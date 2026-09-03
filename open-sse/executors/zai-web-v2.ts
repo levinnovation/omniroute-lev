@@ -253,6 +253,10 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     });
 
     try {
+      console.error(`[zai-web-v2] completions URL: ${completionUrl.slice(0, 100)}...`);
+      console.error(
+        `[zai-web-v2] completions headers: ${JSON.stringify(Object.fromEntries(Object.entries(reqHeaders).map(([k, v]) => [k, k.toLowerCase().includes("auth") ? "[REDACTED]" : v])))}`
+      );
       const streamResponse = await fetch(completionUrl, {
         method: "POST",
         headers: reqHeaders,
