@@ -226,26 +226,60 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const timestamp = Date.now();
     const requestId = randomUUID();
     const prompt = browserPrompt(this.currentMessages);
+
+    // Resolve client/frontend versions from the browser page's loaded HTML.
+    // The v1 executor fetches the homepage and parses versions; we can extract
+    // them from the already-loaded page more efficiently.
+    let clientVersion = ZAI_DEFAULT_CLIENT_VERSION;
+    let frontendVersion = ZAI_DEFAULT_FE_VERSION;
+    try {
+      const pageVersions = await page.evaluate(() => {
+        const feMatch = document.documentElement.outerHTML.match(
+          /\/frontend\/(prod-fe-\d+(?:\.\d+)*)\/assets\//
+        );
+        const feVersion = feMatch?.[1] ?? null;
+        // Look for client version in script tags or meta tags
+        const scripts = Array.from(document.querySelectorAll("script"));
+        let cv: string | null = null;
+        for (const s of scripts) {
+          const text = s.textContent || "";
+          const match = text.match(/["']?version["']?\s*[:=]\s*["'](\d+\.\d+\.\d+)["']/);
+          if (match) {
+            cv = match[1];
+            break;
+          }
+        }
+        return { feVersion, cv };
+      });
+      if (pageVersions.feVersion) frontendVersion = pageVersions.feVersion;
+      if (pageVersions.cv) clientVersion = pageVersions.cv;
+      console.error(
+        `[zai-web-v2] resolved versions: fe=${frontendVersion} client=${clientVersion}`
+      );
+    } catch {
+      // Use defaults
+    }
+
     const completionUrl = buildZaiCompletionUrl({
       requestId,
       timestamp,
       token,
       userId: "",
-      clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
+      clientVersion,
     });
     // Note: The v1 browser transport path does NOT pass a signature.
     // The signature is only used in the direct HTTP path. Passing a wrong
     // signature may cause z.ai to reject the request.
     const reqHeaders = buildZaiHeaders(token, {
       accept: "text/event-stream",
-      frontendVersion: ZAI_DEFAULT_FE_VERSION,
-      clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
+      frontendVersion,
+      clientVersion,
     });
     const reqBody = buildZaiRequestBody({
       body: {},
       captchaVerifyParam: "",
       chatId,
-      clientVersion: ZAI_DEFAULT_CLIENT_VERSION,
+      clientVersion,
       messages: this.currentMessages,
       modelId: this.currentModel,
       prompt,
