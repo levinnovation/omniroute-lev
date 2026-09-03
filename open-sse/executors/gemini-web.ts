@@ -794,34 +794,27 @@ export class GeminiWebExecutor extends BaseExecutor {
       };
     }
 
-    let browser: any = null;
-    let abortBrowser: (() => void) | null = null;
+    let pooled: import("playwright").BrowserContext | null = null;
+    let page: import("playwright").Page | null = null;
     try {
       if (signal?.aborted) {
         throw signal.reason instanceof Error ? signal.reason : new Error("Request aborted");
       }
-      const { chromium } = await import("playwright");
-      browser = await chromium.launch({ headless: true });
-      abortBrowser = () => {
-        void browser?.close().catch(() => {});
-      };
-      signal?.addEventListener("abort", abortBrowser, { once: true });
+      // LEV fork: Use the shared browser pool instead of launching a local
+      // browser. The local chromium.launch() doesn't work on Railway (no
+      // local Chromium installed — the Dockerfile uses Browserless sidecar).
+      // The shared pool connects to Browserless via CDP and handles
+      // reconnection, retry, and context reuse.
+      const poolKey = `gemini-web-fb:${cookie.slice(0, 24)}`;
+      const pooledCtx = await acquireBrowserContext(poolKey, {
+        cookieDomain: ".google.com",
+        cookieString: cookie,
+        warmupUrl: GEMINI_URL,
+        userAgent: GEMINI_USER_AGENT,
+      });
+      pooled = pooledCtx.context;
 
-      const context = await browser.newContext({ userAgent: GEMINI_USER_AGENT });
-
-      // Parse cookies — strips attributes like Path, Domain, Expires
-      const cookiePairs = parseCookies(cookie);
-      await context.addCookies(
-        cookiePairs.map(({ name, value }) => ({
-          name,
-          value,
-          domain: ".google.com",
-          path: "/",
-          secure: true,
-        }))
-      );
-
-      const page = await context.newPage();
+      page = await openPage(pooledCtx);
 
       // #10466: image mode — the /v1/images/generations handler sets
       // x_gemini_web_image_mode. Generated images arrive in the candidate's
@@ -922,7 +915,7 @@ export class GeminiWebExecutor extends BaseExecutor {
       // no text, so the empty-text 502 below must not fire when images
       // were captured.
       if (imageMode) {
-        await this.persistRotatedCookies(context, cookie, credentials, onCredentialsRefreshed, log);
+        await this.persistRotatedCookies(pooled!, cookie, credentials, onCredentialsRefreshed, log);
         const modelId = model || "gemini-2.5-pro";
         return {
           response: new Response(
@@ -950,7 +943,7 @@ export class GeminiWebExecutor extends BaseExecutor {
         };
       }
 
-      await this.persistRotatedCookies(context, cookie, credentials, onCredentialsRefreshed, log);
+      await this.persistRotatedCookies(pooled!, cookie, credentials, onCredentialsRefreshed, log);
 
       const modelId = model || "gemini-2.5-pro";
 
@@ -1030,11 +1023,12 @@ export class GeminiWebExecutor extends BaseExecutor {
       // Return null to allow browser automation fallback for unexpected errors
       return null;
     } finally {
-      if (abortBrowser) signal?.removeEventListener("abort", abortBrowser);
-      // Always close browser to prevent resource leaks
-      if (browser) {
+      // LEV fork: Only close the page — the pool manages the context lifecycle.
+      // Closing the browser (as the old code did) would kill all other pooled
+      // contexts for other providers.
+      if (page) {
         try {
-          await browser.close();
+          await page.close();
         } catch {
           /* ignore close errors */
         }

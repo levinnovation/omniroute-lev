@@ -100,6 +100,15 @@ const EVICT_INTERVAL_MS = 60 * 1000; // check every 60s
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
+// LEV fork: Reconnection and retry constants.
+// The browser pool caches the Browserless CDP connection, but Browserless
+// times out sessions (120-300s). When the WebSocket disconnects, the cached
+// browser becomes a dead reference. These constants control the auto-reconnect
+// and retry behavior that prevents "Target page, context or browser has been
+// closed" errors.
+const MAX_CONTEXT_RETRIES = 2;
+const CONTEXT_RETRY_DELAY_MS = 500;
+
 const state: PoolState = {
   browser: null,
   contexts: new Map(),
@@ -112,6 +121,47 @@ const state: PoolState = {
   cloakLaunchResolved: false,
   metrics: createBrowserPoolMetrics(),
 };
+
+// LEV fork: Clear all stale state when the browser disconnects. The browser
+// reference is dead, so all contexts (which are children of the browser) are
+// also dead. Pending context creations will reject on their own.
+function clearStaleBrowserState(): void {
+  console.log("[BrowserPool] Clearing stale browser state — browser disconnected or closed");
+  state.browser = null;
+  state.contexts.clear();
+  state.pendingContexts.clear();
+  state.launching = null;
+}
+
+// LEV fork: Check if the cached browser is still connected. Playwright's
+// Browser.isConnected() returns false after the CDP WebSocket disconnects
+// (Browserless timeout, network issue, or explicit close).
+function isBrowserAlive(): boolean {
+  if (!state.browser) return false;
+  try {
+    return state.browser.isConnected();
+  } catch {
+    // isConnected() can throw if the browser object is in a bad state
+    return false;
+  }
+}
+
+// LEV fork: Classify context-creation errors to decide retry strategy.
+// "Target closed" → browser died, force reconnect.
+// "429"/"queue"/"concurrent" → Browserless capacity, retry with backoff.
+function classifyContextError(err: unknown): "target-closed" | "queue-full" | "other" {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes("Target") && msg.includes("closed")) return "target-closed";
+  if (
+    msg.includes("429") ||
+    msg.includes("queue") ||
+    msg.includes("concurrent") ||
+    msg.includes("capacity")
+  ) {
+    return "queue-full";
+  }
+  return "other";
+}
 
 // LEV fork: Replace cloakbrowser (obfuscated dynamic import, off-lockfile) with
 // patchright — a drop-in Playwright replacement with built-in stealth patches.
@@ -145,6 +195,10 @@ async function connectBrowserless(): Promise<Browser | null> {
       stealthLaunch !== null
         ? (await import("patchright")).chromium
         : (await import("playwright")).chromium;
+    console.log(
+      "[BrowserPool] Connecting to Browserless sidecar via CDP:",
+      wsUrl.replace(/\?token=.*/, "?token=***")
+    );
     const browser = await chromium.connectOverCDP(wsUrl);
     console.log("[BrowserPool] Connected to Browserless sidecar via CDP");
     return browser as Browser;
@@ -249,7 +303,16 @@ export async function resolveBrowserContextProxy(
 }
 
 async function launchBrowser(): Promise<Browser> {
-  if (state.browser) return state.browser;
+  // LEV fork: Check if the cached browser is still connected before reusing
+  // it. Browserless times out sessions (120-300s), and the CDP WebSocket
+  // disconnects silently. Without this check, the pool returns a dead browser
+  // reference, causing "Target page, context or browser has been closed" on
+  // the next newContext() call.
+  if (state.browser) {
+    if (isBrowserAlive()) return state.browser;
+    console.log("[BrowserPool] Cached browser is disconnected — reconnecting");
+    clearStaleBrowserState();
+  }
   if (state.launching) return state.launching;
   state.launching = (async () => {
     // LEV fork: Try Browserless sidecar via CDP first, fall back to local launch.
@@ -275,6 +338,15 @@ async function launchBrowser(): Promise<Browser> {
         });
       }
     }
+    // LEV fork: Wire the disconnected event so we auto-clear the stale
+    // reference. This fires when Browserless times out the session, when the
+    // network drops, or when the browser crashes. Without this, the pool
+    // would keep returning the dead browser until the next isConnected()
+    // check at the top of this function.
+    browser.on("disconnected", () => {
+      console.log("[BrowserPool] Browser disconnected event — clearing pool for reconnect");
+      clearStaleBrowserState();
+    });
     state.browser = browser;
     state.launching = null;
     state.metrics.browserLaunches++;
@@ -384,6 +456,14 @@ export async function acquireBrowserContext(
       "browserPool: OMNIROUTE_BROWSER_POOL=off — context requested but pool is disabled"
     );
   }
+  // LEV fork: If the cached browser is dead (Browserless timeout, network
+  // drop), clear all stale state before attempting to reuse contexts. This
+  // prevents returning a dead context that would fail on the first page
+  // operation.
+  if (state.browser && !isBrowserAlive()) {
+    console.log("[BrowserPool] Stale browser detected in acquireBrowserContext — clearing");
+    clearStaleBrowserState();
+  }
   const existing = state.contexts.get(key);
   if (existing) {
     existing.lastUsed = Date.now();
@@ -398,25 +478,56 @@ export async function acquireBrowserContext(
   if (pending) return pending;
 
   const createPromise = (async (): Promise<PooledContext> => {
-    const [browser, proxy] = await Promise.all([
-      launchBrowser(),
-      resolveBrowserContextProxy(key, options),
-    ]);
-    const isStealth = state.cloakLaunch !== null;
-    const context = await browser.newContext({
-      userAgent: options.userAgent || DEFAULT_USER_AGENT,
-      locale: options.locale || "en-US",
-      timezoneId: options.timezone || "America/New_York",
-      viewport: { width: 1280, height: 800 },
-      ...(proxy ? { proxy } : {}),
-    });
+    const proxy = await resolveBrowserContextProxy(key, options);
 
-    await seedContextSession(context, options);
+    // LEV fork: Retry context creation with backoff. The browser can die
+    // between launchBrowser() and newContext() (race with Browserless
+    // timeout), or Browserless can reject due to capacity limits.
+    let browser: Browser;
+    let context: BrowserContext;
+    for (let attempt = 0; attempt <= MAX_CONTEXT_RETRIES; attempt++) {
+      browser = await launchBrowser();
+      try {
+        context = await browser.newContext({
+          userAgent: options.userAgent || DEFAULT_USER_AGENT,
+          locale: options.locale || "en-US",
+          timezoneId: options.timezone || "America/New_York",
+          viewport: { width: 1280, height: 800 },
+          ...(proxy ? { proxy } : {}),
+        });
+        break; // Success
+      } catch (err) {
+        const errorKind = classifyContextError(err);
+        if (errorKind === "target-closed") {
+          // Browser died between launch and newContext — force reconnect
+          console.log(
+            `[BrowserPool] Context creation failed (attempt ${attempt + 1}/${MAX_CONTEXT_RETRIES + 1}): browser closed — reconnecting`
+          );
+          clearStaleBrowserState();
+          if (attempt < MAX_CONTEXT_RETRIES) continue;
+          throw err;
+        }
+        if (errorKind === "queue-full" && attempt < MAX_CONTEXT_RETRIES) {
+          // Browserless capacity — retry with backoff
+          const delay = CONTEXT_RETRY_DELAY_MS * (attempt + 1);
+          console.log(
+            `[BrowserPool] Context creation queued (attempt ${attempt + 1}/${MAX_CONTEXT_RETRIES + 1}): retrying in ${delay}ms`
+          );
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    const isStealth = state.cloakLaunch !== null;
+
+    await seedContextSession(context!, options);
 
     let warmupPage: Page | null = null;
     if (options.warmupUrl) {
       try {
-        warmupPage = await context.newPage();
+        warmupPage = await context!.newPage();
         await warmupPage.goto(options.warmupUrl, {
           waitUntil: "domcontentloaded",
           timeout: 30000,
@@ -439,8 +550,8 @@ export async function acquireBrowserContext(
     // Guard: if shutdownPool() ran while we were creating this context,
     // the browser we obtained is now closed. Close our temp context and
     // throw so the caller knows to retry.
-    if (state.browser !== browser) {
-      await context.close().catch(() => {});
+    if (state.browser !== browser!) {
+      await context!.close().catch(() => {});
       if (warmupPage) {
         await warmupPage.close().catch(() => {});
       }
@@ -449,7 +560,7 @@ export async function acquireBrowserContext(
 
     const pooled: PooledContext = {
       id: key,
-      context,
+      context: context!,
       warmupPage,
       lastUsed: Date.now(),
       isStealth,
@@ -554,6 +665,41 @@ export function getBrowserPoolMetrics(): {
 /** Test-only: reset cumulative metrics so assertions start from a clean slate. */
 export function __resetBrowserPoolMetricsForTest(): void {
   state.metrics = createBrowserPoolMetrics();
+}
+
+/** Test-only: expose internal state for reconnection tests. */
+export function __getBrowserPoolStateForTest(): {
+  browser: Browser | null;
+  contextsCount: number;
+  pendingCount: number;
+  isAlive: boolean;
+} {
+  return {
+    browser: state.browser,
+    contextsCount: state.contexts.size,
+    pendingCount: state.pendingContexts.size,
+    isAlive: isBrowserAlive(),
+  };
+}
+
+/** Test-only: simulate a browser disconnect (clears state as the event would). */
+export function __simulateBrowserDisconnectForTest(): void {
+  clearStaleBrowserState();
+}
+
+/** Test-only: set a fake browser in the pool state for testing. */
+export function __setBrowserForTest(browser: Browser | null): void {
+  state.browser = browser;
+  if (browser) {
+    browser.on("disconnected", () => {
+      clearStaleBrowserState();
+    });
+  }
+}
+
+/** Test-only: classify an error for retry strategy. */
+export function __classifyContextErrorForTest(err: unknown): string {
+  return classifyContextError(err);
 }
 
 export async function readPageResponseBody(
