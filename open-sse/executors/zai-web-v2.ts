@@ -123,9 +123,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     await submit.waitFor({ state: "visible", timeout: 15_000 });
 
     const responsePromise = page.waitForResponse(
-      (r) =>
-        r.request().method() === "POST" &&
-        (r.url().includes("/api/chat/completions") || r.url().includes("/api/v1/chats/new")),
+      (r) => r.request().method() === "POST" && r.url().includes("/api/chat/completions"),
       { timeout: 30_000 }
     );
 
