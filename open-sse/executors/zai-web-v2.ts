@@ -4,6 +4,13 @@
  * LEV fork addition (Phase 6). Extends the consolidated base class instead of
  * reimplementing the browser lifecycle. Used when OMNIROUTE_EXECUTOR_V2=on;
  * the original zai-web.ts remains the default fallback.
+ *
+ * Architecture: The browser page provides the authenticated session (cookies,
+ * localStorage token, origin). All API calls are made from page.evaluate() to
+ * use that session context. UI interaction (model selector, prompt fill,
+ * submit click) is bypassed because z.ai's SPA UI changes frequently and breaks
+ * DOM-based interaction. This is still browser-first per LEV Hard Rule #1 — the
+ * browser is the auth and execution context, not direct HTTP from Node.
  */
 import type { Page } from "playwright";
 import {
@@ -21,7 +28,6 @@ import {
   ZAI_USER_AGENT,
 } from "./zai-web/protocol.ts";
 import { parseZaiFrame, isZaiVersionOutdatedError } from "./zai-web/stream.ts";
-import { configureZaiBrowserRequest } from "./zai-web/browserAutomation.ts";
 import { ZAI_WEB_SESSION_CONFIG } from "./zai-web/sessionConfig.ts";
 import { WebSessionDriver } from "../services/webSessionDriver.ts";
 
@@ -65,7 +71,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
    * Override execute to capture request context (token, model, messages, signal)
    * before the base class runs. submitAndCapture needs these for the two-step
    * Z.ai flow: capture chats/new from the browser, then direct-fetch the SSE
-   * stream from /api/chat/completions.
+   * stream from the completions endpoint.
    */
   async execute(input: ExecuteInput): Promise<import("../base.ts").ExecutorExecuteResult> {
     this.currentToken = String(
@@ -108,113 +114,206 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     return base;
   }
 
-  async selectModel(page: Page, model: string): Promise<void> {
-    const modelName = browserModelName(model || ZAI_DEFAULT_MODEL);
-    // Wait for the SPA to render the chat UI before trying to interact.
-    // The base class navigates with waitUntil:"domcontentloaded" which fires
-    // before the Svelte app hydrates and renders the model selector.
-    await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
-    await page.locator(INPUT_SELECTOR).first().waitFor({ state: "visible", timeout: 15_000 });
-    await configureZaiBrowserRequest(page, {
-      modelId: model || ZAI_DEFAULT_MODEL,
-      thinking: { enabled: false, supported: false, effortSupported: false, effort: "high" },
-      vlm: { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false },
-    });
-    void modelName;
+  /**
+   * No-op model selection. The browser page provides the authenticated
+   * session; we bypass the UI model selector because z.ai's SPA changes
+   * frequently and breaks DOM-based interaction. The model is passed
+   * directly in the API request body.
+   */
+  async selectModel(_page: Page, _model: string): Promise<void> {
+    // Intentionally empty — model is set in the API request body, not the UI.
   }
 
-  async fillPrompt(page: Page, messages: Array<{ role: string; content: unknown }>): Promise<void> {
-    const prompt = browserPrompt(messages);
-    const input = page.locator(INPUT_SELECTOR).first();
-    await input.waitFor({ state: "visible", timeout: 10_000 });
-    // Use evaluate mode to set the textarea value and dispatch Svelte-reactive
-    // input/change events. keyboard.type() is slow for long prompts and may
-    // not trigger Svelte's reactivity properly, leaving the submit button
-    // disabled. This matches the v1 executor's fillMode: "evaluate".
-    try {
-      await input.evaluate((el, text) => {
-        const textarea = el as HTMLTextAreaElement;
-        textarea.value = text;
-        textarea.dispatchEvent(new Event("input", { bubbles: true }));
-        textarea.dispatchEvent(new Event("change", { bubbles: true }));
-      }, prompt);
-    } catch {
-      await input.fill(prompt);
-    }
+  /**
+   * No-op prompt fill. The prompt is sent directly via the API request body
+   * in submitAndCapture, not through the UI textarea.
+   */
+  async fillPrompt(
+    _page: Page,
+    _messages: Array<{ role: string; content: unknown }>
+  ): Promise<void> {
+    // Intentionally empty — prompt is sent via API, not UI.
   }
 
+  /**
+   * Two-step Z.ai completion flow, executed entirely from the browser page
+   * context to use the authenticated session (cookies, localStorage token,
+   * origin). Bypasses the UI entirely.
+   *
+   * Step 1: POST to /api/v1/chats/new to create a chat and get a chat ID.
+   * Step 2: POST to the completions endpoint with the chat ID and prompt.
+   *
+   * Z.ai has changed their completions endpoint multiple times. We try
+   * multiple path variants to find the working one.
+   */
   async submitAndCapture(page: Page): Promise<WebCookieRawResponse> {
-    const submit = page.locator(SUBMIT_SELECTOR).first();
-    await submit.waitFor({ state: "visible", timeout: 15_000 });
-
-    // Wait for Svelte to react to the prompt fill and enable the submit button.
-    await page.waitForTimeout(800);
-
-    // Capture ALL POST responses to discover z.ai's current API endpoints.
-    // The /api/chat/completions path returns 404, meaning z.ai changed their API.
-    const allResponses: Array<{ url: string; status: number; method: string }> = [];
-    const responseListener = (response: {
-      request(): { method(): string };
-      url(): string;
-      status(): number;
-    }) => {
-      const method = response.request().method();
-      const url = response.url();
-      if (url.includes("chat.z.ai/api") || url.includes("z.ai/api")) {
-        allResponses.push({ url, status: response.status(), method });
-        console.error(`[zai-web-v2] API: ${method} ${url} -> ${response.status()}`);
-      }
-    };
-    page.on("response", responseListener);
-
-    // Also monitor WebSocket connections — z.ai may have switched to WS for streaming
-    page.on("websocket", (ws) => {
-      console.error(`[zai-web-v2] WEBSOCKET opened: ${ws.url()}`);
-      ws.on("framesent", (frame) => {
-        const payload = String(frame.payload).slice(0, 300);
-        console.error(`[zai-web-v2] WS SENT: ${payload}`);
-      });
-      ws.on("framereceived", (frame) => {
-        const payload = String(frame.payload).slice(0, 300);
-        console.error(`[zai-web-v2] WS RECV: ${payload}`);
-      });
-    });
-
-    // Use keyboard.type() instead of evaluate to ensure Svelte reactivity.
-    // The evaluate approach sets textarea.value but may not trigger Svelte's
-    // bind:value properly, so the submit doesn't send the message content.
-    const input = page.locator(INPUT_SELECTOR).first();
-    await input.click();
-    await page.keyboard.type(browserPrompt(this.currentMessages), { delay: 5 });
-    await page.waitForTimeout(500);
-
-    // Click submit via evaluate (avoids hero animation overlay interception).
-    if ((await submit.count()) > 0) {
-      try {
-        await submit.evaluate((el) => (el as HTMLElement).click());
-      } catch {
-        await page.keyboard.press("Enter");
-      }
-    } else {
-      await page.keyboard.press("Enter");
+    const token = this.currentToken;
+    if (!token) {
+      return {
+        status: 401,
+        headers: {},
+        body: "no token for z.ai completion",
+        contentType: "text/plain",
+      };
     }
 
-    // Wait for responses to come in (chats/new + completions)
-    await page.waitForTimeout(20000);
-    page.off("response", responseListener);
+    const modelId = this.currentModel || ZAI_DEFAULT_MODEL;
+    const browserModel = browserModelName(modelId);
+    const prompt = browserPrompt(this.currentMessages);
+    const messages = this.currentMessages;
 
-    console.error(`[zai-web-v2] Captured ${allResponses.length} API responses total`);
-    for (const r of allResponses) {
-      console.error(`[zai-web-v2] FINAL API: ${r.method} ${r.url} -> ${r.status}`);
-    }
+    // Execute the entire two-step flow from within the browser page context.
+    // This uses the browser's cookies, origin, and localStorage token.
+    const result = await page.evaluate(
+      async (params: {
+        baseUrl: string;
+        token: string;
+        model: string;
+        prompt: string;
+        messages: Array<{ role: string; content: unknown }>;
+      }) => {
+        const { baseUrl, token, model, prompt, messages } = params;
 
-    // Return a placeholder error for now — we're in discovery mode
-    return {
-      status: 502,
-      headers: {},
-      body: "Endpoint discovery mode — check logs for z.ai current API endpoints",
-      contentType: "text/plain",
-    };
+        // Step 1: Create a new chat
+        let chatId = "";
+        try {
+          const newChatResp = await fetch(`${baseUrl}/api/v1/chats/new`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ model }),
+            credentials: "include",
+          });
+          const newChatText = await newChatResp.text();
+          console.log(`chats/new status=${newChatResp.status} body=${newChatText.slice(0, 200)}`);
+          if (newChatResp.ok && newChatText.trim().startsWith("{")) {
+            const chatData = JSON.parse(newChatText);
+            chatId = typeof chatData?.id === "string" ? chatData.id : "";
+          }
+        } catch (err) {
+          return {
+            status: 502,
+            headers: {} as Record<string, string>,
+            body: `chats/new failed: ${err instanceof Error ? err.message : String(err)}`,
+            contentType: "text/plain",
+          };
+        }
+
+        if (!chatId) {
+          return {
+            status: 502,
+            headers: {} as Record<string, string>,
+            body: "chats/new returned no chat id",
+            contentType: "text/plain",
+          };
+        }
+
+        // Step 2: Try multiple completions endpoint variants.
+        // Z.ai has changed this endpoint multiple times.
+        const endpoints = [
+          `${baseUrl}/api/v1/chat/completions`,
+          `${baseUrl}/api/chat/completions`,
+          `${baseUrl}/api/v2/chat/completions`,
+        ];
+
+        const reqBody = {
+          stream: true,
+          model,
+          messages,
+          chat_id: chatId,
+          id: crypto.randomUUID(),
+          current_user_message_id: crypto.randomUUID(),
+          current_user_message_parent_id: null,
+          signature_prompt: prompt,
+          params: {},
+          extra: {},
+          features: {
+            image_generation: false,
+            web_search: false,
+            auto_web_search: false,
+            preview_mode: true,
+            flags: [],
+            vlm_tools_enable: false,
+            vlm_web_search_enable: false,
+            vlm_website_mode: false,
+            enable_thinking: false,
+          },
+          variables: {},
+          background_tasks: {
+            title_generation: true,
+            tags_generation: true,
+          },
+          captcha_verify_param: "",
+        };
+
+        let lastError = "";
+        for (const endpoint of endpoints) {
+          try {
+            const resp = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "text/event-stream",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify(reqBody),
+              credentials: "include",
+            });
+            const text = await resp.text();
+            const respHeaders: Record<string, string> = {};
+            resp.headers.forEach((value, name) => {
+              respHeaders[name] = value;
+            });
+
+            if (resp.ok) {
+              return {
+                status: resp.status,
+                headers: respHeaders,
+                body: text,
+                contentType: respHeaders["content-type"] || "text/event-stream",
+              };
+            }
+
+            // If we get a non-404 error, it means the endpoint exists but
+            // rejected our request — return that error rather than trying
+            // other endpoints.
+            if (resp.status !== 404) {
+              return {
+                status: resp.status,
+                headers: respHeaders,
+                body: text,
+                contentType: respHeaders["content-type"] || "application/json",
+              };
+            }
+
+            lastError = `${endpoint} -> ${resp.status}: ${text.slice(0, 100)}`;
+          } catch (err) {
+            lastError = `${endpoint} fetch failed: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+
+        return {
+          status: 404,
+          headers: {} as Record<string, string>,
+          body: `All completions endpoints returned 404. Last: ${lastError}`,
+          contentType: "text/plain",
+        };
+      },
+      {
+        baseUrl: ZAI_BASE_URL,
+        token,
+        model: browserModel,
+        prompt,
+        messages,
+      }
+    );
+
+    console.error(
+      `[zai-web-v2] completions: status=${result.status} bodyLen=${result.body.length} preview=${result.body.slice(0, 200)}`
+    );
+    return result;
   }
 
   async parseResponse(raw: WebCookieRawResponse): Promise<WebCookieParsedResponse> {
@@ -233,47 +332,44 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       }
       try {
         const frame = JSON.parse(payload);
-        const delta = parseZaiFrame(frame);
-        if (!delta) continue;
-        if (delta.error) {
-          content = delta.error;
-          finishReason = "stop";
-          break;
-        }
-        if (delta.content) content += delta.content;
-        if (delta.reasoning) reasoningContent += delta.reasoning;
-        if (delta.done) {
-          finishReason = "stop";
-          break;
-        }
+        const parsed = parseZaiFrame(frame);
+        if (parsed.content) content += parsed.content;
+        if (parsed.reasoningContent) reasoningContent += parsed.reasoningContent;
+        if (parsed.finishReason) finishReason = parsed.finishReason;
       } catch {
-        // skip non-JSON lines
+        // Non-JSON SSE line, skip
       }
     }
 
+    // If no SSE lines were found, try parsing as JSON (non-streaming response)
     if (!content && !reasoningContent && raw.body.trim().startsWith("{")) {
       try {
         const json = JSON.parse(raw.body);
-        const choices = json?.choices as Array<Record<string, unknown>> | undefined;
-        if (Array.isArray(choices) && choices.length > 0) {
-          const message = (choices[0]?.message ?? {}) as Record<string, unknown>;
-          content = typeof message.content === "string" ? message.content : "";
-          reasoningContent =
-            typeof message.reasoning_content === "string" ? message.reasoning_content : "";
+        const choice = json?.choices?.[0];
+        if (choice?.message?.content) {
+          content = String(choice.message.content);
+        }
+        if (choice?.finish_reason) {
+          finishReason = choice.finish_reason;
         }
       } catch {
-        // not JSON either
+        // Not JSON either — return raw body as content
+        content = raw.body;
       }
     }
 
-    if (isZaiVersionOutdatedError(content)) {
-      return { content: "", reasoningContent: "", finishReason: "stop" };
+    if (isZaiVersionOutdatedError(raw.body)) {
+      return {
+        content: "",
+        reasoningContent: "",
+        finishReason: "error",
+        error: {
+          status: 400,
+          message: "Z.ai client version outdated",
+        },
+      };
     }
 
     return { content, reasoningContent, finishReason };
   }
-}
-
-export function isV2Enabled(): boolean {
-  return process.env.OMNIROUTE_EXECUTOR_V2 === "on";
 }
