@@ -292,29 +292,50 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
 
     try {
       console.error(`[zai-web-v2] completions URL: ${completionUrl.slice(0, 100)}...`);
-      console.error(
-        `[zai-web-v2] completions headers: ${JSON.stringify(Object.fromEntries(Object.entries(reqHeaders).map(([k, v]) => [k, k.toLowerCase().includes("auth") ? "[REDACTED]" : v])))}`
-      );
-      const streamResponse = await fetch(completionUrl, {
-        method: "POST",
-        headers: reqHeaders,
-        body: JSON.stringify(reqBody),
-        signal: this.currentSignal ?? undefined,
-      });
 
-      const status = streamResponse.status;
-      const headers: Record<string, string> = {};
-      streamResponse.headers.forEach((value, name) => {
-        headers[name] = value;
-      });
-      const body = await streamResponse.text().catch(() => "");
-      const contentType = headers["content-type"] || "text/event-stream";
-      console.error(
-        `[zai-web-v2] completions: status=${status} bodyLen=${body.length} preview=${body.slice(0, 200)}`
+      // Execute the completions fetch from within the browser page context.
+      // This ensures the request uses the browser's cookies, origin, and
+      // session context — which a Node-side fetch lacks, causing 404.
+      const result = await page.evaluate(
+        async (url: string, headers: Record<string, string>, body: string) => {
+          try {
+            const resp = await fetch(url, {
+              method: "POST",
+              headers,
+              body,
+              credentials: "include",
+            });
+            const text = await resp.text();
+            const respHeaders: Record<string, string> = {};
+            resp.headers.forEach((value, name) => {
+              respHeaders[name] = value;
+            });
+            return {
+              status: resp.status,
+              headers: respHeaders,
+              body: text,
+              contentType: respHeaders["content-type"] || "text/event-stream",
+            };
+          } catch (err) {
+            return {
+              status: 502,
+              headers: {} as Record<string, string>,
+              body: err instanceof Error ? err.message : "browser fetch failed",
+              contentType: "text/plain",
+            };
+          }
+        },
+        completionUrl,
+        reqHeaders,
+        JSON.stringify(reqBody)
       );
-      return { status, headers, body, contentType };
+
+      console.error(
+        `[zai-web-v2] completions: status=${result.status} bodyLen=${result.body.length} preview=${result.body.slice(0, 200)}`
+      );
+      return result;
     } catch (error) {
-      const message = error instanceof Error ? error.message : "direct completion fetch failed";
+      const message = error instanceof Error ? error.message : "browser completion fetch failed";
       console.error(`[zai-web-v2] completions failed: ${message}`);
       return { status: 502, headers: {}, body: message, contentType: "text/plain" };
     }
