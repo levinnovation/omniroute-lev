@@ -189,7 +189,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       contentType: string;
     } | null = null;
 
-    // Listen for requests to capture the captcha param
+    // Listen for requests to capture the captcha param and chat ID
     page.on("request", (request) => {
       const url = request.url();
       const method = request.method();
@@ -197,12 +197,14 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       if (method === "POST" && url.includes("z.ai")) {
         console.error(`[zai-web-v2] POST request: ${url.slice(0, 120)}`);
       }
+      // Capture captcha from chats/new OR completions requests
       if (
         method === "POST" &&
         (url.includes("/api/v1/chat/completions") ||
           url.includes("/api/chat/completions") ||
           url.includes("/api/v2/chat/completions") ||
-          url.includes("/api/completions"))
+          url.includes("/api/completions") ||
+          url.includes("/api/v1/chats/new"))
       ) {
         try {
           const postData = request.postData();
@@ -211,12 +213,40 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
             if (typeof parsed?.captcha_verify_param === "string" && parsed.captcha_verify_param) {
               capturedCaptcha = parsed.captcha_verify_param;
               console.error(
-                `[zai-web-v2] captured captcha from frontend request: ${capturedCaptcha.length} chars`
+                `[zai-web-v2] captured captcha from request: ${capturedCaptcha.length} chars (url=${url.slice(0, 60)})`
               );
             }
           }
         } catch {}
       }
+    });
+
+    // Also intercept WebSocket frames — z.ai may send completions via WS
+    page.on("websocket", (ws) => {
+      const wsUrl = ws.url();
+      console.error(`[zai-web-v2] WebSocket opened: ${wsUrl.slice(0, 120)}`);
+      ws.on("framesent", (frame) => {
+        const payload = frame.payload;
+        if (typeof payload === "string" && payload.length > 0) {
+          console.error(`[zai-web-v2] WS frame sent: ${payload.slice(0, 200)}`);
+          // Check for captcha in WS frames
+          try {
+            const parsed = JSON.parse(payload);
+            if (typeof parsed?.captcha_verify_param === "string" && parsed.captcha_verify_param) {
+              capturedCaptcha = parsed.captcha_verify_param;
+              console.error(
+                `[zai-web-v2] captured captcha from WS frame: ${capturedCaptcha.length} chars`
+              );
+            }
+          } catch {}
+        }
+      });
+      ws.on("framereceived", (frame) => {
+        const payload = frame.payload;
+        if (typeof payload === "string" && payload.length > 0) {
+          console.error(`[zai-web-v2] WS frame received: ${payload.slice(0, 200)}`);
+        }
+      });
     });
 
     // Set up response listener (best-effort — we don't await this since the
