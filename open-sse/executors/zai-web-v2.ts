@@ -216,8 +216,29 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
                 `[zai-web-v2] captured captcha from request: ${capturedCaptcha.length} chars (url=${url.slice(0, 60)})`
               );
             }
+            // Log the full chats/new body to see what the frontend sends
+            if (url.includes("/api/v1/chats/new")) {
+              console.error(
+                `[zai-web-v2] chats/new body keys: ${Object.keys(parsed).join(",")} model=${parsed?.model} hasCaptcha=${!!parsed?.captcha_verify_param}`
+              );
+            }
           }
         } catch {}
+      }
+    });
+
+    // Intercept the chats/new RESPONSE to get the chat ID
+    page.on("response", (response) => {
+      const url = response.url();
+      if (url.includes("/api/v1/chats/new")) {
+        response
+          .text()
+          .then((text) => {
+            console.error(
+              `[zai-web-v2] chats/new response: status=${response.status()} body=${text.slice(0, 200)}`
+            );
+          })
+          .catch(() => {});
       }
     });
 
