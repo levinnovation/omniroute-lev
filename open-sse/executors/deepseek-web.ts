@@ -131,7 +131,10 @@ function resolveModelOptions(
   searchEnabled: boolean;
 } {
   const m = (model || "").toLowerCase();
-  const modelType = m.includes("pro") || m.includes("expert") ? "expert" : "default";
+  // LEV fork: DeepSeek rejects model_type="expert" with "Update to the latest
+  // version to use Expert mode". The "pro" model works with model_type="default"
+  // — the model name itself distinguishes capability, not the model_type param.
+  const modelType = "default";
   const thinkingEnabled =
     m.includes("r1") ||
     m.includes("think") ||
@@ -310,6 +313,25 @@ function transformSSE(deepseekStream: ReadableStream, model: string): ReadableSt
               const p = (data as any)?.p;
               const o = (data as any)?.o;
               const v = (data as any)?.v;
+
+              // LEV fork: Handle DeepSeek error fragments. DeepSeek sends
+              // {"type":"error","content":"..."} when the model type is
+              // rejected or other errors occur. Without this, the error is
+              // silently dropped and the client gets an empty response.
+              const dataRecord = data as Record<string, unknown>;
+              const dataType = String(dataRecord?.type || "").toLowerCase();
+              const dataContent = dataRecord?.content;
+              if (dataType === "error" && typeof dataContent === "string" && dataContent) {
+                console.error(
+                  `[deepseek-web] upstream error fragment: ${dataContent.slice(0, 200)}`
+                );
+                // Emit the error as content so the client sees it
+                ensureRole();
+                hasEmittedContent = true;
+                chunk({ content: `[DeepSeek error] ${dataContent}` });
+                finishStream();
+                return;
+              }
 
               if (v && typeof v === "object" && v.response) {
                 if (v.response.thinking_enabled === true) currentPath = "thinking";
@@ -555,6 +577,16 @@ async function collectSSEContent(
         const data = JSON.parse(payload);
         const p = data?.p;
         const v = data?.v;
+
+        // LEV fork: Handle DeepSeek error fragments in non-streaming path too
+        const dataRecord = data as Record<string, unknown>;
+        const dataType = String(dataRecord?.type || "").toLowerCase();
+        const dataContent = dataRecord?.content;
+        if (dataType === "error" && typeof dataContent === "string" && dataContent) {
+          console.error(`[deepseek-web] upstream error (non-stream): ${dataContent.slice(0, 200)}`);
+          content = `[DeepSeek error] ${dataContent}`;
+          break;
+        }
 
         if (v && typeof v === "object" && v.response) {
           if (v.response.thinking_enabled === true) currentPath = "thinking";
@@ -1265,6 +1297,10 @@ export class DeepSeekWebExecutor extends BaseExecutor {
             Authorization: `Bearer ${payload.accessToken}`,
             "X-Ds-Pow-Response": payload.powAnswer,
             "X-Client-Timezone-Offset": String(new Date().getTimezoneOffset() * -60),
+            "X-Client-Version": "2.0.0",
+            "X-Client-Bundle-Id": "com.deepseek.chat",
+            "X-Client-Locale": "en-US",
+            "X-Client-Platform": "web",
           },
           credentials: "include",
           body: JSON.stringify({
