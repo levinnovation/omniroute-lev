@@ -368,6 +368,59 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       }
     }
 
+    // If still no captcha, try to find and solve the Cloudflare Turnstile
+    // or similar challenge widget that may have appeared on the page
+    if (!capturedCaptcha) {
+      try {
+        // Check for Turnstile iframe and wait for it to solve
+        const turnstileCount = await page.locator('iframe[src*="turnstile"]').count();
+        console.error(`[zai-web-v2] turnstile iframe count: ${turnstileCount}`);
+
+        if (turnstileCount > 0) {
+          // Wait for turnstile to solve (it's automatic for non-interactive)
+          await page.waitForTimeout(5000);
+
+          // Try to get the turnstile token
+          const turnstileToken = await page.evaluate(() => {
+            const w = window as unknown as Record<string, unknown>;
+            // Turnstile stores the token in a callback, but we can try
+            // to read it from the iframe's data attribute
+            const iframe = document.querySelector('iframe[src*="turnstile"]');
+            if (iframe) {
+              const container = iframe.parentElement;
+              if (container) {
+                const input = container.querySelector('input[name="cf-turnstile-response"]');
+                if (input && input.value) return input.value;
+              }
+            }
+            // Also try the Turnstile API
+            if (w.turnstile) {
+              try {
+                const widgets = document.querySelectorAll(".cf-turnstile");
+                for (const widget of widgets) {
+                  const id = widget.getAttribute("data-turnstile-id");
+                  if (id && w.turnstile.getResponse) {
+                    const resp = w.turnstile.getResponse(id);
+                    if (resp) return resp;
+                  }
+                }
+              } catch {}
+            }
+            return "";
+          });
+
+          if (turnstileToken) {
+            capturedCaptcha = turnstileToken;
+            console.error(`[zai-web-v2] captured turnstile token: ${capturedCaptcha.length} chars`);
+          }
+        }
+      } catch (err) {
+        console.error(
+          `[zai-web-v2] turnstile check failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+
     console.error(
       `[zai-web-v2] after wait: chatId=${capturedChatId ? "yes" : "no"} captcha=${capturedCaptcha ? "yes" : "no"}`
     );
