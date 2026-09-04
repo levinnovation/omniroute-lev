@@ -1320,8 +1320,20 @@ export class DeepSeekWebExecutor extends BaseExecutor {
           return { error: `completion_${completionResp.status}`, body: errText };
         }
 
-        // Read the full SSE response body
-        const body = await completionResp.text();
+        // Read the SSE response body with a timeout to prevent hangs.
+        // DeepSeek's thinking mode can generate very long streams; without
+        // a timeout, page.evaluate will wait indefinitely and the process
+        // will be killed by Railway's memory/time limits.
+        const TIMEOUT_MS = 120_000; // 2 minutes max for the full response
+        const body = await Promise.race([
+          completionResp.text(),
+          new Promise<string>((resolve) =>
+            setTimeout(() => resolve("__STREAM_TIMEOUT__"), TIMEOUT_MS)
+          ),
+        ]);
+        if (body === "__STREAM_TIMEOUT__") {
+          return { error: "completion_timeout", body: "Stream timed out after 120s" };
+        }
         return { error: null, body, status: completionResp.status };
       }, completionPayload);
 
@@ -1531,6 +1543,10 @@ export class DeepSeekWebExecutor extends BaseExecutor {
                       Authorization: `Bearer ${payload.accessToken}`,
                       "X-Ds-Pow-Response": payload.powAnswer,
                       "X-Client-Timezone-Offset": String(new Date().getTimezoneOffset() * -60),
+                      "X-Client-Version": "2.0.0",
+                      "X-Client-Bundle-Id": "com.deepseek.chat",
+                      "X-Client-Locale": "en-US",
+                      "X-Client-Platform": "web",
                     },
                     credentials: "include",
                     body: JSON.stringify({
@@ -1545,7 +1561,16 @@ export class DeepSeekWebExecutor extends BaseExecutor {
                     }),
                   });
                   if (!resp.ok) return { error: `completion_${resp.status}`, body: "" };
-                  const body = await resp.text();
+                  // Timeout to prevent hangs on large thinking-mode responses
+                  const body = await Promise.race([
+                    resp.text(),
+                    new Promise<string>((resolve) =>
+                      setTimeout(() => resolve("__STREAM_TIMEOUT__"), 120_000)
+                    ),
+                  ]);
+                  if (body === "__STREAM_TIMEOUT__") {
+                    return { error: "completion_timeout", body: "Stream timed out after 120s" };
+                  }
                   return { error: null, body };
                 },
                 {
