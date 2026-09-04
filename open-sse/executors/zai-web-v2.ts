@@ -287,6 +287,87 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       await page.waitForTimeout(1000);
     }
 
+    // Try to extract the captcha_verify_param from the frontend's JS context.
+    // Z.ai's frontend generates this dynamically — we need to find and call
+    // the function that produces it.
+    if (!capturedCaptcha) {
+      try {
+        const captchaFromJs = await page.evaluate(() => {
+          // Try common patterns for captcha generation
+          const w = window as unknown as Record<string, unknown>;
+
+          // Check if there's a global captcha function
+          if (typeof w.generateCaptcha === "function") {
+            try {
+              const result = (w.generateCaptcha as () => unknown)();
+              if (typeof result === "string") return result;
+            } catch {}
+          }
+
+          // Check for captcha in global state
+          const nextData = w.__NEXT_DATA__ as Record<string, unknown> | undefined;
+          const nextProps = nextData?.props as Record<string, unknown> | undefined;
+          const nextPageProps = nextProps?.pageProps as Record<string, unknown> | undefined;
+          if (nextPageProps?.captcha) {
+            return String(nextPageProps.captcha);
+          }
+
+          // Check for a captcha store/state
+          const keys = Object.keys(w).filter((k) => k.toLowerCase().includes("captcha"));
+          for (const k of keys) {
+            const val = w[k];
+            if (typeof val === "string" && val.length > 20) return val;
+            if (typeof val === "function") {
+              try {
+                const result = (val as () => unknown)();
+                if (typeof result === "string" && result.length > 20) return result;
+              } catch {}
+            }
+          }
+
+          // Try to find it in localStorage/sessionStorage
+          for (const storage of [localStorage, sessionStorage]) {
+            for (let i = 0; i < storage.length; i++) {
+              const key = storage.key(i);
+              if (key && key.toLowerCase().includes("captcha")) {
+                const val = storage.getItem(key);
+                if (val && val.length > 20) return val;
+              }
+            }
+          }
+
+          // Try to find the captcha module in webpack chunks
+          if (w.__webpack_modules__) {
+            for (const id of Object.keys(w.__webpack_modules__)) {
+              try {
+                const mod = w.__webpack_require__(id);
+                if (mod?.default && typeof mod.default === "function") {
+                  const name = mod.default.name || "";
+                  if (name.toLowerCase().includes("captcha")) {
+                    const result = mod.default();
+                    if (typeof result === "string" && result.length > 20) return result;
+                  }
+                }
+              } catch {}
+            }
+          }
+
+          return "";
+        });
+
+        if (captchaFromJs) {
+          capturedCaptcha = captchaFromJs;
+          console.error(
+            `[zai-web-v2] extracted captcha from JS context: ${capturedCaptcha.length} chars`
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[zai-web-v2] failed to extract captcha from JS: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+
     console.error(
       `[zai-web-v2] after wait: chatId=${capturedChatId ? "yes" : "no"} captcha=${capturedCaptcha ? "yes" : "no"}`
     );
