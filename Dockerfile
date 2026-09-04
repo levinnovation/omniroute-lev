@@ -88,8 +88,6 @@ ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 ARG OMNIROUTE_BUILD_WORKERS=2
 ENV CIRCLE_NODE_TOTAL=${OMNIROUTE_BUILD_WORKERS}
 
-# Cache-bust: force fresh COPY on every build by creating a unique layer
-RUN date -u +%Y%m%d%H%M%S > /tmp/build-timestamp
 # Copy source and build
 COPY . ./
 RUN mkdir -p /app/data \
