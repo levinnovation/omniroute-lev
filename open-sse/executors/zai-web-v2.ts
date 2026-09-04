@@ -144,7 +144,21 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const prompt = browserPrompt(messages);
     const input = page.locator(INPUT_SELECTOR).first();
     await input.waitFor({ state: "visible", timeout: 15_000 });
-    await input.click();
+
+    // Click the input with an explicit timeout and fallbacks.
+    // The default Playwright click timeout is 30s — if the SPA hasn't fully
+    // initialized event handlers (or an overlay covers the input), the click
+    // hangs for 30s and then fails. Use a shorter timeout with evaluate fallback.
+    try {
+      await input.click({ timeout: 10_000 });
+    } catch {
+      try {
+        await input.evaluate((el) => (el as HTMLElement).focus());
+        console.error("[zai-web-v2] fillPrompt: click failed, used focus() fallback");
+      } catch {
+        console.error("[zai-web-v2] fillPrompt: click and focus both failed, typing anyway");
+      }
+    }
     await page.keyboard.type(prompt, { delay: 5 });
     await page.waitForTimeout(500);
   }
@@ -181,6 +195,10 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     } catch {
       // Continue even if networkidle doesn't fire
     }
+    // Give the Svelte SPA a moment to initialize event handlers after networkidle.
+    // Without this, the input element exists and is visible but not yet clickable
+    // (the click action times out because Svelte hasn't bound event listeners yet).
+    await page.waitForTimeout(1000);
 
     // Capture the chat ID from the frontend's chats/new response.
     // The frontend creates a chat via POST /api/v1/chats/new, then sends
