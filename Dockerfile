@@ -88,6 +88,8 @@ ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 ARG OMNIROUTE_BUILD_WORKERS=2
 ENV CIRCLE_NODE_TOTAL=${OMNIROUTE_BUILD_WORKERS}
 
+# Cache-bust arg to force fresh COPY when source changes
+ARG CACHE_BUST=none
 # Copy source and build
 COPY . ./
 RUN mkdir -p /app/data \
