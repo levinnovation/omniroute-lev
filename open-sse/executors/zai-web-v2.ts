@@ -175,65 +175,27 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       // Continue even if networkidle doesn't fire
     }
 
-    // Set up a request interceptor to capture the captcha_verify_param
-    // from the frontend's own completions request. Z.ai's frontend generates
-    // the CAPTCHA proof dynamically on submit — we can't replicate it, but
-    // we CAN intercept the request the frontend sends and extract the param.
+    // Capture the chat ID from the frontend's chats/new response.
+    // The frontend creates a chat via POST /api/v1/chats/new, then sends
+    // completions via a mechanism we can't intercept. We'll use the chat ID
+    // to make our own completions API call with the browser's cookies.
+    let capturedChatId = "";
     let capturedCaptcha = "";
 
-    // Set up response listener for the completions response
-    let capturedResponse: {
-      status: number;
-      headers: Record<string, string>;
-      body: string;
-      contentType: string;
-    } | null = null;
-
-    // Listen for requests to capture the captcha param and chat ID
-    page.on("request", (request) => {
-      const url = request.url();
-      const method = request.method();
-      // Log ALL POST requests to z.ai to understand the frontend's behavior
-      if (method === "POST" && url.includes("z.ai")) {
-        console.error(`[zai-web-v2] POST request: ${url.slice(0, 120)}`);
-      }
-      // Capture captcha from chats/new OR completions requests
-      if (
-        method === "POST" &&
-        (url.includes("/api/v1/chat/completions") ||
-          url.includes("/api/chat/completions") ||
-          url.includes("/api/v2/chat/completions") ||
-          url.includes("/api/completions") ||
-          url.includes("/api/v1/chats/new"))
-      ) {
-        try {
-          const postData = request.postData();
-          if (postData) {
-            const parsed = JSON.parse(postData);
-            if (typeof parsed?.captcha_verify_param === "string" && parsed.captcha_verify_param) {
-              capturedCaptcha = parsed.captcha_verify_param;
-              console.error(
-                `[zai-web-v2] captured captcha from request: ${capturedCaptcha.length} chars (url=${url.slice(0, 60)})`
-              );
-            }
-            // Log the full chats/new body to see what the frontend sends
-            if (url.includes("/api/v1/chats/new")) {
-              console.error(
-                `[zai-web-v2] chats/new body keys: ${Object.keys(parsed).join(",")} model=${parsed?.model} hasCaptcha=${!!parsed?.captcha_verify_param}`
-              );
-            }
-          }
-        } catch {}
-      }
-    });
-
-    // Intercept the chats/new RESPONSE to get the chat ID
+    // Intercept chats/new response to get the chat ID
     page.on("response", (response) => {
       const url = response.url();
       if (url.includes("/api/v1/chats/new")) {
         response
           .text()
           .then((text) => {
+            try {
+              const data = JSON.parse(text);
+              if (typeof data?.id === "string") {
+                capturedChatId = data.id;
+                console.error(`[zai-web-v2] captured chat ID: ${capturedChatId}`);
+              }
+            } catch {}
             console.error(
               `[zai-web-v2] chats/new response: status=${response.status()} body=${text.slice(0, 200)}`
             );
@@ -242,71 +204,33 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       }
     });
 
-    // Also intercept WebSocket frames — z.ai may send completions via WS
-    page.on("websocket", (ws) => {
-      const wsUrl = ws.url();
-      console.error(`[zai-web-v2] WebSocket opened: ${wsUrl.slice(0, 120)}`);
-      ws.on("framesent", (frame) => {
-        const payload = frame.payload;
-        if (typeof payload === "string" && payload.length > 0) {
-          console.error(`[zai-web-v2] WS frame sent: ${payload.slice(0, 200)}`);
-          // Check for captcha in WS frames
-          try {
-            const parsed = JSON.parse(payload);
+    // Intercept requests for captcha param
+    page.on("request", (request) => {
+      const url = request.url();
+      const method = request.method();
+      if (
+        method === "POST" &&
+        (url.includes("/api/v1/chat/completions") ||
+          url.includes("/api/chat/completions") ||
+          url.includes("/api/v2/chat/completions") ||
+          url.includes("/api/completions"))
+      ) {
+        try {
+          const postData = request.postData();
+          if (postData) {
+            const parsed = JSON.parse(postData);
             if (typeof parsed?.captcha_verify_param === "string" && parsed.captcha_verify_param) {
               capturedCaptcha = parsed.captcha_verify_param;
               console.error(
-                `[zai-web-v2] captured captcha from WS frame: ${capturedCaptcha.length} chars`
+                `[zai-web-v2] captured captcha from completions request: ${capturedCaptcha.length} chars`
               );
             }
-          } catch {}
-        }
-      });
-      ws.on("framereceived", (frame) => {
-        const payload = frame.payload;
-        if (typeof payload === "string" && payload.length > 0) {
-          console.error(`[zai-web-v2] WS frame received: ${payload.slice(0, 200)}`);
-        }
-      });
+          }
+        } catch {}
+      }
     });
 
-    // Set up response listener (best-effort — we don't await this since the
-    // page may be closed before the response arrives)
-    page
-      .waitForResponse(
-        (r) =>
-          r.request().method() === "POST" &&
-          (r.url().includes("/api/v1/chat/completions") ||
-            r.url().includes("/api/chat/completions") ||
-            r.url().includes("/api/v2/chat/completions")),
-        { timeout: 90_000 }
-      )
-      .then(async (response) => {
-        const status = response.status();
-        const respHeaders: Record<string, string> = {};
-        const headersObj = response.headers();
-        for (const [name, value] of Object.entries(headersObj)) {
-          respHeaders[name] = value;
-        }
-        await Promise.race([
-          response.finished().then(() => undefined),
-          new Promise((resolve) => setTimeout(resolve, 30_000)),
-        ]);
-        const body = await response.text().catch(() => "");
-        const contentType = respHeaders["content-type"] || "text/event-stream";
-        console.error(
-          `[zai-web-v2] captured completions: status=${status} bodyLen=${body.length} preview=${body.slice(0, 200)}`
-        );
-        capturedResponse = { status, headers: respHeaders, body, contentType };
-      })
-      .catch((err) => {
-        console.error(
-          `[zai-web-v2] completions capture failed: ${err instanceof Error ? err.message : String(err)}`
-        );
-      });
-
-    // Submit the prompt via the UI. The browser's frontend will handle
-    // CAPTCHA, cookies, and session context naturally.
+    // Submit the prompt via the UI to trigger the frontend's chat creation
     const submitSelectors = [
       SUBMIT_SELECTOR,
       'button[type="submit"]',
@@ -329,86 +253,78 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         break;
       }
     }
-    const inputValue =
-      inputCount > 0
-        ? await input.evaluate((el) => (el as HTMLTextAreaElement).value).catch(() => "<error>")
-        : "<no input>";
     console.error(
-      `[zai-web-v2] submit diag: inputCount=${inputCount} submitCount=${submitCount} matchedSel=${matchedSelector || "none"} inputValueLen=${typeof inputValue === "string" ? inputValue.length : 0} preview=${typeof inputValue === "string" ? inputValue.slice(0, 50) : ""}`
+      `[zai-web-v2] submit diag: inputCount=${inputCount} submitCount=${submitCount} matchedSel=${matchedSelector || "none"}`
     );
 
     // Try clicking the submit button
-    let submitted = false;
     if (submitCount > 0 && matchedSelector) {
       const submit = page.locator(matchedSelector).first();
       try {
         await submit.click({ timeout: 5_000 });
-        submitted = true;
         console.error(`[zai-web-v2] submit: clicked button (${matchedSelector})`);
       } catch {
         try {
           await submit.evaluate((el) => (el as HTMLElement).click());
-          submitted = true;
           console.error(`[zai-web-v2] submit: evaluate-clicked button (${matchedSelector})`);
         } catch {
           console.error(`[zai-web-v2] submit: button click failed, trying Enter`);
+          await input.click().catch(() => {});
+          await page.keyboard.press("Enter");
         }
       }
-    }
-
-    if (!submitted) {
+    } else {
       await input.click().catch(() => {});
       await page.keyboard.press("Enter");
       console.error(`[zai-web-v2] submit: pressed Enter`);
     }
 
-    // Wait briefly for the captcha to be captured from the frontend's request.
-    // We do NOT wait for the full response — the page may be closed by the base
-    // class before the response arrives. Instead, we capture the captcha param
-    // from the request, then make our own API call.
-    for (let i = 0; i < 30 && !capturedCaptcha && !capturedResponse; i++) {
+    // Wait for the chat ID to be captured from the frontend's chats/new response
+    for (let i = 0; i < 15 && !capturedChatId && !capturedCaptcha; i++) {
       await page.waitForTimeout(1000);
     }
 
-    // If we captured the response directly, return it
-    if (capturedResponse) return capturedResponse;
+    console.error(
+      `[zai-web-v2] after wait: chatId=${capturedChatId ? "yes" : "no"} captcha=${capturedCaptcha ? "yes" : "no"}`
+    );
 
-    // If we captured the captcha param, do the API call ourselves
-    if (capturedCaptcha) {
-      console.error(
-        `[zai-web-v2] using captured captcha for API flow: ${capturedCaptcha.length} chars`
-      );
-      const { userMessageId, payload: newChatPayload } = buildZaiNewChatBody(
-        messages,
-        modelId,
-        false,
-        "high",
-        { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false }
-      );
-      const completionsBody = buildZaiRequestBody({
-        body: {},
-        captchaVerifyParam: capturedCaptcha,
-        chatId: "",
-        clientVersion: "1.0.91",
-        messages,
-        modelId,
-        prompt,
-        userMessageId,
-        enableThinking: false,
-        reasoningEffort: "high",
-        reasoningEffortSupported: false,
-        vlmConfig: { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false },
-      });
+    // Now make our own completions API call using the captured chat ID
+    // (or create a new chat if we didn't capture one)
+    const { userMessageId, payload: newChatPayload } = buildZaiNewChatBody(
+      messages,
+      modelId,
+      false,
+      "high",
+      { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false }
+    );
+    const completionsBody = buildZaiRequestBody({
+      body: {},
+      captchaVerifyParam: capturedCaptcha,
+      chatId: capturedChatId,
+      clientVersion: "1.0.91",
+      messages,
+      modelId,
+      prompt,
+      userMessageId,
+      enableThinking: false,
+      reasoningEffort: "high",
+      reasoningEffortSupported: false,
+      vlmConfig: { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false },
+    });
 
-      const retryResult = await page.evaluate(
-        async (params: {
-          baseUrl: string;
-          token: string;
-          newChatPayload: Record<string, unknown>;
-          completionsBody: Record<string, unknown>;
-        }) => {
-          const { baseUrl, token, newChatPayload, completionsBody } = params;
-          let chatId = "";
+    const result = await page.evaluate(
+      async (params: {
+        baseUrl: string;
+        token: string;
+        newChatPayload: Record<string, unknown>;
+        completionsBody: Record<string, unknown>;
+        capturedChatId: string;
+      }) => {
+        const { baseUrl, token, newChatPayload, completionsBody, capturedChatId } = params;
+
+        // Use the captured chat ID or create a new chat
+        let chatId = capturedChatId;
+        if (!chatId) {
           try {
             const newChatResp = await fetch(`${baseUrl}/api/v1/chats/new`, {
               method: "POST",
@@ -434,72 +350,69 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
               contentType: "text/plain",
             };
           }
-          if (!chatId)
-            return {
-              status: 502,
-              headers: {} as Record<string, string>,
-              body: "chats/new returned no chat id",
-              contentType: "text/plain",
-            };
+        }
 
-          const endpoints = [
-            `${baseUrl}/api/v1/chat/completions`,
-            `${baseUrl}/api/chat/completions`,
-          ];
-          const reqBody = { ...completionsBody, chat_id: chatId };
-          for (const endpoint of endpoints) {
-            try {
-              const resp = await fetch(endpoint, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  Accept: "text/event-stream",
-                  Authorization: `Bearer ${token}`,
-                  "X-FE-Version": "prod-fe-1.1.93",
-                  "X-Client-Version": "1.0.91",
-                },
-                body: JSON.stringify(reqBody),
-                credentials: "include",
-              });
-              const text = await resp.text();
-              const respHeaders: Record<string, string> = {};
-              for (const [name, value] of Object.entries(resp.headers)) {
-                respHeaders[name] = value;
-              }
-              if (resp.ok || resp.status !== 404) {
-                return {
-                  status: resp.status,
-                  headers: respHeaders,
-                  body: text,
-                  contentType: respHeaders["content-type"] || "text/event-stream",
-                };
-              }
-            } catch {}
-          }
+        if (!chatId) {
           return {
-            status: 404,
+            status: 502,
             headers: {} as Record<string, string>,
-            body: "All endpoints 404",
+            body: "chats/new returned no chat id",
             contentType: "text/plain",
           };
-        },
-        { baseUrl: ZAI_BASE_URL, token, newChatPayload, completionsBody }
-      );
-      console.error(
-        `[zai-web-v2] API retry: status=${retryResult.status} bodyLen=${retryResult.body.length}`
-      );
-      return retryResult;
-    }
+        }
 
-    // No captcha captured — the frontend may not have sent the request
-    console.error(`[zai-web-v2] no captcha captured after 30s`);
+        // Try completions endpoints
+        const endpoints = [`${baseUrl}/api/v1/chat/completions`, `${baseUrl}/api/chat/completions`];
+        const reqBody = { ...completionsBody, chat_id: chatId };
+        for (const endpoint of endpoints) {
+          try {
+            const resp = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "text/event-stream",
+                Authorization: `Bearer ${token}`,
+                "X-FE-Version": "prod-fe-1.1.93",
+                "X-Client-Version": "1.0.91",
+              },
+              body: JSON.stringify(reqBody),
+              credentials: "include",
+            });
+            const text = await resp.text();
+            const respHeaders: Record<string, string> = {};
+            for (const [name, value] of Object.entries(resp.headers)) {
+              respHeaders[name] = value;
+            }
+            if (resp.ok || resp.status !== 404) {
+              return {
+                status: resp.status,
+                headers: respHeaders,
+                body: text,
+                contentType: respHeaders["content-type"] || "text/event-stream",
+              };
+            }
+          } catch {}
+        }
+        return {
+          status: 404,
+          headers: {} as Record<string, string>,
+          body: "All endpoints 404",
+          contentType: "text/plain",
+        };
+      },
+      {
+        baseUrl: ZAI_BASE_URL,
+        token,
+        newChatPayload,
+        completionsBody,
+        capturedChatId,
+      }
+    );
 
-    return {
-      status: 502,
-      headers: {},
-      body: "No completions response captured — the browser may not have sent the message",
-      contentType: "text/plain",
-    };
+    console.error(
+      `[zai-web-v2] completions: status=${result.status} bodyLen=${result.body.length} preview=${result.body.slice(0, 200)}`
+    );
+    return result;
   }
 
   async parseResponse(raw: WebCookieRawResponse): Promise<WebCookieParsedResponse> {
