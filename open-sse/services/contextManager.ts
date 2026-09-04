@@ -986,10 +986,12 @@ export function stripTrailingAssistantOrphanToolUse(
 /**
  * Providers that strictly require the last message to be `user` or `tool`.
  * A trailing `assistant` message with plain text content (no tool_use) is
- * valid for Anthropic/OpenAI (signals "continue from here") but rejected by
- * Mistral with: "Expected last role User or Tool … but got assistant" (#3396).
+ * valid for some Anthropic models (signals "continue from here") but rejected
+ * by newer Claude models (claude-sonnet-5, claude-opus-4-8) and Mistral with:
+ * "Expected last role User or Tool … but got assistant" (#3396) and
+ * "This model does not support assistant message prefill" respectively.
  */
-const PROVIDERS_REQUIRING_USER_LAST_MESSAGE = new Set(["mistral"]);
+const PROVIDERS_REQUIRING_USER_LAST_MESSAGE = new Set(["mistral", "claude"]);
 
 /**
  * Strip a trailing `assistant` message that contains ONLY plain text (no
