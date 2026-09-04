@@ -229,31 +229,11 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       }
     });
 
-    // Intercept requests for captcha param
-    page.on("request", (request) => {
-      const url = request.url();
-      const method = request.method();
-      if (
-        method === "POST" &&
-        (url.includes("/api/v1/chat/completions") ||
-          url.includes("/api/chat/completions") ||
-          url.includes("/api/v2/chat/completions") ||
-          url.includes("/api/completions"))
-      ) {
-        try {
-          const postData = request.postData();
-          if (postData) {
-            const parsed = JSON.parse(postData);
-            if (typeof parsed?.captcha_verify_param === "string" && parsed.captcha_verify_param) {
-              capturedCaptcha = parsed.captcha_verify_param;
-              console.error(
-                `[zai-web-v2] captured captcha from completions request: ${capturedCaptcha.length} chars`
-              );
-            }
-          }
-        } catch {}
-      }
-    });
+    // NOTE: We intentionally do NOT intercept the frontend's captcha_verify_param
+    // from its completions request. The captcha token is single-use and bound to
+    // the specific request payload — reusing it for our own separate API call
+    // always fails with FRONTEND_CAPTCHA_REQUIRED. We must solve a fresh Aliyun
+    // captcha for our own request (see solveZaiCaptchaWithFallback below).
 
     // Submit the prompt via the UI to trigger the frontend's chat creation
     const submitSelectors = [
@@ -305,7 +285,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     }
 
     // Wait for the chat ID to be captured from the frontend's chats/new response
-    for (let i = 0; i < 15 && !capturedChatId && !capturedCaptcha; i++) {
+    for (let i = 0; i < 15 && !capturedChatId; i++) {
       await page.waitForTimeout(1000);
     }
 
@@ -315,23 +295,24 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     // mode "popup", prefix "no8xfe", region "sgp". The success callback
     // receives the verification token that becomes captcha_verify_param.
     // See: open-sse/services/zaiCaptchaSolver.ts for the full implementation.
-    if (!capturedCaptcha) {
-      console.error("[zai-web-v2] solving Aliyun Captcha for captcha_verify_param");
-      try {
-        const captchaToken = await solveZaiCaptchaWithFallback(page);
-        if (captchaToken) {
-          capturedCaptcha = captchaToken;
-          console.error(`[zai-web-v2] Aliyun captcha solved: ${capturedCaptcha.length} chars`);
-        } else {
-          console.error("[zai-web-v2] Aliyun captcha returned empty token");
-        }
-      } catch (err) {
-        console.error(
-          `[zai-web-v2] Aliyun captcha solve failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
+    // Always solve a fresh Aliyun Captcha for our own completions request.
+    // The captcha token is single-use and bound to the specific request payload,
+    // so we cannot reuse any token from the frontend's request.
+    console.error("[zai-web-v2] solving Aliyun Captcha for captcha_verify_param");
+    try {
+      const captchaToken = await solveZaiCaptchaWithFallback(page);
+      if (captchaToken) {
+        capturedCaptcha = captchaToken;
+        console.error(`[zai-web-v2] Aliyun captcha solved: ${capturedCaptcha.length} chars`);
+      } else {
+        console.error("[zai-web-v2] Aliyun captcha returned empty token");
       }
+    } catch (err) {
+      console.error(
+        `[zai-web-v2] Aliyun captcha solve failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
     }
 
     console.error(
