@@ -193,17 +193,20 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     page.on("request", (request) => {
       const url = request.url();
       const method = request.method();
+      // Log ALL POST requests to z.ai to understand the frontend's behavior
+      if (method === "POST" && url.includes("z.ai")) {
+        console.error(`[zai-web-v2] POST request: ${url.slice(0, 120)}`);
+      }
       if (
         method === "POST" &&
         (url.includes("/api/v1/chat/completions") ||
           url.includes("/api/chat/completions") ||
-          url.includes("/api/v2/chat/completions"))
+          url.includes("/api/v2/chat/completions") ||
+          url.includes("/api/completions"))
       ) {
-        capturedCompletionsUrl = url;
         try {
           const postData = request.postData();
           if (postData) {
-            capturedCompletionsBody = postData;
             const parsed = JSON.parse(postData);
             if (typeof parsed?.captcha_verify_param === "string" && parsed.captcha_verify_param) {
               capturedCaptcha = parsed.captcha_verify_param;
