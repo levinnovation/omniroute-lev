@@ -24,11 +24,14 @@ import {
   browserModelName,
   browserPrompt,
   buildZaiCompletionUrl,
+  buildZaiHeaders,
   buildZaiNewChatBody,
   buildZaiRequestBody,
   buildZaiSignature,
   extractZaiUserId,
   ZAI_BASE_URL,
+  ZAI_DEFAULT_CLIENT_VERSION,
+  ZAI_DEFAULT_FE_VERSION,
   ZAI_DEFAULT_MODEL,
   ZAI_USER_AGENT,
 } from "./zai-web/protocol.ts";
@@ -454,12 +457,21 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     const timestamp = Date.now();
     const userId = extractZaiUserId(token);
     const signature = buildZaiSignature({ prompt, requestId, timestamp, userId });
+    const clientVersion = ZAI_DEFAULT_CLIENT_VERSION;
+    const frontendVersion = ZAI_DEFAULT_FE_VERSION;
     const completionUrl = buildZaiCompletionUrl({
       requestId,
       timestamp,
       token,
       userId,
-      clientVersion: "1.0.91",
+      clientVersion,
+    });
+    // Build proper headers using the shared protocol helper
+    const completionsHeaders = buildZaiHeaders(token, {
+      accept: "text/event-stream",
+      frontendVersion,
+      clientVersion,
+      signature,
     });
     console.error(`[zai-web-v2] completionUrl: ${completionUrl.slice(0, 200)}`);
 
@@ -471,16 +483,17 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         completionsBody: Record<string, unknown>;
         capturedChatId: string;
         completionUrl: string;
-        signature: string;
+        completionsHeaders: Record<string, string>;
+        newChatHeaders: Record<string, string>;
       }) => {
         const {
           baseUrl,
-          token,
           newChatPayload,
           completionsBody,
           capturedChatId,
           completionUrl,
-          signature,
+          completionsHeaders,
+          newChatHeaders,
         } = params;
 
         // Use the captured chat ID or create a new chat
@@ -489,12 +502,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
           try {
             const newChatResp = await fetch(`${baseUrl}/api/v1/chats/new`, {
               method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${token}`,
-                "X-FE-Version": "prod-fe-1.1.93",
-                "X-Client-Version": "1.0.91",
-              },
+              headers: newChatHeaders,
               body: JSON.stringify(newChatPayload),
               credentials: "include",
             });
@@ -536,14 +544,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
           try {
             const resp = await fetch(url, {
               method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Accept: "text/event-stream",
-                Authorization: `Bearer ${token}`,
-                "X-FE-Version": "prod-fe-1.1.93",
-                "X-Client-Version": "1.0.91",
-                "X-Signature": signature,
-              },
+              headers: completionsHeaders,
               body: JSON.stringify(reqBody),
               credentials: "include",
             });
@@ -577,7 +578,12 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         completionsBody,
         capturedChatId,
         completionUrl,
-        signature,
+        completionsHeaders,
+        newChatHeaders: buildZaiHeaders(token, {
+          accept: "application/json",
+          frontendVersion,
+          clientVersion,
+        }),
       }
     );
 
