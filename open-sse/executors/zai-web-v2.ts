@@ -38,6 +38,7 @@ import {
 import { parseZaiFrame, isZaiVersionOutdatedError } from "./zai-web/stream.ts";
 import { ZAI_WEB_SESSION_CONFIG } from "./zai-web/sessionConfig.ts";
 import { WebSessionDriver } from "../services/webSessionDriver.ts";
+import { solveZaiCaptchaWithFallback } from "../services/zaiCaptchaSolver.ts";
 
 const INPUT_SELECTOR = "#chat-input";
 const SUBMIT_SELECTOR = '[aria-label="Send Message"] button:not([disabled])';
@@ -290,136 +291,27 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       await page.waitForTimeout(1000);
     }
 
-    // Try to extract the captcha_verify_param from the frontend's JS context.
-    // Z.ai's frontend generates this dynamically — we need to find and call
-    // the function that produces it.
+    // LEV fork: Solve the Aliyun Captcha to get the captcha_verify_param.
+    // Z.ai uses Alibaba Cloud's Aliyun Captcha service (not Turnstile/reCAPTCHA).
+    // The frontend calls window.initAliyunCaptcha() with SceneId "didk33e0",
+    // mode "popup", prefix "no8xfe", region "sgp". The success callback
+    // receives the verification token that becomes captcha_verify_param.
+    // See: open-sse/services/zaiCaptchaSolver.ts for the full implementation.
     if (!capturedCaptcha) {
+      console.error("[zai-web-v2] solving Aliyun Captcha for captcha_verify_param");
       try {
-        const captchaFromJs = await page.evaluate(() => {
-          // Try common patterns for captcha generation
-          const w = window as unknown as Record<string, unknown>;
-
-          // Check if there's a global captcha function
-          if (typeof w.generateCaptcha === "function") {
-            try {
-              const result = (w.generateCaptcha as () => unknown)();
-              if (typeof result === "string") return result;
-            } catch {}
-          }
-
-          // Check for captcha in global state
-          const nextData = w.__NEXT_DATA__ as Record<string, unknown> | undefined;
-          const nextProps = nextData?.props as Record<string, unknown> | undefined;
-          const nextPageProps = nextProps?.pageProps as Record<string, unknown> | undefined;
-          if (nextPageProps?.captcha) {
-            return String(nextPageProps.captcha);
-          }
-
-          // Check for a captcha store/state
-          const keys = Object.keys(w).filter((k) => k.toLowerCase().includes("captcha"));
-          for (const k of keys) {
-            const val = w[k];
-            if (typeof val === "string" && val.length > 20) return val;
-            if (typeof val === "function") {
-              try {
-                const result = (val as () => unknown)();
-                if (typeof result === "string" && result.length > 20) return result;
-              } catch {}
-            }
-          }
-
-          // Try to find it in localStorage/sessionStorage
-          for (const storage of [localStorage, sessionStorage]) {
-            for (let i = 0; i < storage.length; i++) {
-              const key = storage.key(i);
-              if (key && key.toLowerCase().includes("captcha")) {
-                const val = storage.getItem(key);
-                if (val && val.length > 20) return val;
-              }
-            }
-          }
-
-          // Try to find the captcha module in webpack chunks
-          if (w.__webpack_modules__) {
-            for (const id of Object.keys(w.__webpack_modules__)) {
-              try {
-                const mod = w.__webpack_require__(id);
-                if (mod?.default && typeof mod.default === "function") {
-                  const name = mod.default.name || "";
-                  if (name.toLowerCase().includes("captcha")) {
-                    const result = mod.default();
-                    if (typeof result === "string" && result.length > 20) return result;
-                  }
-                }
-              } catch {}
-            }
-          }
-
-          return "";
-        });
-
-        if (captchaFromJs) {
-          capturedCaptcha = captchaFromJs;
-          console.error(
-            `[zai-web-v2] extracted captcha from JS context: ${capturedCaptcha.length} chars`
-          );
+        const captchaToken = await solveZaiCaptchaWithFallback(page);
+        if (captchaToken) {
+          capturedCaptcha = captchaToken;
+          console.error(`[zai-web-v2] Aliyun captcha solved: ${capturedCaptcha.length} chars`);
+        } else {
+          console.error("[zai-web-v2] Aliyun captcha returned empty token");
         }
       } catch (err) {
         console.error(
-          `[zai-web-v2] failed to extract captcha from JS: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-    }
-
-    // If still no captcha, try to find and solve the Cloudflare Turnstile
-    // or similar challenge widget that may have appeared on the page
-    if (!capturedCaptcha) {
-      try {
-        // Check for Turnstile iframe and wait for it to solve
-        const turnstileCount = await page.locator('iframe[src*="turnstile"]').count();
-        console.error(`[zai-web-v2] turnstile iframe count: ${turnstileCount}`);
-
-        if (turnstileCount > 0) {
-          // Wait for turnstile to solve (it's automatic for non-interactive)
-          await page.waitForTimeout(5000);
-
-          // Try to get the turnstile token
-          const turnstileToken = await page.evaluate(() => {
-            const w = window as unknown as Record<string, unknown>;
-            // Turnstile stores the token in a callback, but we can try
-            // to read it from the iframe's data attribute
-            const iframe = document.querySelector('iframe[src*="turnstile"]');
-            if (iframe) {
-              const container = iframe.parentElement;
-              if (container) {
-                const input = container.querySelector('input[name="cf-turnstile-response"]');
-                if (input && input.value) return input.value;
-              }
-            }
-            // Also try the Turnstile API
-            if (w.turnstile) {
-              try {
-                const widgets = document.querySelectorAll(".cf-turnstile");
-                for (const widget of widgets) {
-                  const id = widget.getAttribute("data-turnstile-id");
-                  if (id && w.turnstile.getResponse) {
-                    const resp = w.turnstile.getResponse(id);
-                    if (resp) return resp;
-                  }
-                }
-              } catch {}
-            }
-            return "";
-          });
-
-          if (turnstileToken) {
-            capturedCaptcha = turnstileToken;
-            console.error(`[zai-web-v2] captured turnstile token: ${capturedCaptcha.length} chars`);
-          }
-        }
-      } catch (err) {
-        console.error(
-          `[zai-web-v2] turnstile check failed: ${err instanceof Error ? err.message : String(err)}`
+          `[zai-web-v2] Aliyun captcha solve failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`
         );
       }
     }

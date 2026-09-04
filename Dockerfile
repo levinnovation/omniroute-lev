@@ -142,6 +142,20 @@ COPY --from=builder /app/node_modules/patchright ./node_modules/patchright
 COPY --from=builder /app/node_modules/patchright-core ./node_modules/patchright-core
 RUN node -e "const {chromium} = require('patchright'); chromium.launch({headless:true,args:['--no-sandbox']}).then(b => {console.log('patchright OK'); return b.close();}).catch(e => console.log('patchright launch skipped:', e.message.substring(0,100)))" || true
 
+# ── NopeCHA captcha solver extension ───────────────────────────────────────
+# LEV fork: Load NopeCHA browser extension for auto-solving Turnstile,
+# reCAPTCHA v2/v3, and hCaptcha widgets in web-cookie provider contexts.
+# The extension is free and runs in-browser (no API calls, no per-solve cost).
+# Downloaded at build time from the NopeCHA GitHub releases (chromium_automation
+# variant — includes debugger + declarativeNetRequest permissions for headless).
+RUN mkdir -p /app/extensions/nopecha \
+  && curl -sL "https://github.com/NopeCHALLC/nopecha-extension/releases/download/0.6.1/chromium_automation.zip" -o /tmp/nopecha.zip \
+  && apt-get update && apt-get install -y --no-install-recommends unzip \
+  && unzip -o /tmp/nopecha.zip -d /app/extensions/nopecha/ \
+  && rm /tmp/nopecha.zip \
+  && rm -rf /var/lib/apt/lists/* \
+  && chown -R node:node /app/extensions
+
 # ── wreq-js native binary for TLS fingerprint spoofing ─────────────────────
 RUN ls /app/node_modules/wreq-js/rust/wreq-js.linux-x64-gnu.node && echo "wreq-js native binary OK" || echo "wreq-js binary missing"
 

@@ -32,6 +32,7 @@ import {
   shouldUseGrokBrowserBacked,
   acquireFreshGrokClearance,
 } from "../services/grokClearance.ts";
+import { getCfClearance } from "../services/cfClearanceService.ts";
 import type { GrokStreamEvent } from "./grok-web/types.ts";
 import {
   type OpenAIToolCall,
@@ -748,12 +749,29 @@ async function retryGrokWithFreshClearance(params: {
   grokPayload: Record<string, unknown>;
   signal?: AbortSignal;
 }): Promise<TlsFetchResult | null> {
-  let cfClearance: string | null;
+  // LEV fork: Try the shared cfClearanceService (Python sidecar) first,
+  // then fall back to the grok-specific browser pool clearance.
+  let cfClearance: string | null = null;
+
+  // 1. Try the shared Python cloudflare-solver sidecar
   try {
-    cfClearance = await acquireFreshGrokClearance(params.signal);
+    const result = await getCfClearance("https://grok.com/", params.headers["User-Agent"]);
+    if (result?.cfClearance) {
+      cfClearance = result.cfClearance;
+    }
   } catch {
-    cfClearance = null;
+    // Fall through to grok-specific solver
   }
+
+  // 2. Fall back to the grok-specific browser pool clearance
+  if (!cfClearance) {
+    try {
+      cfClearance = await acquireFreshGrokClearance(params.signal);
+    } catch {
+      cfClearance = null;
+    }
+  }
+
   if (!cfClearance) return null;
 
   const retryHeaders = {

@@ -1,9 +1,10 @@
 // LEV fork: Sidecar service integration for OmniRoute.
 //
-// Connects to three Railway sidecar services:
+// Connects to four Railway sidecar services:
 //   1. Browserless — external browser pool for web-cookie providers
 //   2. LiteLLM — API-key provider router
 //   3. Mem0 — context/memory compaction service
+//   4. Cloudflare-Solver — Python sidecar for cf_clearance acquisition
 //
 // Each sidecar has a health check and graceful fallback if unavailable.
 
@@ -53,6 +54,16 @@ export function getMem0Config(): SidecarConfig | null {
   };
 }
 
+export function getCfSolverConfig(): SidecarConfig | null {
+  const url = process.env.OMNIROUTE_CFSOLVER_URL;
+  if (!url) return null;
+  return {
+    url,
+    apiKey: process.env.OMNIROUTE_CFSOLVER_KEY || undefined,
+    timeoutMs: 60000, // 60s — Cloudflare challenges can take time to solve
+  };
+}
+
 // ── Health checks ──────────────────────────────────────────────────────────
 
 // Each sidecar has a different health endpoint.
@@ -60,6 +71,7 @@ const SIDECAR_HEALTH_PATHS: Record<string, string> = {
   browserless: "/config",
   litellm: "/health/liveness",
   mem0: "/health",
+  cfsolver: "/health",
 };
 
 async function checkSidecarHealth(name: string, config: SidecarConfig): Promise<SidecarHealth> {
@@ -106,6 +118,8 @@ export async function checkAllSidecars(): Promise<SidecarHealth[]> {
   if (litellm) checks.push(checkSidecarHealth("litellm", litellm));
   const mem0 = getMem0Config();
   if (mem0) checks.push(checkSidecarHealth("mem0", mem0));
+  const cfsolver = getCfSolverConfig();
+  if (cfsolver) checks.push(checkSidecarHealth("cfsolver", cfsolver));
   return Promise.all(checks);
 }
 

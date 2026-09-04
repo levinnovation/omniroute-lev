@@ -21,6 +21,7 @@ import { prepareToolMessages } from "../translator/webTools.ts";
 import { buildToolModeResponse } from "./chatgptWebTools.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import { buildSessionCookieHeader, mergeRefreshedCookie } from "../utils/nextAuthCookie.ts";
+import { getCfClearance, injectCfClearance } from "../services/cfClearanceService.ts";
 import {
   PPLX_SSE_ENDPOINT,
   PPLX_USER_AGENT,
@@ -664,11 +665,42 @@ export class PerplexityWebExecutor extends BaseExecutor {
       let errMsg = `Perplexity returned HTTP ${status}`;
       if (status === 401 || status === 403) {
         if (isCloudflareChallenge(response.text)) {
-          errMsg =
-            "Cloudflare blocked the request — Perplexity's edge rejected this server's TLS fingerprint " +
-            "(common on VPS/datacenter IPs). Ensure tls-client-node is installed with its native binary, " +
-            "or route perplexity-web through a residential proxy.";
-          log?.error?.("PPLX-WEB", "Cloudflare challenge detected — TLS bypass failed");
+          // LEV fork: Try cf_clearance refresh via the Python cloudflare-solver sidecar.
+          // If successful, retry the request once with the fresh cf_clearance cookie.
+          log?.error?.(
+            "PPLX-WEB",
+            "Cloudflare challenge detected — attempting cf_clearance refresh"
+          );
+          try {
+            const cfResult = await getCfClearance("https://www.perplexity.ai/");
+            if (cfResult?.cfClearance) {
+              const retryHeaders = {
+                ...headers,
+                Cookie: injectCfClearance(headers["Cookie"] ?? "", cfResult.cfClearance),
+              };
+              const retried = await tlsFetchPerplexity(PPLX_SSE_ENDPOINT, {
+                method: "POST",
+                headers: retryHeaders,
+                body: JSON.stringify(pplxBody),
+                signal: signal ?? null,
+                stream: true,
+                streamEofSymbol: PPLX_STREAM_EOF_SYMBOL,
+              });
+              if (retried.status === 200 && (retried.body || retried.text)) {
+                log?.info?.("PPLX-WEB", "cf_clearance refresh succeeded — retrying request");
+                response = retried;
+              }
+            }
+          } catch {
+            // Fall through to error
+          }
+          if (response.status !== 200 || (!response.body && !response.text)) {
+            errMsg =
+              "Cloudflare blocked the request — Perplexity's edge rejected this server's TLS fingerprint " +
+              "(common on VPS/datacenter IPs). Ensure tls-client-node is installed with its native binary, " +
+              "or route perplexity-web through a residential proxy.";
+            log?.error?.("PPLX-WEB", "Cloudflare challenge detected — TLS bypass failed");
+          }
         } else {
           errMsg =
             "Perplexity auth failed — session cookie may be expired. Re-paste your __Secure-next-auth.session-token.";
@@ -676,14 +708,16 @@ export class PerplexityWebExecutor extends BaseExecutor {
       } else if (status === 429) {
         errMsg = "Perplexity rate limited. Wait a moment and retry.";
       }
-      log?.warn?.("PPLX-WEB", errMsg);
-      const errResp = new Response(
-        JSON.stringify({
-          error: { message: errMsg, type: "upstream_error", code: `HTTP_${status}` },
-        }),
-        { status, headers: { "Content-Type": "application/json" } }
-      );
-      return { response: errResp, url: PPLX_SSE_ENDPOINT, headers, transformedBody: pplxBody };
+      if (response.status !== 200 || (!response.body && !response.text)) {
+        log?.warn?.("PPLX-WEB", errMsg);
+        const errResp = new Response(
+          JSON.stringify({
+            error: { message: errMsg, type: "upstream_error", code: `HTTP_${status}` },
+          }),
+          { status, headers: { "Content-Type": "application/json" } }
+        );
+        return { response: errResp, url: PPLX_SSE_ENDPOINT, headers, transformedBody: pplxBody };
+      }
     }
 
     // If the TLS client buffered the body (looksLikeSse false-negative, or a

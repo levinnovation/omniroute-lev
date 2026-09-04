@@ -30,6 +30,7 @@ import {
   makeExecutorErrorResult as makeErrorResult,
   sanitizeErrorMessage,
 } from "../../utils/error.ts";
+import { classifyCaptcha, CaptchaType } from "../../services/captchaDetector.ts";
 
 type Page = import("playwright").Page;
 type BrowserContext = import("playwright").BrowserContext;
@@ -78,6 +79,7 @@ export type WebCookieErrorKind =
   | "PROVIDER_ERROR"
   | "STREAM_EARLY_EOF"
   | "BROWSER_TRANSPORT"
+  | "CAPTCHA_DETECTED"
   | "UNKNOWN";
 
 export interface WebCookieError {
@@ -205,6 +207,19 @@ export abstract class WebCookieExecutorBase extends BaseExecutor {
     retryAfter?: string | null
   ): WebCookieError {
     const message = sanitizeErrorMessage(bodyText || `HTTP ${status}`);
+
+    // LEV fork: Detect captcha/Cloudflare challenges before other classifications.
+    // This allows the caller to invoke the appropriate solver (NopeCHA extension,
+    // cfClearanceService, or provider-specific solver) before giving up.
+    const captcha = classifyCaptcha(bodyText);
+    if (captcha.type !== CaptchaType.NONE) {
+      return {
+        kind: "CAPTCHA_DETECTED",
+        status,
+        message: `Captcha detected (${captcha.type}): ${message}`,
+      };
+    }
+
     if (status === 404) {
       return { kind: "MODEL_LOCKOUT", status, message: `Model not available: ${message}` };
     }
@@ -247,7 +262,9 @@ export abstract class WebCookieExecutorBase extends BaseExecutor {
           ? 404
           : error.kind === "STREAM_EARLY_EOF"
             ? 502
-            : error.status || 502;
+            : error.kind === "CAPTCHA_DETECTED"
+              ? 403
+              : error.status || 502;
     return makeErrorResult(status, `[${this.provider}] ${error.message}`, body, url);
   }
 

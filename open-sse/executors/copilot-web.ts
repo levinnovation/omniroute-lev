@@ -382,8 +382,14 @@ export class CopilotWebExecutor extends BaseExecutor {
                       chatSent = false;
                       sendChat();
                     } else if (event.method === "cloudflare") {
+                      // LEV fork: Copilot's Cloudflare Turnstile challenge arrives
+                      // over WebSocket, so NopeCHA extension can't auto-solve it.
+                      // The cf_clearance sidecar can help if configured, but the
+                      // primary path is to use an authenticated access_token session.
                       abort(
-                        "Copilot requires Cloudflare Turnstile verification. Use an authenticated session (access_token) instead."
+                        "Copilot requires Cloudflare Turnstile verification. " +
+                          "Use an authenticated session (access_token) instead, " +
+                          "or configure the OMNIROUTE_CFSOLVER_URL sidecar for cf_clearance acquisition."
                       );
                     } else {
                       abort(

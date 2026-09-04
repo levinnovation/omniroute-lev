@@ -163,6 +163,57 @@ function classifyContextError(err: unknown): "target-closed" | "queue-full" | "o
   return "other";
 }
 
+// LEV fork: NopeCHA captcha solver extension support.
+// Resolves the path to the NopeCHA browser extension directory. The extension
+// auto-solves Turnstile, reCAPTCHA v2/v3, and hCaptcha widgets on-page.
+// It is downloaded at Docker build time to /app/extensions/nopecha/.
+// For local dev, set OMNIROUTE_NOPECHA_EXTENSION_PATH to the extension dir.
+// Returns null if the extension is not available (graceful degradation).
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+let nopechaExtensionPathCache: string | null | undefined;
+
+function resolveNopechaExtensionPath(): string | null {
+  if (nopechaExtensionPathCache !== undefined) return nopechaExtensionPathCache;
+
+  // 1. Explicit env var override
+  const envPath = process.env.OMNIROUTE_NOPECHA_EXTENSION_PATH;
+  if (envPath && existsSync(envPath)) {
+    nopechaExtensionPathCache = envPath;
+    return envPath;
+  }
+
+  // 2. Default Docker location
+  const dockerPath = "/app/extensions/nopecha";
+  if (existsSync(join(dockerPath, "manifest.json"))) {
+    nopechaExtensionPathCache = dockerPath;
+    return dockerPath;
+  }
+
+  // 3. Local dev location (relative to CWD)
+  const localPath = join(process.cwd(), "extensions/nopecha");
+  if (existsSync(join(localPath, "manifest.json"))) {
+    nopechaExtensionPathCache = localPath;
+    return localPath;
+  }
+
+  // Not found — extension support disabled
+  nopechaExtensionPathCache = null;
+  return null;
+}
+
+/**
+ * Build Chrome args for loading the NopeCHA extension. Returns an empty array
+ * if the extension is not available. Chrome extensions require `--headless=new`
+ * (not the old `--headless` mode) to function in headless environments.
+ */
+function buildNopechaExtensionArgs(): string[] {
+  const extPath = resolveNopechaExtensionPath();
+  if (!extPath) return [];
+  return [`--disable-extensions-except=${extPath}`, `--load-extension=${extPath}`];
+}
+
 // LEV fork: Replace cloakbrowser (obfuscated dynamic import, off-lockfile) with
 // patchright — a drop-in Playwright replacement with built-in stealth patches.
 // Same API as playwright, no version drift risk, properly pinned in package.json.
@@ -318,11 +369,21 @@ async function launchBrowser(): Promise<Browser> {
     // LEV fork: Try Browserless sidecar via CDP first, fall back to local launch.
     let browser: Browser | null = await connectBrowserless();
     if (!browser) {
+      // LEV fork: Build NopeCHA extension args for captcha auto-solving.
+      // Chrome extensions require --headless=new (Chrome's new headless mode)
+      // to function in headless environments. We pass this via args rather
+      // than the `headless` option because Playwright's type only accepts
+      // boolean, but Chrome's --headless=new arg works with headless: false.
+      const nopechaArgs = buildNopechaExtensionArgs();
+      const extensionArgs = nopechaArgs.length > 0 ? ["--headless=new", ...nopechaArgs] : [];
+      if (nopechaArgs.length > 0) {
+        console.log("[BrowserPool] NopeCHA captcha solver extension loaded");
+      }
       const stealthLaunch = await resolveStealthLaunch();
       if (stealthLaunch) {
         browser = await stealthLaunch({
           headless: true,
-          args: ["--no-sandbox", "--disable-dev-shm-usage"],
+          args: ["--no-sandbox", "--disable-dev-shm-usage", ...extensionArgs],
         });
       } else {
         // Fallback: plain Playwright. Works for Claude web (cookie-only
@@ -334,6 +395,7 @@ async function launchBrowser(): Promise<Browser> {
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
+            ...extensionArgs,
           ],
         });
       }

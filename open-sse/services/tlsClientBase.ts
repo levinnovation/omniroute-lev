@@ -269,13 +269,13 @@ export function looksLikeSse(text: string): boolean {
 
 /**
  * Returns true if the response body is a Cloudflare challenge/interstitial page.
+ *
+ * Canonical implementation now lives in `captchaDetector.ts` — this re-export
+ * preserves backward compatibility for all existing imports from this module
+ * and its per-provider re-exports (grokTlsClient, perplexityTlsClient, etc.).
  */
-export function isCloudflareChallenge(text: string | null | undefined): boolean {
-  if (!text) return false;
-  return /just a moment|window\._cf_chl_opt|challenges\.cloudflare\.com|attention required|cf-chl/i.test(
-    text
-  );
-}
+import { isCloudflareChallenge } from "./captchaDetector.ts";
+export { isCloudflareChallenge };
 
 // ---------------------------------------------------------------------------
 // Temp-path cleanup — two variants
