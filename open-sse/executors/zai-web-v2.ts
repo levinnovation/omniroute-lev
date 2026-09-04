@@ -23,8 +23,11 @@ import type { ProviderCredentials, ExecuteInput } from "../base.ts";
 import {
   browserModelName,
   browserPrompt,
+  buildZaiCompletionUrl,
   buildZaiNewChatBody,
   buildZaiRequestBody,
+  buildZaiSignature,
+  extractZaiUserId,
   ZAI_BASE_URL,
   ZAI_DEFAULT_MODEL,
   ZAI_USER_AGENT,
@@ -312,6 +315,19 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       vlmConfig: { webSearchEnabled: false, toolsEnabled: false, websiteModeEnabled: false },
     });
 
+    // Build the signed completions URL with query parameters
+    const requestId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const userId = extractZaiUserId(token);
+    const signature = buildZaiSignature({ prompt, requestId, timestamp, userId });
+    const completionUrl = buildZaiCompletionUrl({
+      requestId,
+      timestamp,
+      token,
+      userId,
+      clientVersion: "1.0.91",
+    });
+
     const result = await page.evaluate(
       async (params: {
         baseUrl: string;
@@ -319,8 +335,18 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         newChatPayload: Record<string, unknown>;
         completionsBody: Record<string, unknown>;
         capturedChatId: string;
+        completionUrl: string;
+        signature: string;
       }) => {
-        const { baseUrl, token, newChatPayload, completionsBody, capturedChatId } = params;
+        const {
+          baseUrl,
+          token,
+          newChatPayload,
+          completionsBody,
+          capturedChatId,
+          completionUrl,
+          signature,
+        } = params;
 
         // Use the captured chat ID or create a new chat
         let chatId = capturedChatId;
@@ -361,44 +387,41 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
           };
         }
 
-        // Try completions endpoints
-        const endpoints = [`${baseUrl}/api/v1/chat/completions`, `${baseUrl}/api/chat/completions`];
+        // Use the signed completions URL with query parameters
         const reqBody = { ...completionsBody, chat_id: chatId };
-        for (const endpoint of endpoints) {
-          try {
-            const resp = await fetch(endpoint, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Accept: "text/event-stream",
-                Authorization: `Bearer ${token}`,
-                "X-FE-Version": "prod-fe-1.1.93",
-                "X-Client-Version": "1.0.91",
-              },
-              body: JSON.stringify(reqBody),
-              credentials: "include",
-            });
-            const text = await resp.text();
-            const respHeaders: Record<string, string> = {};
-            for (const [name, value] of Object.entries(resp.headers)) {
-              respHeaders[name] = value;
-            }
-            if (resp.ok || resp.status !== 404) {
-              return {
-                status: resp.status,
-                headers: respHeaders,
-                body: text,
-                contentType: respHeaders["content-type"] || "text/event-stream",
-              };
-            }
-          } catch {}
+        try {
+          const resp = await fetch(completionUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              Authorization: `Bearer ${token}`,
+              "X-FE-Version": "prod-fe-1.1.93",
+              "X-Client-Version": "1.0.91",
+              "X-Signature": signature,
+            },
+            body: JSON.stringify(reqBody),
+            credentials: "include",
+          });
+          const text = await resp.text();
+          const respHeaders: Record<string, string> = {};
+          for (const [name, value] of Object.entries(resp.headers)) {
+            respHeaders[name] = value;
+          }
+          return {
+            status: resp.status,
+            headers: respHeaders,
+            body: text,
+            contentType: respHeaders["content-type"] || "text/event-stream",
+          };
+        } catch (err) {
+          return {
+            status: 502,
+            headers: {} as Record<string, string>,
+            body: `completions fetch failed: ${err instanceof Error ? err.message : String(err)}`,
+            contentType: "text/plain",
+          };
         }
-        return {
-          status: 404,
-          headers: {} as Record<string, string>,
-          body: "All endpoints 404",
-          contentType: "text/plain",
-        };
       },
       {
         baseUrl: ZAI_BASE_URL,
@@ -406,6 +429,8 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         newChatPayload,
         completionsBody,
         capturedChatId,
+        completionUrl,
+        signature,
       }
     );
 
