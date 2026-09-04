@@ -327,6 +327,7 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       userId,
       clientVersion: "1.0.91",
     });
+    console.error(`[zai-web-v2] completionUrl: ${completionUrl.slice(0, 200)}`);
 
     const result = await page.evaluate(
       async (params: {
@@ -389,39 +390,51 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
 
         // Use the signed completions URL with query parameters
         const reqBody = { ...completionsBody, chat_id: chatId };
-        try {
-          const resp = await fetch(completionUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "text/event-stream",
-              Authorization: `Bearer ${token}`,
-              "X-FE-Version": "prod-fe-1.1.93",
-              "X-Client-Version": "1.0.91",
-              "X-Signature": signature,
-            },
-            body: JSON.stringify(reqBody),
-            credentials: "include",
-          });
-          const text = await resp.text();
-          const respHeaders: Record<string, string> = {};
-          for (const [name, value] of Object.entries(resp.headers)) {
-            respHeaders[name] = value;
-          }
-          return {
-            status: resp.status,
-            headers: respHeaders,
-            body: text,
-            contentType: respHeaders["content-type"] || "text/event-stream",
-          };
-        } catch (err) {
-          return {
-            status: 502,
-            headers: {} as Record<string, string>,
-            body: `completions fetch failed: ${err instanceof Error ? err.message : String(err)}`,
-            contentType: "text/plain",
-          };
+
+        // Try multiple endpoint variants — z.ai may have changed the path
+        const baseUrls = [
+          completionUrl, // /api/chat/completions?...
+          completionUrl.replace("/api/chat/completions", "/api/v1/chat/completions"),
+          completionUrl.replace("/api/chat/completions", "/api/v2/chat/completions"),
+        ];
+
+        for (const url of baseUrls) {
+          try {
+            const resp = await fetch(url, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "text/event-stream",
+                Authorization: `Bearer ${token}`,
+                "X-FE-Version": "prod-fe-1.1.93",
+                "X-Client-Version": "1.0.91",
+                "X-Signature": signature,
+              },
+              body: JSON.stringify(reqBody),
+              credentials: "include",
+            });
+            const text = await resp.text();
+            const respHeaders: Record<string, string> = {};
+            for (const [name, value] of Object.entries(resp.headers)) {
+              respHeaders[name] = value;
+            }
+            // Return the first non-404 response
+            if (resp.status !== 404) {
+              return {
+                status: resp.status,
+                headers: respHeaders,
+                body: text,
+                contentType: respHeaders["content-type"] || "text/event-stream",
+              };
+            }
+          } catch {}
         }
+        return {
+          status: 404,
+          headers: {} as Record<string, string>,
+          body: "All completions endpoints returned 404",
+          contentType: "text/plain",
+        };
       },
       {
         baseUrl: ZAI_BASE_URL,
