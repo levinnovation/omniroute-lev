@@ -216,8 +216,9 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       }
     });
 
-    // Set up response listener
-    const responsePromise = page
+    // Set up response listener (best-effort — we don't await this since the
+    // page may be closed before the response arrives)
+    page
       .waitForResponse(
         (r) =>
           r.request().method() === "POST" &&
@@ -307,12 +308,22 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       console.error(`[zai-web-v2] submit: pressed Enter`);
     }
 
-    // Wait for the completions response
-    await responsePromise;
+    // Wait briefly for the captcha to be captured from the frontend's request.
+    // We do NOT wait for the full response — the page may be closed by the base
+    // class before the response arrives. Instead, we capture the captcha param
+    // from the request, then make our own API call.
+    for (let i = 0; i < 30 && !capturedCaptcha && !capturedResponse; i++) {
+      await page.waitForTimeout(1000);
+    }
 
-    // If we captured the captcha param but no response, retry with API flow
-    if (!capturedResponse && capturedCaptcha) {
-      console.error(`[zai-web-v2] retrying with API flow using captured captcha`);
+    // If we captured the response directly, return it
+    if (capturedResponse) return capturedResponse;
+
+    // If we captured the captcha param, do the API call ourselves
+    if (capturedCaptcha) {
+      console.error(
+        `[zai-web-v2] using captured captcha for API flow: ${capturedCaptcha.length} chars`
+      );
       const { userMessageId, payload: newChatPayload } = buildZaiNewChatBody(
         messages,
         modelId,
@@ -426,7 +437,8 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       return retryResult;
     }
 
-    if (capturedResponse) return capturedResponse;
+    // No captcha captured — the frontend may not have sent the request
+    console.error(`[zai-web-v2] no captcha captured after 30s`);
 
     return {
       status: 502,
