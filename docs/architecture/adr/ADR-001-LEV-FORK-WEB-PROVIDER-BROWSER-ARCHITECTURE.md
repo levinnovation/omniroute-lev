@@ -1,3 +1,8 @@
+---
+title: "ADR-001: LEV Fork Web Provider Browser Architecture"
+description: "Decision record for browser-first web-cookie provider execution in the LEV fork."
+---
+
 # ADR-001: LEV Fork Web Provider Browser Architecture
 
 **Status**: Accepted
