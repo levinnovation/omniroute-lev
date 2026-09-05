@@ -528,6 +528,7 @@ export class GeminiWebExecutor extends BaseExecutor {
       });
       await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: 20_000 });
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      log?.info?.("GEMINI-WEB", "Browser path: page navigated, looking for input selector");
 
       const imageMode = (body as Record<string, unknown>)?.x_gemini_web_image_mode === true;
       let responseText = "";
@@ -565,6 +566,7 @@ export class GeminiWebExecutor extends BaseExecutor {
       const inputEl = await page.waitForSelector(".ql-editor, [contenteditable='true']", {
         timeout: 10_000,
       });
+      log?.info?.("GEMINI-WEB", "Browser path: input selector found, filling prompt");
       await inputEl.click();
       await page.evaluate((text) => {
         const editor = document.querySelector(".ql-editor, [contenteditable='true']");
@@ -579,6 +581,7 @@ export class GeminiWebExecutor extends BaseExecutor {
         editor.dispatchEvent(event);
       }, prompt);
       await page.keyboard.press("Enter");
+      log?.info?.("GEMINI-WEB", `Browser path: prompt submitted, waiting ${responseWaitMs}ms for StreamGenerate response`);
 
       const responseWaitMs = imageMode ? 90000 : hasTools ? 60000 : 30000;
       // LEV fork: use a plain setTimeout instead of page.waitForTimeout() — the
@@ -590,6 +593,7 @@ export class GeminiWebExecutor extends BaseExecutor {
       });
       await Promise.race([responsePromise, timeoutPromise, disconnectPromise]);
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      log?.info?.("GEMINI-WEB", `Browser path: response wait settled, responseText length=${responseText.length}, images=${responseImages.length}`);
 
       await this.persistRotatedCookies(
         pooled.context,
