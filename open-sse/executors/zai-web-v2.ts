@@ -98,24 +98,23 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
 
     try {
       const result = await super.execute(input);
-      if (
-        result &&
-        typeof result === "object" &&
-        "status" in result &&
-        (result as { status: number }).status >= 500
-      ) {
-        const errBody = String((result as { body?: unknown }).body ?? "");
-        // Check for Browserless disconnect patterns OR zai-web-specific
-        // symptoms of disconnect (no completions response captured = page closed)
-        const isDisconnect =
-          shouldFallbackToFFI(errBody) ||
-          errBody.includes("did not send a completions request") ||
-          errBody.includes("no completions response captured") ||
-          errBody.includes("page may have navigated away");
-        if (isDisconnect) {
-          console.error("[zai-web-v2] base execute failed with Browserless disconnect, trying FFI fallback");
-          const ffiResult = await this.executeViaFFI(input);
-          if (ffiResult) return ffiResult;
+      // Check if the result is an error response (502/503) from a Browserless disconnect
+      if (result && typeof result === "object" && "response" in result) {
+        const response = (result as { response: Response }).response;
+        if (response.status >= 500) {
+          // Clone the response so we can read the body without consuming it
+          const errBody = await response.clone().text();
+          const isDisconnect =
+            shouldFallbackToFFI(errBody) ||
+            errBody.includes("did not send a completions request") ||
+            errBody.includes("no completions response captured") ||
+            errBody.includes("page may have navigated away") ||
+            errBody.includes("Target page, context or browser has been closed");
+          if (isDisconnect) {
+            console.error("[zai-web-v2] base execute failed with Browserless disconnect, trying FFI fallback");
+            const ffiResult = await this.executeViaFFI(input);
+            if (ffiResult) return ffiResult;
+          }
         }
       }
       return result;
