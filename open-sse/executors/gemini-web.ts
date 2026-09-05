@@ -622,19 +622,46 @@ export class GeminiWebExecutor extends BaseExecutor {
           log?.warn?.("GEMINI-WEB", `keyboard.type() failed: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
-      // Submit: try clicking the send button first, then fall back to Enter
-      const sendBtn = page.locator('button[aria-label="Send"], button[data-testid="send-button"], button.send-button').first();
+      // Submit: try clicking the send button first, then fall back to DOM-based submit.
+      // LEV fork: Avoid page.keyboard.press("Enter") — the Gemini frontend throws
+      // "Cannot access 'T' before initialization" on ANY keyboard event.
+      const sendBtn = page.locator('button[aria-label="Send"], button[data-testid="send-button"], button.send-button, button[mattooltip*="Send"], rich-text-menu + button, .send-button').first();
       if (await sendBtn.count() > 0) {
         try {
-          await sendBtn.click({ timeout: 2000 });
-          log?.info?.("GEMINI-WEB", "Browser path: submitted via send button click");
+          await sendBtn.evaluate((el) => (el as HTMLElement).click());
+          log?.info?.("GEMINI-WEB", "Browser path: submitted via send button DOM click");
         } catch {
-          await page.keyboard.press("Enter");
-          log?.info?.("GEMINI-WEB", "Browser path: submitted via Enter key (send button click failed)");
+          try {
+            await sendBtn.click({ timeout: 2000 });
+            log?.info?.("GEMINI-WEB", "Browser path: submitted via send button Playwright click");
+          } catch {
+            // Last resort: submit via form submit() or evaluate-based Enter
+            await page.evaluate(() => {
+              const form = document.querySelector("form") as HTMLFormElement | null;
+              if (form) form.submit();
+            }).catch(() => {});
+            log?.info?.("GEMINI-WEB", "Browser path: submitted via form.submit()");
+          }
         }
       } else {
-        await page.keyboard.press("Enter");
-        log?.info?.("GEMINI-WEB", "Browser path: submitted via Enter key (no send button found)");
+        // No send button found — try submitting the form directly
+        await page.evaluate(() => {
+          const form = document.querySelector("form") as HTMLFormElement | null;
+          if (form) form.submit();
+          else {
+            // Try clicking any button that looks like a submit
+            const buttons = document.querySelectorAll("button");
+            for (const btn of buttons) {
+              const text = (btn.textContent || "").toLowerCase();
+              const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+              if (text.includes("send") || aria.includes("send") || btn.classList.contains("send")) {
+                (btn as HTMLElement).click();
+                return;
+              }
+            }
+          }
+        }).catch(() => {});
+        log?.info?.("GEMINI-WEB", "Browser path: submitted via evaluate form submit");
       }
       log?.info?.("GEMINI-WEB", `Browser path: prompt submitted, waiting ${responseWaitMs}ms for StreamGenerate response`);
 
