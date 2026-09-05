@@ -568,13 +568,43 @@ export class GeminiWebExecutor extends BaseExecutor {
       });
       log?.info?.("GEMINI-WEB", "Browser path: input selector found, filling prompt");
       await inputEl.click();
-      // LEV fork: Use keyboard.type() instead of ClipboardEvent paste — the
-      // Gemini frontend's minified code throws "Cannot access 'v' before
-      // initialization" when receiving a synthetic paste event, likely because
-      // a Quill handler references a variable before Quill finishes initializing.
-      // keyboard.type() simulates real keystrokes which the frontend handles
-      // natively without triggering the broken paste handler.
-      await page.keyboard.type(prompt, { delay: 5 });
+      // LEV fork: Wait for Quill to be fully initialized before typing.
+      // The Gemini frontend throws "Cannot access 'N' before initialization"
+      // when keystrokes arrive before Quill's internal state is ready.
+      await page.waitForFunction(() => {
+        const editor = document.querySelector(".ql-editor, [contenteditable='true']") as HTMLElement | null;
+        if (!editor) return false;
+        return editor.isContentEditable && document.activeElement === editor;
+      }, { timeout: 10_000 }).catch(() => {});
+      // LEV fork: Try multiple input strategies — the Gemini frontend's minified
+      // Quill handlers can throw "Cannot access 'N' before initialization" on
+      // keyboard events. Try keyboard.type() first, then fall back to
+      // locator.fill(), then fall back to evaluate-based input.
+      let promptFilled = false;
+      try {
+        await page.keyboard.type(prompt, { delay: 10 });
+        promptFilled = true;
+      } catch (e) {
+        log?.warn?.("GEMINI-WEB", `keyboard.type() failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (!promptFilled) {
+        try {
+          await inputEl.fill(prompt);
+          promptFilled = true;
+        } catch (e) {
+          log?.warn?.("GEMINI-WEB", `locator.fill() failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (!promptFilled) {
+        // Last resort: set innerHTML directly
+        await page.evaluate((text) => {
+          const editor = document.querySelector(".ql-editor, [contenteditable='true']") as HTMLElement | null;
+          if (editor) {
+            editor.innerHTML = `<p>${text}</p>`;
+            editor.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+          }
+        }, prompt).catch(() => {});
+      }
       await page.keyboard.press("Enter");
       log?.info?.("GEMINI-WEB", `Browser path: prompt submitted, waiting ${responseWaitMs}ms for StreamGenerate response`);
 
