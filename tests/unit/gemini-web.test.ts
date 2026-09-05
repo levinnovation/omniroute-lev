@@ -25,7 +25,7 @@ test("GeminiWebExecutor sets correct provider name", () => {
 });
 
 test("buildGeminiStreamRequestBody includes the prompt, model category, and CSRF token", () => {
-  const body = buildGeminiStreamRequestBody("Say OK", "csrf-token", "gemini-3.7-flash");
+  const body = buildGeminiStreamRequestBody("Say OK", "csrf-token", "gemini-3.5-flash");
   const form = new URLSearchParams(body);
   assert.equal(form.get("at"), "csrf-token");
 

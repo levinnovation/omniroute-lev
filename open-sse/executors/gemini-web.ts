@@ -37,8 +37,10 @@ const GEMINI_STREAM_URL =
 
 const GEMINI_MODEL_CATEGORY: Record<string, number> = {
   "gemini-3.1-pro": 70,
+  "gemini-3.5-flash": 75,
   "gemini-3.7-flash": 75,
   "gemini-3.1-flash-lite": 75,
+  "nano-banana-web": 76,
 };
 
 /**
