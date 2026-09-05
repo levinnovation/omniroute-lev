@@ -581,36 +581,61 @@ export class GeminiWebExecutor extends BaseExecutor {
         if (!editor) return false;
         return editor.isContentEditable && document.activeElement === editor;
       }, { timeout: 10_000 }).catch(() => {});
-      // LEV fork: Try multiple input strategies — the Gemini frontend's minified
-      // Quill handlers can throw "Cannot access 'N' before initialization" on
-      // keyboard events. Try keyboard.type() first, then fall back to
-      // locator.fill(), then fall back to evaluate-based input.
+      // LEV fork: The Gemini frontend's minified JS throws "Cannot access 'T'
+      // before initialization" on ANY keyboard event because a module-level
+      // variable in an event handler hasn't been initialized. This is a
+      // frontend bug that affects all keyboard input. Work around it by
+      // setting the Quill editor's content directly via its internal API,
+      // then dispatching an input event — no keyboard events needed.
       let promptFilled = false;
       try {
-        await page.keyboard.type(prompt, { delay: 10 });
-        promptFilled = true;
-      } catch (e) {
-        log?.warn?.("GEMINI-WEB", `keyboard.type() failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      if (!promptFilled) {
-        try {
-          await inputEl.fill(prompt);
-          promptFilled = true;
-        } catch (e) {
-          log?.warn?.("GEMINI-WEB", `locator.fill() failed: ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      if (!promptFilled) {
-        // Last resort: set innerHTML directly
         await page.evaluate((text) => {
+          // Try Quill's internal API first
+          const quillRoot = document.querySelector(".ql-editor") as HTMLElement | null;
+          if (quillRoot) {
+            // Access Quill's internal instance
+            const quill = (quillRoot as any).__quill || (quillRoot.parentElement as any)?.__quill;
+            if (quill) {
+              quill.setText(text);
+              return;
+            }
+          }
+          // Fallback: set innerHTML and dispatch input event
           const editor = document.querySelector(".ql-editor, [contenteditable='true']") as HTMLElement | null;
           if (editor) {
             editor.innerHTML = `<p>${text}</p>`;
             editor.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
           }
-        }, prompt).catch(() => {});
+        }, prompt);
+        promptFilled = true;
+        log?.info?.("GEMINI-WEB", "Browser path: prompt filled via evaluate");
+      } catch (e) {
+        log?.warn?.("GEMINI-WEB", `evaluate fill failed: ${e instanceof Error ? e.message : String(e)}`);
       }
-      await page.keyboard.press("Enter");
+      if (!promptFilled) {
+        // Last resort: try keyboard.type() with a long delay
+        try {
+          await page.keyboard.type(prompt, { delay: 50 });
+          promptFilled = true;
+          log?.info?.("GEMINI-WEB", "Browser path: prompt filled via keyboard.type()");
+        } catch (e) {
+          log?.warn?.("GEMINI-WEB", `keyboard.type() failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      // Submit: try clicking the send button first, then fall back to Enter
+      const sendBtn = page.locator('button[aria-label="Send"], button[data-testid="send-button"], button.send-button').first();
+      if (await sendBtn.count() > 0) {
+        try {
+          await sendBtn.click({ timeout: 2000 });
+          log?.info?.("GEMINI-WEB", "Browser path: submitted via send button click");
+        } catch {
+          await page.keyboard.press("Enter");
+          log?.info?.("GEMINI-WEB", "Browser path: submitted via Enter key (send button click failed)");
+        }
+      } else {
+        await page.keyboard.press("Enter");
+        log?.info?.("GEMINI-WEB", "Browser path: submitted via Enter key (no send button found)");
+      }
       log?.info?.("GEMINI-WEB", `Browser path: prompt submitted, waiting ${responseWaitMs}ms for StreamGenerate response`);
 
       const responseWaitMs = imageMode ? 90000 : hasTools ? 60000 : 30000;
