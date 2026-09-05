@@ -200,12 +200,22 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
     let completionsResponse: import("playwright").Response | null = null;
     let capturedChatId = "";
 
+    // Log ALL POST requests to diagnose what the frontend is actually doing
+    page.on("request", (request) => {
+      if (request.method() === "POST") {
+        console.error(`[zai-web-v2] POST request: ${request.url().slice(0, 150)}`);
+      }
+    });
+
     const responsePromise = page
       .waitForResponse(
         (r) =>
           r.request().method() === "POST" &&
-          r.url().includes("/api/chat/completions"),
-        { timeout: 60_000 }
+          (r.url().includes("/api/chat/completions") ||
+            r.url().includes("/api/v1/chat/completions") ||
+            r.url().includes("/api/v2/chat/completions") ||
+            r.url().includes("/completions")),
+        { timeout: 90_000 }
       )
       .then((r) => {
         completionsResponse = r;
