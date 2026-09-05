@@ -22,6 +22,11 @@ import {
 } from "../../services/browserPool.ts";
 import { sanitizeErrorMessage } from "../../utils/error.ts";
 import type { ExecutorLog } from "../base.ts";
+import {
+  interceptFrontendFetch,
+  shouldFallbackToFFI,
+  type FrontendFetchConfig,
+} from "./frontendFetchInterception.ts";
 
 type Page = import("playwright").Page;
 
@@ -48,6 +53,7 @@ export interface BrowserAutomationConfig {
   log?: ExecutorLog | null;
   signal?: AbortSignal | null;
   reuseContext?: boolean;
+  frontendFetchConfig?: FrontendFetchConfig;
 }
 
 export interface BrowserAutomationResult {
@@ -144,6 +150,7 @@ export async function runBrowserAutomation(
     log,
     signal,
     reuseContext = true,
+    frontendFetchConfig,
   } = config;
 
   const contextKey = reuseContext
@@ -173,6 +180,7 @@ export async function runBrowserAutomation(
   }
 
   let page: Page | null = null;
+  let ffiFallbackError: unknown = null;
   try {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     page = await openPage(pooled);
@@ -221,10 +229,7 @@ export async function runBrowserAutomation(
 
     // LEV fork: race the response against browser disconnect — if Browserless
     // dies mid-wait, return null immediately so the caller can fall back.
-    const response = await Promise.race([
-      responsePromise.catch(() => null),
-      disconnectPromise,
-    ]);
+    const response = await Promise.race([responsePromise.catch(() => null), disconnectPromise]);
     if (!response) {
       log?.warn?.(providerName.toUpperCase(), "Browser automation: no response captured");
       return null;
@@ -249,14 +254,14 @@ export async function runBrowserAutomation(
       providerName.toUpperCase(),
       `Browser automation failed: ${sanitizeErrorMessage(err instanceof Error ? err.message : String(err))}`
     );
-    return null;
+    if (frontendFetchConfig && shouldFallbackToFFI(err)) ffiFallbackError = err;
   } finally {
     try {
       if (page) await page.close();
     } catch {
       // ignore
     }
-    if (!reuseContext) {
+    if (!reuseContext || ffiFallbackError) {
       try {
         await releaseBrowserContext(contextKey);
       } catch {
@@ -264,6 +269,15 @@ export async function runBrowserAutomation(
       }
     }
   }
+
+  if (ffiFallbackError && frontendFetchConfig) {
+    log?.info?.(
+      providerName.toUpperCase(),
+      `Browser automation failed with an FFI-eligible error; retrying through frontend fetch`
+    );
+    return interceptFrontendFetch(frontendFetchConfig);
+  }
+  return null;
 }
 
 /**
