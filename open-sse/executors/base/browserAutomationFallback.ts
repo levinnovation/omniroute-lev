@@ -176,6 +176,14 @@ export async function runBrowserAutomation(
   try {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     page = await openPage(pooled);
+    // LEV fork: fail fast when Browserless disconnects mid-request instead of
+    // hanging until the local execution deadline or Browserless timeout.
+    const browser = pooled.context.browser();
+    const disconnectPromise = new Promise<null>((resolve) => {
+      if (browser) {
+        browser.on("disconnected", () => resolve(null));
+      }
+    });
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
     await waitWithSignal(1500, signal);
 
@@ -211,7 +219,12 @@ export async function runBrowserAutomation(
       await page.keyboard.press("Enter");
     }
 
-    const response = await responsePromise.catch(() => null);
+    // LEV fork: race the response against browser disconnect — if Browserless
+    // dies mid-wait, return null immediately so the caller can fall back.
+    const response = await Promise.race([
+      responsePromise.catch(() => null),
+      disconnectPromise,
+    ]);
     if (!response) {
       log?.warn?.(providerName.toUpperCase(), "Browser automation: no response captured");
       return null;

@@ -92,6 +92,10 @@ interface PoolState {
   cloakLaunch: ((opts: unknown) => Promise<Browser>) | null;
   cloakLaunchResolved: boolean;
   metrics: BrowserPoolMetrics;
+  // LEV fork: active lease counter — prevents idle-timer shutdown while
+  // requests are in-flight. Incremented on acquireBrowserContext, decremented
+  // on releaseBrowserContext. shutdownPool() refuses to run while > 0.
+  activeLeases: number;
 }
 
 const POOL_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -120,11 +124,14 @@ const state: PoolState = {
   cloakLaunch: null,
   cloakLaunchResolved: false,
   metrics: createBrowserPoolMetrics(),
+  activeLeases: 0,
 };
 
 // LEV fork: Clear all stale state when the browser disconnects. The browser
 // reference is dead, so all contexts (which are children of the browser) are
 // also dead. Pending context creations will reject on their own.
+// NOTE: we do NOT reset activeLeases here — callers still hold references and
+// will decrement on release. Resetting would allow a premature shutdown.
 function clearStaleBrowserState(): void {
   console.log("[BrowserPool] Clearing stale browser state — browser disconnected or closed");
   state.browser = null;
@@ -531,6 +538,7 @@ export async function acquireBrowserContext(
     existing.lastUsed = Date.now();
     state.lastActivity = Date.now();
     state.metrics.contextsReused++;
+    state.activeLeases++;
     resetIdleTimer();
     return existing;
   }
@@ -630,6 +638,7 @@ export async function acquireBrowserContext(
     state.contexts.set(key, pooled);
     state.metrics.contextsCreated++;
     state.lastActivity = Date.now();
+    state.activeLeases++;
     resetIdleTimer();
     startEvictTimer();
     return pooled;
@@ -649,20 +658,37 @@ export async function openPage(pooled: PooledContext): Promise<Page> {
 
 export async function releaseBrowserContext(key: string): Promise<void> {
   const pooled = state.contexts.get(key);
-  if (!pooled) return;
+  if (!pooled) {
+    // Still decrement the lease — acquireBrowserContext may have incremented it
+    // for a reused context that was evicted by the time release runs.
+    if (state.activeLeases > 0) state.activeLeases--;
+    return;
+  }
   state.contexts.delete(key);
   state.metrics.contextsReleased++;
+  if (state.activeLeases > 0) state.activeLeases--;
   try {
     await pooled.context.close();
   } catch {
     /* ignore */
   }
-  if (state.contexts.size === 0) {
+  if (state.contexts.size === 0 && state.activeLeases === 0) {
     await shutdownPool("last-context-closed");
   }
 }
 
 export async function shutdownPool(reason: string): Promise<void> {
+  // LEV fork: refuse to shut down while there are active leases. The idle
+  // timer or eviction timer may fire while a request is mid-execution; closing
+  // the browser out from under it causes "Target page, context or browser has
+  // been closed" errors. Reschedule instead.
+  if (state.activeLeases > 0) {
+    console.log(
+      `[BrowserPool] Shutdown requested (${reason}) but ${state.activeLeases} active lease(s) — deferring`
+    );
+    resetIdleTimer();
+    return;
+  }
   state.metrics.shutdowns++;
   state.metrics.lastShutdownReason = reason;
   if (state.idleTimer) {

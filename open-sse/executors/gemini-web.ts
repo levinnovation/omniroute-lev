@@ -517,6 +517,15 @@ export class GeminiWebExecutor extends BaseExecutor {
     try {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       page = await openPage(pooled);
+      // LEV fork: fail fast when Browserless disconnects mid-request instead of
+      // hanging until the local execution deadline expires.
+      const browser = pooled.context.browser();
+      const disconnectError = new Error("Browser disconnected during gemini-web execution");
+      const disconnectPromise = new Promise<never>((_, reject) => {
+        if (browser) {
+          browser.on("disconnected", () => reject(disconnectError));
+        }
+      });
       await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: 20_000 });
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
@@ -572,7 +581,14 @@ export class GeminiWebExecutor extends BaseExecutor {
       await page.keyboard.press("Enter");
 
       const responseWaitMs = imageMode ? 90000 : hasTools ? 60000 : 30000;
-      await Promise.race([responsePromise, page.waitForTimeout(responseWaitMs)]);
+      // LEV fork: use a plain setTimeout instead of page.waitForTimeout() — the
+      // latter keeps a live handle on the page and throws "Target page, context
+      // or browser has been closed" when Browserless disconnects mid-wait.
+      const timeoutPromise = new Promise<void>((resolve) => {
+        const t = setTimeout(() => resolve(), responseWaitMs);
+        signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+      });
+      await Promise.race([responsePromise, timeoutPromise, disconnectPromise]);
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
       await this.persistRotatedCookies(
