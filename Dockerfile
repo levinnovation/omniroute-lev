@@ -74,6 +74,7 @@ RUN npm ci --include=optional --no-audit --no-fund --legacy-peer-deps --ignore-s
       || echo "tls-client-node native binary missing (non-fatal — browser-first architecture)")
 
 # Build configuration
+ARG BUILD_TRIGGER=2026-09-05-v2
 ARG OMNIROUTE_USE_TURBOPACK=1
 ENV OMNIROUTE_USE_TURBOPACK="${OMNIROUTE_USE_TURBOPACK}"
 ARG OMNIROUTE_BASE_PATH=""
