@@ -26,10 +26,16 @@ import {
   ZAI_BASE_URL,
   ZAI_DEFAULT_MODEL,
   ZAI_USER_AGENT,
+  ZAI_CHAT_URL,
+  ZAI_NEW_CHAT_URL,
+  ZAI_DEFAULT_FE_VERSION,
+  ZAI_DEFAULT_CLIENT_VERSION,
 } from "./zai-web/protocol.ts";
 import { parseZaiFrame, isZaiVersionOutdatedError } from "./zai-web/stream.ts";
 import { ZAI_WEB_SESSION_CONFIG } from "./zai-web/sessionConfig.ts";
 import { WebSessionDriver } from "../services/webSessionDriver.ts";
+import { interceptFrontendFetch, shouldFallbackToFFI, type FrontendFetchConfig } from "./base/frontendFetchInterception.ts";
+import { makeExecutorErrorResult as makeErrorResult } from "../utils/error.ts";
 
 const INPUT_SELECTOR = "#chat-input";
 const SUBMIT_SELECTOR = '[aria-label="Send Message"] button:not([disabled])';
@@ -73,6 +79,9 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
    * before the base class runs. submitAndCapture needs these for the two-step
    * Z.ai flow: capture chats/new from the browser, then direct-fetch the SSE
    * stream from the completions endpoint.
+   *
+   * LEV fork GAP-7: If the base class execute() fails with a Browserless
+   * disconnect or JS crash, fall back to FFI (frontend fetch interception).
    */
   async execute(input: ExecuteInput): Promise<import("../base.ts").ExecutorExecuteResult> {
     this.currentToken = String(
@@ -86,7 +95,133 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         content: unknown;
       }>) || [];
     this.currentSignal = input.signal ?? null;
-    return super.execute(input);
+
+    try {
+      const result = await super.execute(input);
+      if (
+        result &&
+        typeof result === "object" &&
+        "status" in result &&
+        (result as { status: number }).status >= 500
+      ) {
+        const errBody = String((result as { body?: unknown }).body ?? "");
+        if (shouldFallbackToFFI(errBody)) {
+          console.error("[zai-web-v2] base execute failed with Browserless disconnect, trying FFI fallback");
+          const ffiResult = await this.executeViaFFI(input);
+          if (ffiResult) return ffiResult;
+        }
+      }
+      return result;
+    } catch (err) {
+      if (shouldFallbackToFFI(err)) {
+        console.error(
+          `[zai-web-v2] base execute threw Browserless disconnect: ${
+            err instanceof Error ? err.message : String(err)
+          }, trying FFI fallback`
+        );
+        const ffiResult = await this.executeViaFFI(input);
+        if (ffiResult) return ffiResult;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * LEV fork GAP-7: FFI fallback — make the API call from within a fresh
+   * browser context using page.evaluate(fetch(...)). This bypasses the UI
+   * interaction that fails when Browserless disconnects mid-operation.
+   */
+  private async executeViaFFI(
+    input: ExecuteInput
+  ): Promise<import("../base.ts").ExecutorExecuteResult | null> {
+    const token = this.currentToken;
+    if (!token) return null;
+
+    const cookieString = token.includes("=") ? token : "";
+    const prompt = browserPrompt(this.currentMessages);
+    const modelId = browserModelName(this.currentModel);
+
+    const ffiConfig: FrontendFetchConfig = {
+      providerName: "zai-web",
+      poolKey: `zai-web-ffi:${token.slice(0, 24)}`,
+      pageUrl: `${ZAI_BASE_URL}/?model=${encodeURIComponent(modelId)}`,
+      cookieDomain: "chat.z.ai",
+      cookieString,
+      userAgent: ZAI_USER_AGENT,
+      localStorage: { token },
+      localStorageOrigin: ZAI_BASE_URL,
+      fetchUrl: async (page) => {
+        const newChatRes = await page.evaluate(async (url: string) => {
+          const r = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title: "New Chat", model: "GLM-5.1" }),
+          });
+          return { status: r.status, body: await r.text() };
+        }, ZAI_NEW_CHAT_URL);
+        let chatId = "ffi-chat";
+        try {
+          const data = JSON.parse(newChatRes.body);
+          chatId = data?.id ?? data?.data?.id ?? chatId;
+        } catch {}
+        return `${ZAI_CHAT_URL}?chat_id=${chatId}`;
+      },
+      fetchOptions: async () => ({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-client-version": ZAI_DEFAULT_CLIENT_VERSION,
+          "x-fe-version": ZAI_DEFAULT_FE_VERSION,
+        },
+        body: JSON.stringify({
+          model: modelId,
+          messages: [{ role: "user", content: prompt }],
+          stream: true,
+        }),
+      }),
+      responseUrlMatch: /\/api\/chat\/completions/,
+      responseTimeoutMs: 60_000,
+      log: input.log,
+      signal: this.currentSignal,
+    };
+
+    const ffiResult = await interceptFrontendFetch(ffiConfig);
+    if (!ffiResult) return null;
+
+    const parsed = await this.parseResponse({
+      status: ffiResult.status,
+      headers: ffiResult.headers,
+      body: ffiResult.body,
+      contentType: ffiResult.contentType,
+    });
+
+    if (!parsed.content && !parsed.reasoningContent) return null;
+
+    const completionBody = {
+      id: `zai-web-ffi-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: this.currentModel,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: parsed.content,
+            reasoning_content: parsed.reasoningContent || undefined,
+          },
+          finish_reason: parsed.finishReason || "stop",
+        },
+      ],
+    };
+
+    return {
+      response: new Response(JSON.stringify(completionBody), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+      url: ZAI_CHAT_URL,
+    } as import("../base.ts").ExecutorExecuteResult;
   }
 
   getProviderUrl(): string {

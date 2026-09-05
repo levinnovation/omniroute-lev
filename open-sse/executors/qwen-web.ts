@@ -41,6 +41,7 @@ import {
   isBrowserAutomationEnabled,
 } from "./base/browserAutomationFallback.ts";
 import { flattenToolHistory } from "../utils/flattenToolHistory.ts";
+import { type FrontendFetchConfig } from "./base/frontendFetchInterception.ts";
 
 const BASE_URL = "https://chat.qwen.ai";
 const CHATS_NEW_URL = `${BASE_URL}/api/v2/chats/new`;
@@ -154,8 +155,57 @@ export class QwenWebExecutor extends BaseExecutor {
     const modelId = mapModel(requestedModel);
     const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(bodyObj, messages);
     const prompt = this.foldMessages(effectiveMessages);
+    const requestedModel = (bodyObj.model as string) || DEFAULT_MODEL;
+    const modelId = mapModel(requestedModel);
+    const msgPayload = this.buildMessagePayload("ffi-chat", modelId, prompt, requestedModel);
+    const apiHeaders = this.buildApiHeaders(token, cookieHeader);
 
     const poolKey = `qwen-web:${token.slice(0, 24)}`;
+
+    // LEV fork GAP-7: FFI fallback config — if UI automation fails with a
+    // Browserless disconnect or JS crash, interceptFrontendFetch() will
+    // acquire a fresh browser context and make the API call via page.evaluate(fetch(...)).
+    const ffiConfig: FrontendFetchConfig = {
+      providerName: "qwen-web",
+      poolKey: `${poolKey}-ffi`,
+      pageUrl: `${BASE_URL}/`,
+      cookieDomain: "chat.qwen.ai",
+      cookieString: cookieHeader,
+      userAgent: USER_AGENT,
+      fetchUrl: async (page) => {
+        // Step 1: create a chat via page.evaluate(fetch(...))
+        const newChatRes = await page.evaluate(async (url: string) => {
+          const r = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title: "New Chat",
+              models: ["qwen3-235b-a22b"],
+              chat_mode: "normal",
+              chat_type: "t2t",
+              timestamp: Date.now(),
+            }),
+          });
+          return { status: r.status, body: await r.text() };
+        }, CHATS_NEW_URL);
+        let chatId = "ffi-chat";
+        try {
+          const data = JSON.parse(newChatRes.body);
+          chatId = data?.data?.id ?? chatId;
+        } catch {}
+        return `${CHAT_COMPLETIONS_URL}?chat_id=${chatId}`;
+      },
+      fetchOptions: async () => ({
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...apiHeaders },
+        body: JSON.stringify(msgPayload),
+      }),
+      responseUrlMatch: /\/api\/v2\/chat\/completions/,
+      responseTimeoutMs: 60_000,
+      log,
+      signal,
+    };
+
     const result = await runBrowserAutomation({
       providerName: "qwen-web",
       poolKey,
@@ -173,6 +223,7 @@ export class QwenWebExecutor extends BaseExecutor {
       fillMode: "evaluate",
       log,
       signal,
+      frontendFetchConfig: ffiConfig,
     });
     if (!result) {
       log?.warn?.("QWEN-WEB", "Browser path: runBrowserAutomation returned null");
