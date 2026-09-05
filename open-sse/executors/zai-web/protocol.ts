@@ -3,6 +3,7 @@ import { createHmac, randomUUID } from "node:crypto";
 import type { ProviderCredentials } from "../base.ts";
 import { extractImageUrls } from "../../utils/cursorImages.ts";
 import { normalizeCookie, sanitizeErrorMessage } from "../../utils/error.ts";
+import { flattenToolHistory } from "../../utils/flattenToolHistory.ts";
 
 export const ZAI_BASE_URL = "https://chat.z.ai";
 export const ZAI_NEW_CHAT_URL = `${ZAI_BASE_URL}/api/v1/chats/new`;
@@ -333,7 +334,10 @@ export function foldMessages(
 }
 
 export function browserPrompt(messages: Array<{ role: string; content: unknown }>): string {
-  const folded = foldMessages(messages);
+  // LEV fork GAP-8: Flatten tool history before folding so assistant tool_calls
+  // and tool results are preserved as prose for agentic multi-turn conversations.
+  const flattened = flattenToolHistory(messages) as Array<{ role: string; content: unknown }>;
+  const folded = foldMessages(flattened);
   if (folded.length === 1 && folded[0]?.role === "user") return folded[0].content;
   return folded.map((message) => `${message.role.toUpperCase()}:\n${message.content}`).join("\n\n");
 }

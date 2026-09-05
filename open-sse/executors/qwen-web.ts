@@ -40,6 +40,7 @@ import {
   runBrowserAutomation,
   isBrowserAutomationEnabled,
 } from "./base/browserAutomationFallback.ts";
+import { flattenToolHistory } from "../utils/flattenToolHistory.ts";
 
 const BASE_URL = "https://chat.qwen.ai";
 const CHATS_NEW_URL = `${BASE_URL}/api/v2/chats/new`;
@@ -459,17 +460,24 @@ export class QwenWebExecutor extends BaseExecutor {
   }
 
   private foldMessages(messages: Array<{ role: string; content: unknown }>): string {
+    // LEV fork GAP-8: Flatten tool history before folding so assistant tool_calls
+    // and tool results are preserved as prose. Without this, agentic clients
+    // (Zed, Cursor, Cline) lose all tool context in multi-turn conversations.
+    const flattened = flattenToolHistory(messages) as Array<{ role: string; content: unknown }>;
     let systemContent = "";
-    let userContent = "";
-    for (const m of messages) {
+    let conversation = "";
+    for (const m of flattened) {
       const text = this.contentToText(m.content);
+      if (!text) continue;
       if (m.role === "system") {
         systemContent += (systemContent ? "\n\n" : "") + text;
       } else if (m.role === "user") {
-        userContent = text;
+        conversation += (conversation ? "\n\n" : "") + `User: ${text}`;
+      } else if (m.role === "assistant") {
+        conversation += (conversation ? "\n\n" : "") + `Assistant: ${text}`;
       }
     }
-    return systemContent ? `${systemContent}\n\nUser: ${userContent}` : userContent;
+    return systemContent ? `${systemContent}\n\n${conversation}` : conversation;
   }
 
   private buildMessagePayload(

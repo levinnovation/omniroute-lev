@@ -36,6 +36,7 @@ import {
   runBrowserAutomation,
   isBrowserAutomationEnabled,
 } from "./base/browserAutomationFallback.ts";
+import { flattenToolHistory } from "../utils/flattenToolHistory.ts";
 
 const HUGGINGFACE_BASE = "https://huggingface.co";
 const CONVERSATION_URL = `${HUGGINGFACE_BASE}/chat/conversation`;
@@ -78,10 +79,13 @@ function buildConversationPrompt(messages: Array<Record<string, unknown>>): {
   inputs: string;
   systemPrompt: string | null;
 } {
+  // LEV fork GAP-8: Flatten tool history so tool_calls and tool results are
+  // preserved as prose for agentic multi-turn conversations.
+  const flattened = flattenToolHistory(messages) as Array<Record<string, unknown>>;
   const systemParts: string[] = [];
   const conversationParts: Array<{ role: string; content: string }> = [];
 
-  for (const msg of messages) {
+  for (const msg of flattened) {
     const role = String(msg.role || "user");
     const text = extractTextFromContent(msg.content);
     if (!text) continue;

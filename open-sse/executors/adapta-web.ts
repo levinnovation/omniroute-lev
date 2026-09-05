@@ -7,6 +7,7 @@ import {
   extractLastUserText,
 } from "../translator/robustWebTools.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
+import { flattenToolHistory } from "../utils/flattenToolHistory.ts";
 
 const ADAPTA_APP_URL = "https://agent.adapta.one";
 const ADAPTA_CLERK_URL = "https://clerk.agent.adapta.one";
@@ -205,10 +206,13 @@ function extractText(content: unknown): string {
 
 /** Build the final Adapta messages array, injecting system prompt into first user message. */
 function buildAdaptaMessages(messages: OpenAIMessage[]): AdaptaMessage[] {
+  // LEV fork GAP-8: Flatten tool history so tool_calls and tool results are
+  // preserved as prose for agentic multi-turn conversations.
+  const flattened = flattenToolHistory(messages) as OpenAIMessage[];
   let systemText = "";
   const rest: OpenAIMessage[] = [];
 
-  for (const msg of messages) {
+  for (const msg of flattened) {
     const role = msg.role === "developer" ? "system" : msg.role;
     if (role === "system") {
       systemText += (systemText ? "\n" : "") + extractText(msg.content);

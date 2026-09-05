@@ -12,6 +12,7 @@ import {
   extractLastUserText,
 } from "../translator/robustWebTools.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
+import { flattenToolHistory } from "../utils/flattenToolHistory.ts";
 import {
   normalizeSessionCookieHeader,
   normalizeSessionCookieHeaders,
@@ -106,9 +107,12 @@ type ParsedHistory = {
 };
 
 function parseOpenAIMessages(messages: Array<Record<string, unknown>>): ParsedHistory {
+  // LEV fork GAP-8: Flatten tool history so tool_calls and tool results are
+  // preserved as prose for agentic multi-turn conversations.
+  const flattened = flattenToolHistory(messages) as Array<Record<string, unknown>>;
   const extracted: NormalizedMessage[] = [];
 
-  for (const message of messages) {
+  for (const message of flattened) {
     let role = String(message.role || "user");
     if (role === "developer") role = "system";
 

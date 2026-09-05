@@ -26,6 +26,7 @@ import {
   runBrowserAutomation,
   isBrowserAutomationEnabled,
 } from "./base/browserAutomationFallback.ts";
+import { flattenToolHistory } from "../utils/flattenToolHistory.ts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -360,7 +361,7 @@ export class T3ChatWebExecutor extends BaseExecutor {
     if (!validateT3Credentials(parsed)) return null;
 
     const cookieHeader = parsed.cookieHeader;
-    const prompt = effectiveMessages
+    const prompt = (flattenToolHistory(effectiveMessages) as Array<{ role: string; content: unknown }>)
       .map((m) => {
         const text =
           typeof m.content === "string"

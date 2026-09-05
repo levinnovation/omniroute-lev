@@ -13,6 +13,7 @@ import {
   synthesizeGrepToolCall,
   extractLastUserText,
 } from "../translator/robustWebTools.ts";
+import { flattenToolHistory } from "../utils/flattenToolHistory.ts";
 
 const BLACKBOX_CHAT_API = "https://app.blackbox.ai/api/chat";
 const BLACKBOX_DEFAULT_COOKIE = "next-auth.session-token";
@@ -106,10 +107,13 @@ function parseOpenAIMessages(
   messages: Array<Record<string, unknown>>,
   chatId: string
 ): BlackboxMessage[] {
+  // LEV fork GAP-8: Flatten tool history so tool_calls and tool results are
+  // preserved as prose for agentic multi-turn conversations.
+  const flattened = flattenToolHistory(messages) as Array<Record<string, unknown>>;
   const systemParts: string[] = [];
   const parsed: BlackboxMessage[] = [];
 
-  for (const message of messages) {
+  for (const message of flattened) {
     const role = String(message.role || "user");
     const content = extractMessageText(message.content);
     if (!content) continue;

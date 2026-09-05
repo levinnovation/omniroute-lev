@@ -30,7 +30,6 @@ import {
   makeExecutorErrorResult as makeErrorResult,
   sanitizeErrorMessage,
 } from "../../utils/error.ts";
-import { classifyCaptcha, CaptchaType } from "../../services/captchaDetector.ts";
 
 type Page = import("playwright").Page;
 type BrowserContext = import("playwright").BrowserContext;
@@ -72,22 +71,14 @@ export interface WebCookieParsedResponse {
 export type WebCookieExecuteResult =
   { response: Response; url: string } | { errorResult: ReturnType<typeof makeErrorResult> };
 
-export type WebCookieErrorKind =
-  | "MODEL_LOCKOUT"
-  | "RATE_LIMIT"
-  | "SESSION_EXPIRED"
-  | "PROVIDER_ERROR"
-  | "STREAM_EARLY_EOF"
-  | "BROWSER_TRANSPORT"
-  | "CAPTCHA_DETECTED"
-  | "UNKNOWN";
-
-export interface WebCookieError {
-  kind: WebCookieErrorKind;
-  status: number;
-  message: string;
-  retryAfterMs?: number;
-}
+// LEV fork: Re-export types from the standalone error classifier so existing
+// imports from WebCookieExecutorBase continue to work.
+export type { WebCookieErrorKind, WebCookieError } from "./errorClassifier.ts";
+import type { WebCookieError, WebCookieErrorKind } from "./errorClassifier.ts";
+import {
+  classifyWebCookieError,
+  parseRetryAfterMs,
+} from "./errorClassifier.ts";
 
 export abstract class WebCookieExecutorBase extends BaseExecutor {
   protected providerConfig: WebCookieProviderConfig;
@@ -206,48 +197,12 @@ export abstract class WebCookieExecutorBase extends BaseExecutor {
     bodyText: string,
     retryAfter?: string | null
   ): WebCookieError {
-    const message = sanitizeErrorMessage(bodyText || `HTTP ${status}`);
-
-    // LEV fork: Detect captcha/Cloudflare challenges before other classifications.
-    // This allows the caller to invoke the appropriate solver (NopeCHA extension,
-    // cfClearanceService, or provider-specific solver) before giving up.
-    const captcha = classifyCaptcha(bodyText);
-    if (captcha.type !== CaptchaType.NONE) {
-      return {
-        kind: "CAPTCHA_DETECTED",
-        status,
-        message: `Captcha detected (${captcha.type}): ${message}`,
-      };
-    }
-
-    if (status === 404) {
-      return { kind: "MODEL_LOCKOUT", status, message: `Model not available: ${message}` };
-    }
-    if (status === 429) {
-      const retryAfterMs = this.parseRetryAfterMs(retryAfter);
-      return {
-        kind: "RATE_LIMIT",
-        status,
-        message: `Rate limited: ${message}`,
-        retryAfterMs,
-      };
-    }
-    if (status === 401) {
-      return { kind: "SESSION_EXPIRED", status, message: `Session expired: ${message}` };
-    }
-    if (status === 502 || status === 503) {
-      return { kind: "PROVIDER_ERROR", status, message: `Provider error: ${message}` };
-    }
-    return { kind: "UNKNOWN", status, message };
+    // LEV fork: Delegate to the standalone classifier (LEV-4).
+    return classifyWebCookieError(status, bodyText, retryAfter);
   }
 
   protected parseRetryAfterMs(retryAfter?: string | null): number | undefined {
-    if (!retryAfter) return undefined;
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
-    const dateMs = new Date(retryAfter).getTime();
-    if (Number.isFinite(dateMs)) return Math.max(dateMs - Date.now(), 0);
-    return undefined;
+    return parseRetryAfterMs(retryAfter);
   }
 
   protected buildErrorFromClassification(
