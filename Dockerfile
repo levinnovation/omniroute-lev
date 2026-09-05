@@ -148,9 +148,10 @@ RUN node -e "const {chromium} = require('patchright'); chromium.launch({headless
 # The extension is free and runs in-browser (no API calls, no per-solve cost).
 # Downloaded at build time from the NopeCHA GitHub releases (chromium_automation
 # variant — includes debugger + declarativeNetRequest permissions for headless).
-RUN mkdir -p /app/extensions/nopecha \
+RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && mkdir -p /app/extensions/nopecha \
   && curl -sL "https://github.com/NopeCHALLC/nopecha-extension/releases/download/0.6.1/chromium_automation.zip" -o /tmp/nopecha.zip \
-  && apt-get update && apt-get install -y --no-install-recommends unzip \
   && unzip -o /tmp/nopecha.zip -d /app/extensions/nopecha/ \
   && rm /tmp/nopecha.zip \
   && rm -rf /var/lib/apt/lists/* \
