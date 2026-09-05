@@ -527,6 +527,11 @@ export class GeminiWebExecutor extends BaseExecutor {
         }
       });
       await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      // LEV fork: Wait for networkidle so the Gemini frontend's JS modules
+      // (including Quill) are fully loaded and initialized. Without this,
+      // keyboard events arrive before module-level variables are initialized,
+      // causing "Cannot access 'T' before initialization" errors.
+      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       log?.info?.("GEMINI-WEB", "Browser path: page navigated, looking for input selector");
 
