@@ -105,7 +105,14 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
         (result as { status: number }).status >= 500
       ) {
         const errBody = String((result as { body?: unknown }).body ?? "");
-        if (shouldFallbackToFFI(errBody)) {
+        // Check for Browserless disconnect patterns OR zai-web-specific
+        // symptoms of disconnect (no completions response captured = page closed)
+        const isDisconnect =
+          shouldFallbackToFFI(errBody) ||
+          errBody.includes("did not send a completions request") ||
+          errBody.includes("no completions response captured") ||
+          errBody.includes("page may have navigated away");
+        if (isDisconnect) {
           console.error("[zai-web-v2] base execute failed with Browserless disconnect, trying FFI fallback");
           const ffiResult = await this.executeViaFFI(input);
           if (ffiResult) return ffiResult;
@@ -113,7 +120,10 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
       }
       return result;
     } catch (err) {
-      if (shouldFallbackToFFI(err)) {
+      const isDisconnect =
+        shouldFallbackToFFI(err) ||
+        (err instanceof Error && err.message.includes("Target page, context or browser has been closed"));
+      if (isDisconnect) {
         console.error(
           `[zai-web-v2] base execute threw Browserless disconnect: ${
             err instanceof Error ? err.message : String(err)
