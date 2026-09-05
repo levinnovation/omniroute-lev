@@ -130,7 +130,11 @@ export function buildGeminiStreamRequestBody(
 
   const form = new URLSearchParams();
   form.set("f.req", JSON.stringify([null, JSON.stringify(inner)]));
-  form.set("at", csrfToken);
+  // Gemini's September 2026 frontend no longer exposes SNlM0e on every
+  // authenticated page. StreamGenerate accepts the cookie-backed request
+  // without it (the enterprise client uses the same contract), so include the
+  // anti-CSRF field when present and otherwise rely on same-origin cookies.
+  if (csrfToken) form.set("at", csrfToken);
   return form.toString();
 }
 
@@ -573,9 +577,12 @@ export class GeminiWebExecutor extends BaseExecutor {
             | undefined;
           const globalToken = globalData?.["SNlM0e"];
           const globalBuild = globalData?.["cfb2h"];
-          if (typeof globalToken === "string" && globalToken) {
+          if (
+            (typeof globalToken === "string" && globalToken) ||
+            (typeof globalBuild === "string" && globalBuild)
+          ) {
             return {
-              csrfToken: globalToken,
+              csrfToken: typeof globalToken === "string" ? globalToken : "",
               buildLabel: typeof globalBuild === "string" ? globalBuild : "",
             };
           }
@@ -594,11 +601,14 @@ export class GeminiWebExecutor extends BaseExecutor {
               return { csrfToken: tokenMatch[1], buildLabel: buildMatch?.[1] || "" };
             }
           }
-          return null;
+          return { csrfToken: "", buildLabel: "" };
         });
 
-        if (!frontendSession?.csrfToken) {
-          throw new Error("Gemini frontend did not expose the CSRF token");
+        if (!frontendSession.csrfToken) {
+          log?.info?.(
+            "GEMINI-WEB",
+            "FFI: frontend omitted SNlM0e; continuing with same-origin cookie authentication"
+          );
         }
 
         await this.persistRotatedCookies(

@@ -37,6 +37,14 @@ test("buildGeminiStreamRequestBody includes the prompt, model category, and CSRF
   assert.match(inner[59], /^[0-9a-f-]{36}$/i);
 });
 
+test("buildGeminiStreamRequestBody supports the current tokenless frontend contract", () => {
+  const form = new URLSearchParams(
+    buildGeminiStreamRequestBody("Say OK", "", "gemini-3.1-pro")
+  );
+  assert.equal(form.has("at"), false);
+  assert.ok(form.get("f.req"));
+});
+
 // ─── Input validation ───────────────────────────────────────────────────────
 
 test("Returns 401 when no cookies provided", async () => {
