@@ -296,6 +296,72 @@ export class ZaiWebExecutorV2 extends WebCookieExecutorBase {
 
     // Wait for the frontend's completions response
     console.error("[zai-web-v2] waiting for frontend completions response...");
+
+    // Check for captcha popup and try to solve it
+    // The Aliyun captcha popup appears as an iframe with a slider
+    await page.waitForTimeout(3000);
+
+    // Log page state for diagnostics
+    const pageState = await page.evaluate(() => {
+      const iframes = Array.from(document.querySelectorAll("iframe"));
+      const captchaElements = Array.from(
+        document.querySelectorAll("[id*='captcha'], [class*='captcha'], [id*='aliyun'], [class*='aliyun']")
+      );
+      const popupElements = Array.from(
+        document.querySelectorAll("[class*='popup'], [class*='modal'], [class*='dialog'], [role='dialog']")
+      );
+      return {
+        url: window.location.href,
+        iframes: iframes.map((f) => ({ src: f.src?.slice(0, 100), id: f.id, class: f.className })),
+        captchaElements: captchaElements.map((e) => ({
+          tag: e.tagName,
+          id: e.id,
+          class: e.className?.toString().slice(0, 100),
+        })),
+        popupElements: popupElements.map((e) => ({
+          tag: e.tagName,
+          id: e.id,
+          class: e.className?.toString().slice(0, 100),
+        })),
+      };
+    }).catch(() => null);
+    console.error(`[zai-web-v2] page state: ${JSON.stringify(pageState)?.slice(0, 500)}`);
+
+    // Try to solve the Aliyun slide captcha by dragging the slider
+    try {
+      const captchaFrame = page.frames().find((f) => {
+        const url = f.url();
+        return url.includes("captcha") || url.includes("aliyun") || url.includes("alicdn");
+      });
+      if (captchaFrame) {
+        console.error(`[zai-web-v2] found captcha iframe: ${captchaFrame.url().slice(0, 100)}`);
+        // Try to find and drag the slider
+        const slider = await captchaFrame.locator("[class*='slider'], [class*='btn'], [class*='drag']").first();
+        if (slider) {
+          const box = await slider.boundingBox();
+          if (box) {
+            console.error(`[zai-web-v2] found slider at (${box.x}, ${box.y}) ${box.width}x${box.height}`);
+            // Drag the slider from left to right
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+            await page.mouse.down();
+            await page.waitForTimeout(100);
+            // Move in steps to simulate human-like dragging
+            for (let i = 0; i < 10; i++) {
+              await page.mouse.move(box.x + box.width / 2 + (i + 1) * 30, box.y + box.height / 2);
+              await page.waitForTimeout(50);
+            }
+            await page.mouse.up();
+            console.error("[zai-web-v2] dragged slider");
+            await page.waitForTimeout(2000);
+          }
+        }
+      } else {
+        console.error("[zai-web-v2] no captcha iframe found");
+      }
+    } catch (err) {
+      console.error(`[zai-web-v2] captcha solve attempt failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     await responsePromise;
 
     if (!completionsResponse) {
