@@ -227,7 +227,36 @@ function shouldFallbackToFFI(err: unknown): boolean {
 
 This makes FFI a universal safety net for ALL UI-automation providers, not just gemini-web.
 
-### GAP-8: Browserless Sidecar Capacity
+### GAP-8: Multi-Turn Tool Context Retention (qwen-web, zai-web, all UI-automation providers)
+
+**Problem**: When agentic clients (Zed, Cursor, Cline) send multi-turn conversations with tool calls and tool results, web-cookie providers that fold messages into a single prompt lose the tool context:
+
+- **qwen-web** (`foldMessages()` at line 461): Only processes `system` and `user` roles — **completely drops `assistant` messages (including `tool_calls`) and `tool` messages (tool results)**. The model receives only the last user message with no context of prior tool interactions.
+- **zai-web** (`textContent()` in `protocol.ts`): Includes all roles in the prompt but `textContent()` only extracts `type: "text"` parts — **`tool_calls` field on assistant messages is dropped**, and tool results are included but without the context of which tool was called.
+
+**Observed error** (2026-09-05, Zed editor with qwen-web):
+```
+User: "ok i implemented all this on a separate claude code session, so lets audit whatever it did"
+Qwen-web response: "Since I don't have direct access to read your local files or git history in this environment, sharing that context will allow me to perform a thorough gap analysis..."
+```
+The model says it can't read files because it never sees the tool results from prior turns — they were stripped by `foldMessages()`.
+
+**Root cause**: Web-cookie providers that use UI automation (Pattern B) must fold the entire conversation into a single prompt string (the chat UI only has one input field). But the folding logic was written for simple Q&A, not for agentic multi-turn tool conversations.
+
+**Proposed solution**: Use `flattenToolHistory()` from `open-sse/utils/flattenToolHistory.ts` BEFORE folding messages into a prompt. This utility:
+1. Converts `tool`/`function` role messages → assistant prose: `[Tool result: <text>]`
+2. Converts `assistant` messages with `tool_calls` → assistant prose: `[Called tools: <names>]`
+3. Converts Anthropic-style `tool_use`/`tool_result` content blocks → prose
+4. Preserves all text content
+
+After flattening, `foldMessages()` / `browserPrompt()` can safely fold the conversation into a single prompt without losing tool context.
+
+**Required changes**:
+- `qwen-web.ts`: Call `flattenToolHistory()` before `foldMessages()`, and update `foldMessages()` to include `assistant` role messages (not just `system` and `user`)
+- `zai-web/protocol.ts`: Call `flattenToolHistory()` before `browserPrompt()`
+- All other UI-automation providers that fold messages: audit and add `flattenToolHistory()` if missing
+
+### GAP-9: Browserless Sidecar Capacity
 
 **Current**: Browserless configured with `MAX_CONCURRENT_SESSIONS=10`, `TIMEOUT=120000` (2 min).
 **Issue**: Under concurrent load, sessions queue and time out. The active-lease protection prevents premature shutdown but doesn't solve capacity.
