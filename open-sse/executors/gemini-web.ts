@@ -27,10 +27,19 @@ import { WebSessionDriver } from "../services/webSessionDriver.ts";
 import { GEMINI_WEB_SESSION_CONFIG } from "./gemini-web/sessionConfig.ts";
 import { acquireBrowserContext, openPage } from "../services/browserPool.ts";
 import { isBrowserAutomationEnabled } from "./base/browserAutomationFallback.ts";
+import { interceptFrontendFetch } from "./base/frontendFetchInterception.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const GEMINI_URL = "https://gemini.google.com/app";
+const GEMINI_STREAM_URL =
+  "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
+
+const GEMINI_MODEL_CATEGORY: Record<string, number> = {
+  "gemini-3.1-pro": 70,
+  "gemini-3.7-flash": 75,
+  "gemini-3.1-flash-lite": 75,
+};
 
 /**
  * Whether an error came from Playwright failing to launch because the browser binary is not
@@ -64,6 +73,11 @@ interface GeminiRequestBody {
   stream?: boolean;
 }
 
+interface GeminiFrontendSession {
+  csrfToken: string;
+  buildLabel: string;
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function formatChatCompletion(content: string, model: string, finishReason = "stop") {
@@ -85,6 +99,37 @@ function formatStreamChunk(content: string, model: string, finishReason: string 
     model,
     choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finishReason }],
   };
+}
+
+/** Build the form-encoded body accepted by Gemini's StreamGenerate frontend endpoint. */
+export function buildGeminiStreamRequestBody(
+  prompt: string,
+  csrfToken: string,
+  model: string
+): string {
+  const inner: unknown[] = new Array(80).fill(null);
+  inner[0] = [prompt, 0, null, null, null, null, 0];
+  inner[1] = ["en"];
+  inner[2] = ["", "", "", null, null, null, null, null, null, ""];
+  inner[6] = [0];
+  inner[7] = 1;
+  inner[10] = 1;
+  inner[11] = 0;
+  inner[17] = [[0]];
+  inner[18] = 0;
+  inner[27] = 1;
+  inner[30] = [4];
+  inner[41] = [2];
+  inner[53] = 0;
+  inner[59] = crypto.randomUUID();
+  inner[61] = [];
+  inner[68] = 1;
+  inner[79] = GEMINI_MODEL_CATEGORY[model] ?? 70;
+
+  const form = new URLSearchParams();
+  form.set("f.req", JSON.stringify([null, JSON.stringify(inner)]));
+  form.set("at", csrfToken);
+  return form.toString();
 }
 
 /**
@@ -393,7 +438,7 @@ export function mergeRotatedGeminiCookies(
   return merged.map(({ name, value }) => `${name}=${value}`).join("; ");
 }
 
-function resolveGeminiWebCookie(credentials: ExecuteInput["credentials"]): string {
+export function resolveGeminiWebCookie(credentials: ExecuteInput["credentials"]): string {
   const directCookie =
     readCredentialString(credentials?.apiKey) ||
     readCredentialString((credentials as Record<string, unknown> | undefined)?.cookie);
@@ -480,6 +525,203 @@ export class GeminiWebExecutor extends BaseExecutor {
     const { model, body, stream, credentials, signal, log, onCredentialsRefreshed } = input;
     const requestBody = body as GeminiRequestBody;
 
+    if (checkGeminiWebUnsupportedControls(body as Record<string, unknown>)) return null;
+
+    const cookie = resolveGeminiWebCookie(credentials);
+    if (!cookie) return null;
+
+    const messages = requestBody.messages || [];
+    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
+      body as Record<string, unknown>,
+      messages
+    );
+    const prompt = hasTools
+      ? buildGeminiToolPrompt(effectiveMessages)
+      : buildGeminiPrompt(messages);
+    if (!prompt) return null;
+
+    const modelId = model || "gemini-3.1-pro";
+    const imageMode = (body as Record<string, unknown>)?.x_gemini_web_image_mode === true;
+    const responseTimeoutMs = imageMode ? 90_000 : hasTools ? 60_000 : 30_000;
+    let frontendSession: GeminiFrontendSession | null = null;
+
+    const result = await interceptFrontendFetch({
+      providerName: "gemini-web",
+      poolKey: `gemini-web:${cookie.slice(0, 24)}`,
+      pageUrl: GEMINI_URL,
+      cookieDomain: ".google.com",
+      cookieString: cookie,
+      userAgent: GEMINI_USER_AGENT,
+      responseTimeoutMs,
+      signal,
+      log,
+      beforeFetch: async (page) => {
+        const currentUrl = new URL(page.url());
+        if (
+          currentUrl.hostname === "accounts.google.com" ||
+          currentUrl.pathname.includes("signin") ||
+          currentUrl.pathname.includes("consent")
+        ) {
+          throw new Error("Gemini session redirected to login or consent");
+        }
+
+        frontendSession = await page.evaluate(() => {
+          const globalData = (window as unknown as Record<string, unknown>)["WIZ_global_data"] as
+            | Record<string, unknown>
+            | undefined;
+          const globalToken = globalData?.["SNlM0e"];
+          const globalBuild = globalData?.["cfb2h"];
+          if (typeof globalToken === "string" && globalToken) {
+            return {
+              csrfToken: globalToken,
+              buildLabel: typeof globalBuild === "string" ? globalBuild : "",
+            };
+          }
+
+          for (const script of Array.from(document.querySelectorAll("script"))) {
+            const source = script.textContent || "";
+            const tokenMatch = source.match(/"SNlM0e"\s*:\s*"((?:\\.|[^"\\])*)"/);
+            if (!tokenMatch) continue;
+            const buildMatch = source.match(/"cfb2h"\s*:\s*"((?:\\.|[^"\\])*)"/);
+            try {
+              return {
+                csrfToken: JSON.parse(`"${tokenMatch[1]}"`) as string,
+                buildLabel: buildMatch ? (JSON.parse(`"${buildMatch[1]}"`) as string) : "",
+              };
+            } catch {
+              return { csrfToken: tokenMatch[1], buildLabel: buildMatch?.[1] || "" };
+            }
+          }
+          return null;
+        });
+
+        if (!frontendSession?.csrfToken) {
+          throw new Error("Gemini frontend did not expose the CSRF token");
+        }
+
+        await this.persistRotatedCookies(
+          page.context(),
+          cookie,
+          credentials,
+          onCredentialsRefreshed,
+          log
+        );
+      },
+      fetchUrl: async () => {
+        if (!frontendSession) throw new Error("Gemini frontend session is unavailable");
+        const query = new URLSearchParams({
+          hl: "en",
+          _reqid: String(Math.floor(Math.random() * 900_000) + 100_000),
+          rt: "c",
+        });
+        if (frontendSession.buildLabel) query.set("bl", frontendSession.buildLabel);
+        return `${GEMINI_STREAM_URL}?${query.toString()}`;
+      },
+      fetchOptions: async () => {
+        if (!frontendSession) throw new Error("Gemini frontend session is unavailable");
+        return {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "X-Same-Domain": "1",
+          },
+          body: buildGeminiStreamRequestBody(prompt, frontendSession.csrfToken, modelId),
+        };
+      },
+    });
+
+    if (!result || result.status < 200 || result.status >= 300) {
+      if (result) log?.warn?.("GEMINI-WEB", `FFI returned HTTP ${result.status}`);
+      return null;
+    }
+
+    const responseText = parseStreamResponse(result.body);
+    const responseImages = imageMode ? parseStreamResponseImages(result.body) : [];
+    if (imageMode) {
+      return {
+        response: new Response(
+          JSON.stringify({
+            ...formatChatCompletion(responseText, modelId),
+            x_gemini_web_image_urls: responseImages,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        ),
+        url: GEMINI_STREAM_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    }
+    if (!responseText) return null;
+
+    if (hasTools) {
+      const cid = `chatcmpl-gwe-${crypto.randomUUID().slice(0, 12)}`;
+      const created = Math.floor(Date.now() / 1000);
+      return {
+        response: await buildGeminiToolResponse(
+          responseText,
+          requestedTools,
+          Boolean(stream),
+          modelId,
+          cid,
+          created
+        ),
+        url: GEMINI_STREAM_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    }
+
+    if (stream) {
+      const encoder = new TextEncoder();
+      const readable = new ReadableStream(
+        {
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify(formatStreamChunk(responseText, modelId))}\n\n`)
+            );
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify(formatStreamChunk("", modelId, "stop"))}\n\n`)
+            );
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          },
+        },
+        { highWaterMark: 16_384 }
+      );
+      return {
+        response: new Response(readable, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          },
+        }),
+        url: GEMINI_STREAM_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    }
+
+    return {
+      response: new Response(JSON.stringify(formatChatCompletion(responseText, modelId)), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+      url: GEMINI_STREAM_URL,
+      headers: {},
+      transformedBody: body,
+    };
+  }
+
+  private async executeViaUiAutomation(
+    input: ExecuteInput
+  ): Promise<ExecutorExecuteResult | null> {
+    if (!isBrowserAutomationEnabled()) return null;
+    const { model, body, stream, credentials, signal, log, onCredentialsRefreshed } = input;
+    const requestBody = body as GeminiRequestBody;
+
     const violation = checkGeminiWebUnsupportedControls(body as Record<string, unknown>);
     if (violation) return null;
 
@@ -533,7 +775,13 @@ export class GeminiWebExecutor extends BaseExecutor {
       // causing "Cannot access 'T' before initialization" errors.
       await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      log?.info?.("GEMINI-WEB", "Browser path: page navigated, looking for input selector");
+      // LEV fork: Check if we've been redirected to a login/consent page
+      const currentUrl = page.url();
+      if (currentUrl.includes("accounts.google.com") || currentUrl.includes("signin") || currentUrl.includes("consent")) {
+        log?.warn?.("GEMINI-WEB", `Browser path: redirected to login/consent page: ${currentUrl}`);
+        return null;
+      }
+      log?.info?.("GEMINI-WEB", `Browser path: page navigated to ${currentUrl}, looking for input selector`);
 
       const imageMode = (body as Record<string, unknown>)?.x_gemini_web_image_mode === true;
       let responseText = "";
@@ -594,7 +842,13 @@ export class GeminiWebExecutor extends BaseExecutor {
           const quillRoot = document.querySelector(".ql-editor") as HTMLElement | null;
           if (quillRoot) {
             // Access Quill's internal instance
-            const quill = (quillRoot as any).__quill || (quillRoot.parentElement as any)?.__quill;
+            const quill =
+              (quillRoot as unknown as { __quill?: { setText(text: string): void } }).__quill ||
+              (
+                quillRoot.parentElement as unknown as {
+                  __quill?: { setText(text: string): void };
+                }
+              )?.__quill;
             if (quill) {
               quill.setText(text);
               return;
@@ -663,9 +917,11 @@ export class GeminiWebExecutor extends BaseExecutor {
         }).catch(() => {});
         log?.info?.("GEMINI-WEB", "Browser path: submitted via evaluate form submit");
       }
-      log?.info?.("GEMINI-WEB", `Browser path: prompt submitted, waiting ${responseWaitMs}ms for StreamGenerate response`);
-
       const responseWaitMs = imageMode ? 90000 : hasTools ? 60000 : 30000;
+      log?.info?.(
+        "GEMINI-WEB",
+        `Browser path: prompt submitted, waiting ${responseWaitMs}ms for StreamGenerate response`
+      );
       // LEV fork: use a plain setTimeout instead of page.waitForTimeout() — the
       // latter keeps a live handle on the page and throws "Target page, context
       // or browser has been closed" when Browserless disconnects mid-wait.
@@ -785,12 +1041,28 @@ export class GeminiWebExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
-    // LEV fork: Browser automation is PRIMARY (like deepseek-web). The browser
-    // path uses a real Playwright browser context with Google cookies, giving
-    // us proper session validation and Cloudflare bypass. Falls back to direct
-    // HTTP only when browser automation is unavailable or fails.
-    const browserResult = await this.executeViaBrowser(input);
-    if (browserResult) return browserResult;
+    // LEV fork: FFI is primary because Gemini's frontend intermittently throws
+    // temporal-dead-zone errors for every keyboard/click submission mechanism.
+    try {
+      const ffiResult = await this.executeViaBrowser(input);
+      if (ffiResult) return ffiResult;
+    } catch (error) {
+      if (input.signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+        return {
+          response: new Response(JSON.stringify({ error: "Request cancelled" }), {
+            status: 499,
+            headers: { "Content-Type": "application/json" },
+          }),
+          url: GEMINI_URL,
+          headers: {},
+          transformedBody: input.body,
+        };
+      }
+      throw error;
+    }
+
+    const uiResult = await this.executeViaUiAutomation(input);
+    if (uiResult) return uiResult;
 
     const directResult = await this.executeViaDirectHttp(input);
     if (directResult) return directResult;
@@ -798,7 +1070,7 @@ export class GeminiWebExecutor extends BaseExecutor {
     return {
       response: new Response(
         JSON.stringify({
-          error: "Gemini-web: both browser automation and direct HTTP failed",
+          error: "Gemini-web: FFI and both UI automation fallbacks failed",
         }),
         { status: 502, headers: { "Content-Type": "application/json" } }
       ),
@@ -932,7 +1204,7 @@ export class GeminiWebExecutor extends BaseExecutor {
       const responseImages: string[] = [];
       let captured = false;
       const responsePromise = new Promise<void>((resolve) => {
-        page.on("response", async (resp: any) => {
+        page.on("response", async (resp: import("playwright").Response) => {
           if (!resp.url().includes("StreamGenerate")) return;
           if (!imageMode && captured) return;
           if (imageMode) {

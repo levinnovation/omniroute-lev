@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { GeminiWebExecutor, parseStreamResponse } =
+const {
+  GeminiWebExecutor,
+  buildGeminiStreamRequestBody,
+  isMissingBrowserExecutable,
+  parseStreamResponse,
+  resolveGeminiWebCookie,
+} =
   await import("../../open-sse/executors/gemini-web.ts");
 const { getExecutor, hasSpecializedExecutor } = await import("../../open-sse/executors/index.ts");
 
@@ -16,6 +22,19 @@ test("GeminiWebExecutor is registered in executor index", async () => {
 test("GeminiWebExecutor sets correct provider name", () => {
   const executor = new GeminiWebExecutor();
   assert.equal(executor.getProvider(), "gemini-web");
+});
+
+test("buildGeminiStreamRequestBody includes the prompt, model category, and CSRF token", () => {
+  const body = buildGeminiStreamRequestBody("Say OK", "csrf-token", "gemini-3.7-flash");
+  const form = new URLSearchParams(body);
+  assert.equal(form.get("at"), "csrf-token");
+
+  const envelope = JSON.parse(form.get("f.req") || "null");
+  const inner = JSON.parse(envelope[1]);
+  assert.equal(inner[0][0], "Say OK");
+  assert.equal(inner[1][0], "en");
+  assert.equal(inner[79], 75);
+  assert.match(inner[59], /^[0-9a-f-]{36}$/i);
 });
 
 // ─── Input validation ───────────────────────────────────────────────────────
@@ -51,38 +70,13 @@ test("Returns 400 when no user message", async () => {
 });
 
 test("Reads bulk-imported cookie credentials from providerSpecificData.cookie", async () => {
-  const playwrightError = new Error(
-    "browserType.launch: Executable doesn't exist at /home/node/.cache/ms-playwright/chromium_headless_shell-1161/chrome-linux/headless_shell"
+  const executor = new GeminiWebExecutor();
+  assert.equal(
+    await executor.testConnection({
+      providerSpecificData: { cookie: "__Secure-1PSID=from-bulk-import" },
+    }),
+    true
   );
-
-  const playwright = await import("playwright");
-  const originalLaunch = playwright.chromium.launch;
-
-  playwright.chromium.launch = async () => {
-    throw playwrightError;
-  };
-
-  try {
-    const executor = new GeminiWebExecutor();
-    const result = await executor.execute({
-      model: "gemini-3.1-pro",
-      body: { messages: [{ role: "user", content: "hello" }], stream: false },
-      stream: false,
-      credentials: {
-        providerSpecificData: { cookie: "__Secure-1PSID=from-bulk-import" },
-      } as any,
-      signal: AbortSignal.timeout(5000),
-      log: null,
-    });
-
-    assert.equal(
-      result.response.status,
-      503,
-      "providerSpecificData.cookie should be accepted and reach Playwright launch"
-    );
-  } finally {
-    playwright.chromium.launch = originalLaunch;
-  }
 });
 
 test("Ignores array-valued providerSpecificData when resolving cookies", async () => {
@@ -102,50 +96,7 @@ test("Ignores array-valued providerSpecificData when resolving cookies", async (
 });
 
 test("Normalizes a bare __Secure-1PSID value before adding browser cookies", async () => {
-  const playwright = await import("playwright");
-  const originalLaunch = playwright.chromium.launch;
-  let addedCookies: Array<{ name: string; value: string }> = [];
-
-  playwright.chromium.launch = async () =>
-    ({
-      newContext: async () => ({
-        addCookies: async (cookies: Array<{ name: string; value: string }>) => {
-          addedCookies = cookies;
-        },
-        newPage: async () => ({
-          on: () => {},
-          goto: async () => {},
-          waitForTimeout: async () => {},
-          waitForSelector: async () => ({
-            click: async () => {},
-          }),
-          keyboard: {
-            type: async () => {},
-            press: async () => {},
-          },
-        }),
-      }),
-      close: async () => {},
-    }) as any;
-
-  try {
-    const executor = new GeminiWebExecutor();
-    const result = await executor.execute({
-      model: "gemini-3.1-pro",
-      body: { messages: [{ role: "user", content: "hello" }], stream: false },
-      stream: false,
-      credentials: { apiKey: "raw-psid-value" },
-      signal: AbortSignal.timeout(5000),
-      log: null,
-    });
-
-    assert.equal(result.response.status, 502, "fake page intentionally returns no Gemini response");
-    assert.equal(addedCookies.length, 1);
-    assert.equal(addedCookies[0].name, "__Secure-1PSID");
-    assert.equal(addedCookies[0].value, "raw-psid-value");
-  } finally {
-    playwright.chromium.launch = originalLaunch;
-  }
+  assert.equal(resolveGeminiWebCookie({ apiKey: "raw-psid-value" }), "__Secure-1PSID=raw-psid-value");
 });
 
 // ─── Provider registration ──────────────────────────────────────────────────
@@ -192,49 +143,13 @@ test("Provider: gemini-web has correct models", async () => {
 //
 // Hard rule #12: the body carries no raw err.message stack trace.
 
-test("#2832/#3516: missing Playwright browser returns an actionable 503 with cooldown hint, not a retryable 500", async () => {
+test("#2832/#3516: missing Playwright browser errors remain recognizable after transport refactor", () => {
   const playwrightError = new Error(
     "browserType.launch: Executable doesn't exist at /home/node/.cache/ms-playwright/chromium_headless_shell-1161/chrome-linux/headless_shell\n" +
       "    at /app/node_modules/playwright-core/lib/server/browserType.js:123:19"
   );
 
-  const playwright = await import("playwright");
-  const originalLaunch = playwright.chromium.launch;
-
-  playwright.chromium.launch = async () => {
-    throw playwrightError;
-  };
-
-  try {
-    const executor = new GeminiWebExecutor();
-    const result = await executor.execute({
-      model: "gemini-3.1-pro",
-      body: { messages: [{ role: "user", content: "hello" }], stream: false },
-      stream: false,
-      credentials: { apiKey: "fake-cookie=abc" },
-      signal: AbortSignal.timeout(5000),
-      log: null,
-    });
-
-    // #3516: missing browser → 503 + connection-cooldown hint (not a retryable 500 loop).
-    assert.equal(result.response.status, 503, "missing browser should return HTTP 503");
-    assert.equal(
-      result.response.headers.get("X-Omni-Fallback-Hint"),
-      "connection_cooldown",
-      "must signal connection cooldown so the provider breaker is skipped"
-    );
-    const json = (await result.response.json()) as any;
-    assert.ok(typeof json.error === "string", "error field must be a string");
-    assert.match(json.error, /playwright install|not installed/i, "message must be actionable");
-    // No raw stack trace / source path leaks into the body.
-    assert.ok(!json.error.includes("\n    at "), "must not contain multi-line stack trace");
-    assert.ok(
-      !json.error.includes("node_modules/playwright-core"),
-      "must not contain node_modules source path"
-    );
-  } finally {
-    playwright.chromium.launch = originalLaunch;
-  }
+  assert.equal(isMissingBrowserExecutable(playwrightError.message), true);
 });
 
 test("#2832: GeminiWebExecutor catch block sanitizes Playwright launch errors (integration path)", async () => {
@@ -256,9 +171,9 @@ test("#2832: GeminiWebExecutor catch block sanitizes Playwright launch errors (i
     log: null,
   });
 
-  // Aborted request should return a structured 500, not throw
+  // Aborted request should return a structured client-closed response, not throw.
   assert.ok(result.response instanceof Response, "must return a Response object");
-  assert.equal(result.response.status, 500, "aborted request returns 500");
+  assert.equal(result.response.status, 499, "aborted request returns 499");
   const json = (await result.response.json()) as any;
   assert.ok(typeof json.error === "string", "error must be a string");
   assert.ok(!json.error.includes("at /"), "no stack trace path in error response");

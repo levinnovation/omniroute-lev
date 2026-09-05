@@ -127,24 +127,31 @@ function throwIfAborted(signal?: AbortSignal | null): void {
 async function executePageFetch(
   page: Page,
   fetchUrl: string,
-  fetchOptions: RequestInit
+  fetchOptions: RequestInit,
+  timeoutMs: number
 ): Promise<BrowserFetchResult> {
   const options = serializeFetchOptions(fetchOptions);
   return page.evaluate(
-    async ({ url, init }) => {
-      const response = await fetch(url, init as RequestInit);
-      const headers: Record<string, string> = {};
-      response.headers.forEach((value, name) => {
-        headers[name] = value;
-      });
-      return {
-        status: response.status,
-        body: await response.text(),
-        contentType: response.headers.get("content-type") || "application/octet-stream",
-        headers,
-      };
+    async ({ url, init, timeout }) => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+      try {
+        const response = await fetch(url, { ...(init as RequestInit), signal: controller.signal });
+        const headers: Record<string, string> = {};
+        response.headers.forEach((value, name) => {
+          headers[name] = value;
+        });
+        return {
+          status: response.status,
+          body: await response.text(),
+          contentType: response.headers.get("content-type") || "application/octet-stream",
+          headers,
+        };
+      } finally {
+        clearTimeout(timeoutId);
+      }
     },
-    { url: fetchUrl, init: options }
+    { url: fetchUrl, init: options, timeout: timeoutMs }
   );
 }
 
@@ -219,7 +226,7 @@ export async function interceptFrontendFetch(
         { timeout: responseTimeoutMs }
       );
       const [, intercepted] = await Promise.all([
-        executePageFetch(page, fetchUrl, fetchOptions),
+        executePageFetch(page, fetchUrl, fetchOptions, responseTimeoutMs),
         responsePromise,
       ]);
       const result = await readInterceptedResponse(intercepted);
@@ -227,7 +234,7 @@ export async function interceptFrontendFetch(
       return result;
     }
 
-    const result = await executePageFetch(page, fetchUrl, fetchOptions);
+    const result = await executePageFetch(page, fetchUrl, fetchOptions, responseTimeoutMs);
     log?.info?.(providerName.toUpperCase(), `FFI completed with HTTP ${result.status}`);
     return result;
   } catch (err) {
