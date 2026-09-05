@@ -568,18 +568,13 @@ export class GeminiWebExecutor extends BaseExecutor {
       });
       log?.info?.("GEMINI-WEB", "Browser path: input selector found, filling prompt");
       await inputEl.click();
-      await page.evaluate((text) => {
-        const editor = document.querySelector(".ql-editor, [contenteditable='true']");
-        if (!editor) return;
-        const dataTransfer = new DataTransfer();
-        dataTransfer.setData("text/plain", text);
-        const event = new ClipboardEvent("paste", {
-          clipboardData: dataTransfer,
-          bubbles: true,
-          cancelable: true,
-        });
-        editor.dispatchEvent(event);
-      }, prompt);
+      // LEV fork: Use keyboard.type() instead of ClipboardEvent paste — the
+      // Gemini frontend's minified code throws "Cannot access 'v' before
+      // initialization" when receiving a synthetic paste event, likely because
+      // a Quill handler references a variable before Quill finishes initializing.
+      // keyboard.type() simulates real keystrokes which the frontend handles
+      // natively without triggering the broken paste handler.
+      await page.keyboard.type(prompt, { delay: 5 });
       await page.keyboard.press("Enter");
       log?.info?.("GEMINI-WEB", `Browser path: prompt submitted, waiting ${responseWaitMs}ms for StreamGenerate response`);
 
