@@ -104,7 +104,11 @@ describe("interceptFrontendFetch", () => {
     assert.deepEqual(events, [
       "acquire",
       "open",
-      "goto:networkidle",
+      // Default is domcontentloaded, NOT networkidle: chat SPAs hold persistent
+      // connections so the network never goes idle and page.goto times out
+      // (observed live as "FFI failed: page.goto: Timeout 30000ms exceeded" on
+      // zai-web). Providers can opt into networkidle via config.waitUntil.
+      "goto:domcontentloaded",
       "beforeFetch",
       "evaluate",
       "close",

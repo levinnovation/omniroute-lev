@@ -32,6 +32,14 @@ export interface FrontendFetchConfig {
   fetchOptions: RequestInit | ((page: Page) => Promise<RequestInit>);
   responseUrlMatch?: RegExp | ((url: string) => boolean);
   responseTimeoutMs: number;
+  /**
+   * Navigation wait condition. Defaults to "domcontentloaded" — the same
+   * condition runBrowserAutomation uses. Do NOT default this to "networkidle":
+   * chat SPAs hold persistent connections (websockets, long-polling, telemetry
+   * beacons) so the network never goes idle, and page.goto then burns its full
+   * timeout and fails. Only set "networkidle" for a provider proven to reach it.
+   */
+  waitUntil?: "domcontentloaded" | "load" | "networkidle" | "commit";
   beforeFetch?: (page: Page) => Promise<void>;
   log?: ExecutorLog | null;
   signal?: AbortSignal | null;
@@ -187,6 +195,7 @@ export async function interceptFrontendFetch(
     localStorageOrigin,
     responseUrlMatch,
     responseTimeoutMs,
+    waitUntil = "domcontentloaded",
     beforeFetch,
     log,
     signal,
@@ -207,7 +216,7 @@ export async function interceptFrontendFetch(
     });
     acquired = true;
     page = await dependencies.openPage(pooled);
-    await page.goto(pageUrl, { waitUntil: "networkidle", timeout: 30_000 });
+    await page.goto(pageUrl, { waitUntil, timeout: 30_000 });
     throwIfAborted(signal);
 
     if (beforeFetch) await beforeFetch(page);
