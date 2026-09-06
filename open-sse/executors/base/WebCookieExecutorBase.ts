@@ -77,6 +77,7 @@ export type { WebCookieErrorKind, WebCookieError } from "./errorClassifier.ts";
 import type { WebCookieError, WebCookieErrorKind } from "./errorClassifier.ts";
 import {
   classifyWebCookieError,
+  errorKindToStatus,
   parseRetryAfterMs,
 } from "./errorClassifier.ts";
 
@@ -210,16 +211,14 @@ export abstract class WebCookieExecutorBase extends BaseExecutor {
     body: unknown,
     url: string
   ): ReturnType<typeof makeErrorResult> {
+    // LEV-4: errorClassifier.errorKindToStatus() is the single source of truth
+    // for kind → HTTP status. The previous inline table diverged from it and
+    // mapped SESSION_EXPIRED to 503, overriding the 401 that callers such as
+    // the login-wall check below construct — so an expired cookie looked like a
+    // provider outage and never triggered credential rotation upstream.
+    // UNKNOWN keeps the caller-supplied status when there is one.
     const status =
-      error.kind === "SESSION_EXPIRED"
-        ? 503
-        : error.kind === "MODEL_LOCKOUT"
-          ? 404
-          : error.kind === "STREAM_EARLY_EOF"
-            ? 502
-            : error.kind === "CAPTCHA_DETECTED"
-              ? 403
-              : error.status || 502;
+      error.kind === "UNKNOWN" ? error.status || 502 : errorKindToStatus(error.kind);
     return makeErrorResult(status, `[${this.provider}] ${error.message}`, body, url);
   }
 

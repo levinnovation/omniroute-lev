@@ -518,7 +518,10 @@ async function seedContextSession(
 
 export async function acquireBrowserContext(
   key: string,
-  options: BrowserPoolContextOptions
+  options: BrowserPoolContextOptions,
+  // Internal: bounded retry depth for the pool-restart race below. Callers
+  // never pass this.
+  retryDepth = 0
 ): Promise<PooledContext> {
   if (!isPoolEnabled()) {
     throw new Error(
@@ -649,7 +652,22 @@ export async function acquireBrowserContext(
     .then(() => settlePendingContext(key, false))
     .catch(() => settlePendingContext(key, true));
 
-  return createPromise;
+  // LEV fork: the "Pool shut down during context creation" guard above fires
+  // AFTER the newContext() retry loop — during cookie injection and warmup —
+  // so a Browserless recycle at that moment used to surface as a hard failure:
+  // runBrowserAutomation() logged "context acquire failed" and returned null,
+  // and the request 502'd even though a simple retry reconnects fine
+  // (observed live on qwen-web). Retry it here, bounded, like target-closed.
+  return createPromise.catch(async (err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!message.includes("Pool shut down during context creation")) throw err;
+    if (retryDepth >= MAX_CONTEXT_RETRIES) throw err;
+    console.log(
+      `[BrowserPool] Context creation raced a pool restart — retrying (${retryDepth + 1}/${MAX_CONTEXT_RETRIES})`
+    );
+    await new Promise((resolve) => setTimeout(resolve, CONTEXT_RETRY_DELAY_MS * (retryDepth + 1)));
+    return acquireBrowserContext(key, options, retryDepth + 1);
+  });
 }
 
 export async function openPage(pooled: PooledContext): Promise<Page> {

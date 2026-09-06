@@ -18,6 +18,7 @@ import {
   type TlsFetchResult,
 } from "../services/perplexityTlsClient.ts";
 import { prepareToolMessages } from "../translator/webTools.ts";
+import { flattenToolHistory } from "../utils/flattenToolHistory.ts";
 import { buildToolModeResponse } from "./chatgptWebTools.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import { buildSessionCookieHeader, mergeRefreshedCookie } from "../utils/nextAuthCookie.ts";
@@ -375,9 +376,16 @@ export class PerplexityWebExecutor extends BaseExecutor {
     const rawMessages = bodyObj.messages as Array<Record<string, unknown>> | undefined;
     if (!rawMessages || !Array.isArray(rawMessages) || rawMessages.length === 0) return null;
 
+    // LEV fork GAP-8: flatten tool history first so assistant tool_calls and
+    // tool results survive into the prompt. Without this, multi-turn agentic
+    // conversations lose every prior tool result and the model answers as if
+    // it had never called a tool.
     const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
       bodyObj,
-      rawMessages as Array<{ role: string; content: unknown }>
+      flattenToolHistory(rawMessages as Array<{ role: string; content: unknown }>) as Array<{
+        role: string;
+        content: unknown;
+      }>
     );
     const thinking =
       bodyObj.thinking === true ||
@@ -414,9 +422,14 @@ export class PerplexityWebExecutor extends BaseExecutor {
       cookieDomain: "www.perplexity.ai",
       cookieString,
       userAgent: PPLX_USER_AGENT,
-      inputSelector: "textarea#ask-input, textarea[data-testid='ask-input'], textarea",
+      // perplexity.ai renders the composer as a contenteditable <div id="ask-input">
+      // with role="textbox" — there is no <textarea> anywhere on the page. The
+      // previous textarea-only selector could never match, so locator.waitFor()
+      // timed out after 10s on every request and the browser path silently fell
+      // through to direct HTTP (verified live against www.perplexity.ai).
+      inputSelector: '#ask-input[contenteditable="true"], [role="textbox"]#ask-input, textarea',
       submitSelector:
-        'button[data-testid="submit-button"], button[aria-label="Submit"], button.submit-btn',
+        'button[aria-label="Submit"], button[data-testid="submit-button"], button.submit-btn',
       prompt: query,
       responseUrlMatch: /perplexity\.ai.*\/rest\/.*ask|\/api\/.*ask|sse\/rest\/.*ask/i,
       responseTimeoutMs: 60_000,
@@ -550,9 +563,16 @@ export class PerplexityWebExecutor extends BaseExecutor {
       return { response: errResp, url: PPLX_SSE_ENDPOINT, headers: {}, transformedBody: body };
     }
 
+    // LEV fork GAP-8: flatten tool history first so assistant tool_calls and
+    // tool results survive into the prompt. Without this, multi-turn agentic
+    // conversations lose every prior tool result and the model answers as if
+    // it had never called a tool.
     const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
       bodyObj,
-      rawMessages as Array<{ role: string; content: unknown }>
+      flattenToolHistory(rawMessages as Array<{ role: string; content: unknown }>) as Array<{
+        role: string;
+        content: unknown;
+      }>
     );
 
     // Resolve thinking mode

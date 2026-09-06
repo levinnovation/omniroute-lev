@@ -96,17 +96,35 @@ async function fillPrompt(
 ): Promise<void> {
   const locator = page.locator(selector).first();
   await locator.waitFor({ state: "visible", timeout: 10_000 });
+
+  // Focus the target before typing. `page.keyboard.type()` types into whatever
+  // currently holds focus, which is only the chat input by luck (autofocus).
+  // On providers that do not autofocus — or that steal focus during load — the
+  // prompt was silently typed into the void and the submit produced nothing.
   if (mode === "type") {
+    await locator.click({ timeout: 5_000 }).catch(() => locator.focus().catch(() => {}));
     await page.keyboard.type(prompt, { delay: 5 });
     return;
   }
+
   if (mode === "evaluate") {
     try {
       await locator.evaluate((el, text) => {
-        const textarea = el as HTMLTextAreaElement;
-        textarea.value = text;
-        textarea.dispatchEvent(new Event("input", { bubbles: true }));
-        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+        const element = el as HTMLElement;
+        // Rich-text editors (Perplexity, Gemini/Quill, Claude) render a
+        // contenteditable <div>, not a <textarea>. Assigning `.value` on those
+        // is a silent no-op, so the prompt never reaches the composer.
+        if (element.isContentEditable) {
+          element.focus();
+          element.textContent = text;
+          element.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
+          element.dispatchEvent(new Event("change", { bubbles: true }));
+          return;
+        }
+        const field = element as HTMLTextAreaElement | HTMLInputElement;
+        field.value = text;
+        field.dispatchEvent(new Event("input", { bubbles: true }));
+        field.dispatchEvent(new Event("change", { bubbles: true }));
       }, prompt);
     } catch {
       await locator.fill(prompt);
