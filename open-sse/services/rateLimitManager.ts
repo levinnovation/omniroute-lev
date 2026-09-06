@@ -98,6 +98,40 @@ let initialized = false;
 let currentRequestQueueSettings: RequestQueueSettings = DEFAULT_RESILIENCE_SETTINGS.requestQueue;
 export const ZAI_WEB_REQUEST_QUEUE_MAX_WAIT_MS = 60_000;
 
+// Browser-backed web providers drive a real browser for every request —
+// navigate, clear a challenge, fill the composer, scrape an SSE stream — which
+// routinely takes 15-60s and considerably longer for a large agentic payload
+// (a 48K-token request with 60 tool definitions is normal from opencode,
+// Cursor or Cline).
+//
+// This matters because maxWaitMs is applied as Bottleneck's `expiration`, i.e.
+// an EXECUTION deadline that starts AFTER dispatch — not a queue-wait bound
+// (see the comment at the scheduleOpts construction below). The shared 120s
+// default therefore kills legitimate in-flight browser work mid-request and
+// surfaces as a 504 that reads like an upstream timeout, when nothing upstream
+// timed out at all. Raising the floor for these providers keeps the gateway
+// usable from any agentic client rather than pushing callers to a different
+// provider. Operators can still raise it further per connection; the floor
+// only prevents the default from being too tight for this transport.
+const BROWSER_BACKED_EXECUTION_FLOOR_MS = 300_000;
+
+const BROWSER_BACKED_PROVIDERS = new Set([
+  "adapta-web",
+  "blackbox-web",
+  "chatgpt-web",
+  "claude-web",
+  "deepseek-web",
+  "duckduckgo-web",
+  "gemini-web",
+  "grok-web",
+  "huggingchat",
+  "muse-spark-web",
+  "perplexity-web",
+  "qwen-web",
+  "t3-web",
+  "zai-web",
+]);
+
 const limiterEffectiveSettings = new WeakMap<Bottleneck, Bottleneck.ConstructorOptions>();
 const preservedReplacementSettings = new Map<string, Bottleneck.ConstructorOptions>();
 const limiterWatchdog = new LimiterWedgeWatchdog({
@@ -166,10 +200,14 @@ export function resolveRequestQueueMaxWaitMs(
   configuredMaxWaitMs: number = currentRequestQueueSettings.maxWaitMs,
   connectionId?: string
 ): number {
-  const legacyDefault =
-    provider.trim().toLowerCase() === "zai-web"
-      ? Math.max(configuredMaxWaitMs, ZAI_WEB_REQUEST_QUEUE_MAX_WAIT_MS)
-      : configuredMaxWaitMs;
+  const normalizedProvider = provider.trim().toLowerCase();
+  let legacyDefault = configuredMaxWaitMs;
+  if (normalizedProvider === "zai-web") {
+    legacyDefault = Math.max(legacyDefault, ZAI_WEB_REQUEST_QUEUE_MAX_WAIT_MS);
+  }
+  if (BROWSER_BACKED_PROVIDERS.has(normalizedProvider)) {
+    legacyDefault = Math.max(legacyDefault, BROWSER_BACKED_EXECUTION_FLOOR_MS);
+  }
   const override = connectionId
     ? connectionRateLimitOverrides.get(connectionId)?.maxWaitMs
     : undefined;

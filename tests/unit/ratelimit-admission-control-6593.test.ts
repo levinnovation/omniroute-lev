@@ -183,10 +183,21 @@ test("#6593 DEFAULT_REQUEST_QUEUE_MAX_WAIT_MS is 15s absent RATE_LIMIT_MAX_WAIT_
   assert.equal(resilienceSettings.DEFAULT_RESILIENCE_SETTINGS.requestQueue.maxWaitMs, 15000);
 });
 
-test("#6593 zai-web receives a provider-scoped 60s scheduling budget", () => {
+test("browser-backed providers get a 300s execution floor; others are untouched", () => {
+  // Supersedes #6593's 60s zai-web floor. maxWaitMs is applied as Bottleneck's
+  // `expiration` — an EXECUTION deadline after dispatch, not a queue-wait bound
+  // — and browser-backed providers drive a real browser per request. zai-web
+  // was measured at 148s end-to-end in production, so a 60s (or the shared
+  // 120s) budget kills legitimate in-flight work and surfaces as a 504 that
+  // looks like an upstream timeout. Non-browser providers keep the configured
+  // value exactly.
   assert.equal(rateLimitManager.resolveRequestQueueMaxWaitMs("openai", 15_000), 15_000);
-  assert.equal(rateLimitManager.resolveRequestQueueMaxWaitMs("zai-web", 15_000), 60_000);
-  assert.equal(rateLimitManager.resolveRequestQueueMaxWaitMs("ZAI-WEB", 90_000), 90_000);
+  assert.equal(rateLimitManager.resolveRequestQueueMaxWaitMs("zai-web", 15_000), 300_000);
+  assert.equal(rateLimitManager.resolveRequestQueueMaxWaitMs("ZAI-WEB", 90_000), 300_000);
+  assert.equal(rateLimitManager.resolveRequestQueueMaxWaitMs("perplexity-web", 120_000), 300_000);
+  assert.equal(rateLimitManager.resolveRequestQueueMaxWaitMs("gemini-web", 120_000), 300_000);
+  // The floor only raises; a larger configured value still wins.
+  assert.equal(rateLimitManager.resolveRequestQueueMaxWaitMs("qwen-web", 600_000), 600_000);
 });
 
 test("#6593 connection maxWaitMs override takes priority over the zai-web scheduling budget", () => {
@@ -207,12 +218,12 @@ test("#6593 connection maxWaitMs override takes priority over the zai-web schedu
   }
 });
 
-test("#6593 a connection without a maxWaitMs override keeps the zai-web 60s floor", () => {
+test("a connection without a maxWaitMs override keeps the browser-backed floor", () => {
   rateLimitManager.refreshConnectionRateLimits("conn-no-maxwait-override", { rpm: 10 });
   try {
     assert.equal(
       rateLimitManager.resolveRequestQueueMaxWaitMs("zai-web", 15_000, "conn-no-maxwait-override"),
-      rateLimitManager.ZAI_WEB_REQUEST_QUEUE_MAX_WAIT_MS
+      300_000
     );
   } finally {
     rateLimitManager.refreshConnectionRateLimits("conn-no-maxwait-override", null);
