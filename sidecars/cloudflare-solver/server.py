@@ -10,6 +10,7 @@ Endpoints:
   GET  /health        — Health check
 """
 
+import asyncio
 import time
 import logging
 from typing import Optional
@@ -41,16 +42,87 @@ class CfClearanceResponse(BaseModel):
     expires_at: int  # Unix timestamp
 
 
+DEFAULT_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+# How long to wait for Cloudflare's interstitial to clear before giving up.
+CHALLENGE_TIMEOUT_MS = 45_000
+
+
 async def _get_solver():
-    """Lazily initialize the cloudflare-solver instance."""
+    """Lazily start Playwright and keep one browser warm.
+
+    Returns (browser, lock). The lock serialises solves: each one drives a real
+    browser and Cloudflare rate-limits by IP anyway, so concurrency here buys
+    nothing and costs memory.
+    """
     global _solver, _solver_lock
     if _solver is None:
         import asyncio
+        from playwright.async_api import async_playwright
+
         _solver_lock = asyncio.Lock()
-        from cloudflare_solver import CloudflareSolver
-        _solver = CloudflareSolver(headless=True)
-        logger.info("CloudflareSolver initialized")
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        _solver = {"pw": pw, "browser": browser}
+        logger.info("Playwright chromium launched for cf_clearance solving")
     return _solver, _solver_lock
+
+
+async def _solve_clearance(url: str, user_agent: str, proxy: Optional[str]) -> dict:
+    """Navigate to a Cloudflare-protected URL and wait out the JS challenge.
+
+    Returns {cf_clearance, user_agent, cookies}. cf_clearance is absent when the
+    origin never issued one — either the challenge did not clear, or the URL was
+    not actually challenged.
+    """
+    solver, _ = await _get_solver()
+    browser = solver["browser"]
+
+    context_kwargs: dict = {
+        "user_agent": user_agent,
+        "viewport": {"width": 1280, "height": 800},
+        "locale": "en-US",
+    }
+    if proxy:
+        context_kwargs["proxy"] = {"server": proxy}
+
+    context = await browser.new_context(**context_kwargs)
+    try:
+        page = await context.new_page()
+        # Hide the most obvious automation tell before any page script runs.
+        await page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        await page.goto(url, wait_until="domcontentloaded", timeout=CHALLENGE_TIMEOUT_MS)
+
+        # Poll for the cookie rather than racing a fixed sleep: the interstitial
+        # can clear in under a second or take tens of seconds under load.
+        deadline = time.time() + (CHALLENGE_TIMEOUT_MS / 1000)
+        while time.time() < deadline:
+            cookies = await context.cookies()
+            if any(c.get("name") == "cf_clearance" for c in cookies):
+                break
+            await asyncio.sleep(1.0)
+
+        cookies = await context.cookies()
+        jar = {c["name"]: c["value"] for c in cookies if "name" in c and "value" in c}
+        return {
+            "cf_clearance": jar.get("cf_clearance", ""),
+            "user_agent": user_agent,
+            "cookies": jar,
+        }
+    finally:
+        await context.close()
 
 
 @app.on_event("startup")
@@ -63,9 +135,11 @@ async def shutdown():
     global _solver
     if _solver is not None:
         try:
-            await _solver.close()
+            await _solver["browser"].close()
+            await _solver["pw"].stop()
         except Exception:
             pass
+        _solver = None
     logger.info("Cloudflare Solver Sidecar shut down")
 
 
@@ -89,20 +163,15 @@ async def get_cf_clearance(req: CfClearanceRequest):
     """
     import asyncio
 
-    solver, lock = await _get_solver()
+    _, lock = await _get_solver()
 
     async with lock:
         try:
             logger.info(f"Solving cf_clearance for URL: {req.url}")
 
-            # cloudflare-solver API: solve(url, user_agent, proxy)
-            kwargs = {}
-            if req.user_agent:
-                kwargs["user_agent"] = req.user_agent
-            if req.proxy:
-                kwargs["proxy"] = req.proxy
-
-            result = await solver.solve(req.url, **kwargs)
+            result = await _solve_clearance(
+                req.url, req.user_agent or DEFAULT_UA, req.proxy
+            )
 
             if not result or not result.get("cf_clearance"):
                 raise HTTPException(

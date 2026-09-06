@@ -1,4 +1,9 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
-cloudflare-solver-re==0.1.4
+# Playwright, not cloudflare-solver-re: that package does not exist on PyPI
+# ("No matching distribution found for cloudflare-solver-re==0.1.4"), so this
+# sidecar could never build. Playwright is also the engine the rest of the
+# stack already runs on (Browserless/patchright), so the challenge-solving
+# behaviour here matches what the executors get elsewhere.
+playwright==1.49.1

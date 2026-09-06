@@ -14,21 +14,22 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies for Chrome/Chromium
+# curl is needed for the HEALTHCHECK below; Chromium itself comes from
+# `playwright install --with-deps`, which pins a browser build matched to the
+# Playwright version instead of whatever Debian ships.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-    wget gnupg2 unzip curl \
-    chromium \
-    chromium-driver \
+  && apt-get install -y --no-install-recommends curl \
   && rm -rf /var/lib/apt/lists/*
-
-# Set Chrome environment
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Chromium plus its system libraries. --with-deps pulls the exact apt
+# packages the bundled build needs, so a missing shared object surfaces at build
+# time rather than as a launch failure on the first solve request.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install --with-deps chromium
 
 # Copy server code
 COPY server.py .
