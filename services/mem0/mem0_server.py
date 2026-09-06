@@ -13,7 +13,7 @@ import os
 import json
 import logging
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 logger = logging.getLogger("mem0-server")
@@ -66,6 +66,32 @@ def get_mem0():
 
 
 # ── Auth middleware (simple API key) ───────────────────────────────────────
+def resolve_api_key(
+    api_key: Optional[str] = None,
+    authorization: Optional[str] = None,
+    x_api_key: Optional[str] = None,
+) -> Optional[str]:
+    """Accept the key from an Authorization header, an X-API-Key header, or the
+    legacy ?api_key= query parameter.
+
+    OmniRoute's sidecar client (open-sse/services/sidecars.ts) sends
+    `Authorization: Bearer <key>`, but every route here declared `api_key` as a
+    bare scalar, which FastAPI binds as a QUERY parameter. The header was
+    therefore never read, api_key was always None, and every call 401'd —
+    compactContext() swallowed that and silently fell back to client-side
+    truncation, so context compaction never actually ran server-side.
+    """
+    if authorization:
+        token = authorization.strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        if token:
+            return token
+    if x_api_key:
+        return x_api_key.strip()
+    return api_key
+
+
 def check_auth(api_key: Optional[str]):
     if API_KEY and api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -97,8 +123,11 @@ async def health():
 
 
 @app.post("/memories/add")
-async def add_memory(req: AddMemoryRequest, api_key: Optional[str] = None):
-    check_auth(api_key)
+async def add_memory(req: AddMemoryRequest, api_key: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_auth(resolve_api_key(api_key, authorization, x_api_key))
     client = get_mem0()
     if client is None:
         return {"status": "stub", "message": "Mem0 not configured — request accepted but no memory stored"}
@@ -114,8 +143,11 @@ async def add_memory(req: AddMemoryRequest, api_key: Optional[str] = None):
 
 
 @app.post("/memories/search")
-async def search_memory(req: SearchMemoryRequest, api_key: Optional[str] = None):
-    check_auth(api_key)
+async def search_memory(req: SearchMemoryRequest, api_key: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_auth(resolve_api_key(api_key, authorization, x_api_key))
     client = get_mem0()
     if client is None:
         return {"status": "stub", "memories": []}
@@ -131,9 +163,14 @@ async def search_memory(req: SearchMemoryRequest, api_key: Optional[str] = None)
 
 
 @app.post("/context/compact")
-async def compact_context(req: CompactContextRequest, api_key: Optional[str] = None):
+async def compact_context(
+    req: CompactContextRequest,
+    api_key: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
     """Compact a long conversation history into a concise summary using mem0."""
-    check_auth(api_key)
+    check_auth(resolve_api_key(api_key, authorization, x_api_key))
     client = get_mem0()
     if client is None:
         # Fallback: simple truncation
@@ -166,8 +203,11 @@ async def compact_context(req: CompactContextRequest, api_key: Optional[str] = N
 
 
 @app.get("/memories")
-async def list_memories(user_id: str = "default", api_key: Optional[str] = None):
-    check_auth(api_key)
+async def list_memories(user_id: str = "default", api_key: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_auth(resolve_api_key(api_key, authorization, x_api_key))
     client = get_mem0()
     if client is None:
         return {"status": "stub", "memories": []}
@@ -179,8 +219,11 @@ async def list_memories(user_id: str = "default", api_key: Optional[str] = None)
 
 
 @app.delete("/memories")
-async def delete_memory(memory_id: str, api_key: Optional[str] = None):
-    check_auth(api_key)
+async def delete_memory(memory_id: str, api_key: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    check_auth(resolve_api_key(api_key, authorization, x_api_key))
     client = get_mem0()
     if client is None:
         return {"status": "stub", "deleted": False}

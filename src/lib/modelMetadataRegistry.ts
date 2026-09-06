@@ -491,6 +491,23 @@ export function enrichCatalogModelEntry<T extends JsonRecord>(
                 metadata.model,
                 CANONICAL_EFFORT_VALUES
               );
+  // #5240/#8437 follow-up: web-cookie providers honestly declare registry
+  // `toolCalling: false` (they have no NATIVE function calling) while still
+  // running the prompt-emulated tool shim, and the provider entry declares
+  // `toolCalling: "emulated"`. Combo routing already keeps those targets
+  // eligible via providerSupportsEmulatedToolCalling(), but EXTERNAL clients
+  // only ever see this catalog. Advertising a bare `false` made Zed, Cline and
+  // Cursor disable tools outright — Zed swaps in its "you have no ability to
+  // use tools" system prompt and sends no tools[] at all, so the emulated shim
+  // (prepareToolMessages + robustWebTools) could never fire and the model
+  // truthfully answered that it cannot read the codebase.
+  // Advertise the emulated capability so clients send tools; only upgrade a
+  // non-true value, never downgrade, and never turn `unknown` into `true` for
+  // providers that make no such declaration.
+  const emulatedToolProvider =
+    (AI_PROVIDERS as Record<string, JsonRecord>)[String(metadata.provider ?? provider ?? "")]
+      ?.toolCalling === "emulated";
+
   const capabilityFields = {
     ...(typeof metadata.capabilities.vision === "boolean"
       ? { vision: metadata.capabilities.vision }
@@ -502,7 +519,9 @@ export function enrichCatalogModelEntry<T extends JsonRecord>(
       ? metadata.capabilities.supportsTools === true || metadata.capabilities.toolCalling === true
         ? true
         : false
-      : metadata.capabilities.toolCalling,
+      : metadata.capabilities.toolCalling !== true && emulatedToolProvider
+        ? true
+        : metadata.capabilities.toolCalling,
     reasoning: specialtySurface
       ? metadata.capabilities.supportsThinking === true || metadata.capabilities.reasoning === true
         ? true
