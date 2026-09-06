@@ -212,11 +212,52 @@ export function buildGeminiPrompt(messages: Array<{ role: string; content: unkno
 export function buildGeminiToolPrompt(
   effectiveMessages: Array<{ role: string; content: unknown }>
 ): string {
-  const toolSystemMsg = effectiveMessages.find((m) => m.role === "system");
-  const lastUserMsg = [...effectiveMessages].reverse().find((m) => m.role === "user");
-  const userText = typeof lastUserMsg?.content === "string" ? lastUserMsg.content : "";
-  const toolPrompt = typeof toolSystemMsg?.content === "string" ? toolSystemMsg.content : "";
-  return toolPrompt ? `${toolPrompt}\n\n${userText}` : userText;
+  // Fold EVERY system message, not just the first. prepareToolMessages()
+  // APPENDS the tool contract as the final system message (webTools.ts) and
+  // documents the requirement: "Executors fold all system messages into one
+  // block". This used to take .find(), i.e. the FIRST system message, so with
+  // any client that sends its own system prompt (opencode, Cursor, Cline) it
+  // picked up the client prompt and dropped the tool contract entirely. The
+  // model then received a tool REMINDER naming tools whose contract it had
+  // never been given, could not emit a <tool> block, and answered with a bare
+  // acknowledgement — "I am ready to assist you" against a 48K-token request.
+  const systemText = effectiveMessages
+    .filter((m) => m.role === "system" && typeof m.content === "string")
+    .map((m) => (m.content as string).trim())
+    .filter(Boolean)
+    .join("\n\n");
+
+  const textMessages = effectiveMessages.filter(
+    (m) => typeof m.content === "string" && (m.content as string).trim().length > 0
+  ) as Array<{ role: string; content: string }>;
+
+  const userMessages = textMessages.filter((m) => m.role === "user");
+  const lastUser = userMessages[userMessages.length - 1];
+  const userText = lastUser?.content ?? "";
+  const lastUserIdx = lastUser ? textMessages.lastIndexOf(lastUser) : -1;
+
+  // Carry the prior turns too. gemini-web sends one flat string, and this
+  // builder previously emitted only system + the final user message, so in
+  // tool mode every earlier turn — including tool results already returned to
+  // the model — was silently dropped and multi-turn agentic sessions could not
+  // continue. The no-tools builder above has always included them.
+  const priorTurns = textMessages.filter(
+    (m, i) => i < lastUserIdx && (m.role === "user" || m.role === "assistant")
+  );
+
+  const parts: string[] = [];
+  if (systemText) parts.push(systemText);
+  if (priorTurns.length > 0) {
+    parts.push(
+      `Previous conversation:\n${priorTurns
+        .map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`)
+        .join("\n\n")}`
+    );
+    parts.push(`Current user message:\n${userText}`);
+  } else if (userText) {
+    parts.push(userText);
+  }
+  return parts.join("\n\n");
 }
 
 /**

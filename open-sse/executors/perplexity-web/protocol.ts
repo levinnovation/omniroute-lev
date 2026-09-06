@@ -485,7 +485,21 @@ export function buildQuery(parsed: ParsedMessages, followUpUuid: string | null):
   const MAX_SYSTEM_LEN = 12_000;
   let systemMsg = parsed.systemMsg.trim();
   if (systemMsg.length > MAX_SYSTEM_LEN) {
-    systemMsg = systemMsg.slice(0, MAX_SYSTEM_LEN) + "\n[...system prompt truncated...]";
+    // Keep the HEAD and the TAIL, not just the head. prepareToolMessages()
+    // appends the tool contract as the FINAL system message and every system
+    // message is folded into this one block, so a plain slice(0, MAX) drops the
+    // contract outright on exactly the clients that need it — agentic ones,
+    // whose own system prompts already exceed this budget on their own. The
+    // model was then told (by the reminder appended to the user turn) that
+    // tools were available, while never receiving the <tool> protocol itself.
+    // The head carries the client's identity and core instructions; the tail
+    // carries the contract.
+    const TAIL_LEN = 4_000;
+    const headLen = MAX_SYSTEM_LEN - TAIL_LEN;
+    systemMsg =
+      systemMsg.slice(0, headLen) +
+      "\n[...system prompt truncated...]\n" +
+      systemMsg.slice(-TAIL_LEN);
   }
 
   const obj: Record<string, unknown> = {};
