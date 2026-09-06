@@ -50,7 +50,12 @@ export function getMem0Config(): SidecarConfig | null {
   return {
     url,
     apiKey: process.env.OMNIROUTE_MEM0_KEY || undefined,
-    timeoutMs: 30000,
+    // Real compaction embeds every message locally (sentence-transformers on
+    // CPU) and then runs a pgvector similarity search, so it is meaningfully
+    // slower than the stub that used to answer instantly. Blowing this deadline
+    // is silent — compactContext() falls back to positional truncation — so it
+    // is generous, and overridable without a redeploy.
+    timeoutMs: Number(process.env.OMNIROUTE_MEM0_TIMEOUT_MS) || 60_000,
   };
 }
 
@@ -179,8 +184,17 @@ export async function compactContext(
       messages: result.messages,
       method: result.method || "mem0",
     };
-  } catch {
-    // Fallback to truncation on error
+  } catch (err) {
+    // Fallback to positional truncation. This path is a real degradation — it
+    // keeps the first 2 and last 6 messages and throws the middle away with no
+    // regard for relevance — so say so. Swallowing it silently is exactly how a
+    // 401 from the sidecar went unnoticed in production while every large
+    // request quietly lost its context.
+    console.warn(
+      `[Mem0] compactContext falling back to positional truncation: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
     const totalChars = messages.reduce((sum, m) => sum + m.content.length, 0);
     if (totalChars <= maxTokens * 4) {
       return { compacted: false, messages, method: "none" };

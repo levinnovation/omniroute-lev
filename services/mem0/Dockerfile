@@ -10,13 +10,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Install mem0 + FastAPI + uvicorn
+# Install mem0 + FastAPI + uvicorn.
+# CPU-only torch: the default wheel pulls ~2GB of CUDA libraries that are dead
+# weight on a Railway container with no GPU, and slow enough to push the build
+# past its timeout. Installed first so the sentence-transformers dependency
+# resolution below reuses it instead of fetching the CUDA build.
+RUN pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    "torch>=2.2,<3"
+
 RUN pip install --no-cache-dir \
     "mem0ai>=0.1.50" \
     "fastapi>=0.115.0" \
     "uvicorn[standard]>=0.30.0" \
     "psycopg2-binary>=2.9" \
-    "pgvector>=0.3.0"
+    "pgvector>=0.3.0" \
+    "sentence-transformers>=3.0"
+
+# Bake the embedding model into the image. Without this the first request pays a
+# cold HuggingFace download, and a container with no outbound HF access would
+# fall back to stub mode at runtime instead of at build time.
+ENV MEM0_EMBEDDER_MODEL=all-MiniLM-L6-v2
+ENV HF_HOME=/app/.cache/huggingface
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
 # Copy the server code
 COPY mem0_server.py .

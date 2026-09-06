@@ -26,40 +26,100 @@ POSTGRES_URL = os.getenv("DATABASE_URL", os.getenv("POSTGRES_URL", ""))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 API_KEY = os.getenv("API_KEY", "lev-mem0-prod-2026")
 
+# ── Embedder / LLM wiring ──────────────────────────────────────────────────
+# Local-first: sentence-transformers runs in-process, so semantic memory needs
+# no external key. all-MiniLM-L6-v2 emits 384-dim vectors — EMBEDDING_DIMS must
+# track whatever model is selected or pgvector inserts fail on width mismatch.
+EMBEDDER_PROVIDER = os.getenv("MEM0_EMBEDDER_PROVIDER", "huggingface").strip().lower()
+EMBEDDER_MODEL = os.getenv(
+    "MEM0_EMBEDDER_MODEL",
+    "text-embedding-3-small" if EMBEDDER_PROVIDER == "openai" else "all-MiniLM-L6-v2",
+)
+EMBEDDING_DIMS = int(os.getenv("MEM0_EMBEDDING_DIMS", "1536" if EMBEDDER_PROVIDER == "openai" else "384"))
+
+# Fact-extraction LLM. Defaults to OmniRoute's own gateway over the Railway
+# private network so no external LLM account is required.
+LLM_BASE_URL = os.getenv("MEM0_LLM_BASE_URL", "").strip()
+LLM_MODEL = os.getenv("MEM0_LLM_MODEL", "gpt-4o-mini")
+LLM_API_KEY = os.getenv("MEM0_LLM_API_KEY", "").strip()
+
+# Whether mem0 runs LLM fact-extraction on add(). Extraction over a full
+# long-context conversation is the slowest thing in this service and sits on the
+# hot path of every compaction, so it is opt-in.
+INFER_ON_ADD = os.getenv("MEM0_INFER_ON_ADD", "false").strip().lower() in ("1", "true", "yes")
+
 # ── Mem0 client (lazy init) ────────────────────────────────────────────────
 _mem0_client = None
+_last_init_error = None
 
 def get_mem0():
-    global _mem0_client
+    global _mem0_client, _last_init_error
     if _mem0_client is not None:
         return _mem0_client
     try:
         from mem0 import Memory
+
+        # Vector store — Postgres + pgvector on the existing Railway Postgres.
+        # embedding_model_dims MUST match the embedder's output width or every
+        # insert fails: the local MiniLM default is 384, not OpenAI's 1536.
         config = {
             "vector_store": {
                 "provider": "pgvector",
                 "config": {
                     "dbname": os.getenv("POSTGRES_DB", "postgres"),
-                    "collection_name": "mem0_memories",
+                    "collection_name": os.getenv("MEM0_COLLECTION", "mem0_memories"),
                     "host": os.getenv("POSTGRES_HOST", "localhost"),
                     "port": int(os.getenv("POSTGRES_PORT", "5432")),
                     "user": os.getenv("POSTGRES_USER", "postgres"),
                     "password": os.getenv("POSTGRES_PASSWORD", ""),
+                    "embedding_model_dims": EMBEDDING_DIMS,
                 },
             },
         }
-        if OPENAI_API_KEY:
-            config["llm"] = {
-                "provider": "openai",
-                "config": {"api_key": OPENAI_API_KEY, "model": "gpt-4o-mini"},
-            }
+
+        # Embedder — local sentence-transformers by default, so vector memory
+        # needs no external API key and costs nothing per request. Falls back to
+        # OpenAI only when a key is explicitly provided.
+        if EMBEDDER_PROVIDER == "openai" and OPENAI_API_KEY:
             config["embedder"] = {
                 "provider": "openai",
-                "config": {"api_key": OPENAI_API_KEY, "model": "text-embedding-3-small"},
+                "config": {"api_key": OPENAI_API_KEY, "model": EMBEDDER_MODEL},
             }
+        else:
+            config["embedder"] = {
+                "provider": "huggingface",
+                "config": {"model": EMBEDDER_MODEL, "embedding_dims": EMBEDDING_DIMS},
+            }
+
+        # LLM for fact extraction. Points at OmniRoute's own OpenAI-compatible
+        # gateway by default, so memory extraction runs on the providers this
+        # deployment already has rather than a separate vendor account.
+        if OPENAI_API_KEY and LLM_BASE_URL == "":
+            config["llm"] = {
+                "provider": "openai",
+                "config": {"api_key": OPENAI_API_KEY, "model": LLM_MODEL},
+            }
+        elif LLM_BASE_URL:
+            config["llm"] = {
+                "provider": "openai",
+                "config": {
+                    "api_key": LLM_API_KEY or "omniroute",
+                    "model": LLM_MODEL,
+                    "openai_base_url": LLM_BASE_URL,
+                },
+            }
+
         _mem0_client = Memory.from_config(config)
-        logger.info("Mem0 initialized with pgvector backend")
+        logger.info(
+            "Mem0 initialized (vector_store=pgvector dims=%s embedder=%s/%s llm=%s@%s)",
+            EMBEDDING_DIMS,
+            config["embedder"]["provider"],
+            EMBEDDER_MODEL,
+            LLM_MODEL,
+            LLM_BASE_URL or "openai",
+        )
     except Exception as e:
+        _last_init_error = f"{type(e).__name__}: {e}"[:300]
         logger.warning(f"Mem0 init failed (running in stub mode): {e}")
         _mem0_client = None
     return _mem0_client
@@ -119,7 +179,23 @@ class CompactContextRequest(BaseModel):
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "mem0": "connected" if get_mem0() else "stub"}
+    """Report backing-service wiring so a stub is diagnosable without shell access.
+
+    The previous form returned a bare {"mem0": "stub"} with no indication of
+    which dependency was missing, which is how this service ran as a stub in
+    production unnoticed.
+    """
+    client = get_mem0()
+    return {
+        "status": "ok",
+        "mem0": "connected" if client else "stub",
+        "vector_store": "pgvector",
+        "embedder": {"provider": EMBEDDER_PROVIDER, "model": EMBEDDER_MODEL, "dims": EMBEDDING_DIMS},
+        "llm": {"model": LLM_MODEL, "base_url": LLM_BASE_URL or "openai"},
+        "infer_on_add": INFER_ON_ADD,
+        "postgres_configured": bool(os.getenv("POSTGRES_HOST")),
+        "last_init_error": _last_init_error,
+    }
 
 
 @app.post("/memories/add")
@@ -181,8 +257,13 @@ async def compact_context(
         kept = req.messages[:2] + req.messages[-6:]
         return {"status": "ok", "compacted": True, "messages": kept, "method": "truncation"}
     try:
-        # Use mem0 to extract and store relevant memories, then return a compact context
-        client.add(messages=req.messages, user_id=req.user_id)
+        # Store the conversation, then retrieve what is relevant to the latest turn.
+        # infer=False skips LLM fact-extraction, which is by far the slowest step
+        # here and sits on the hot path of every compaction — a long-context
+        # request would otherwise pay a full extraction pass over the entire
+        # history before the caller's 30s sidecar timeout. Opt in via
+        # MEM0_INFER_ON_ADD=true once extraction latency is acceptable.
+        client.add(messages=req.messages, user_id=req.user_id, infer=INFER_ON_ADD)
         # Search for the most relevant memories to build a compact context
         last_user_msg = ""
         for m in reversed(req.messages):
