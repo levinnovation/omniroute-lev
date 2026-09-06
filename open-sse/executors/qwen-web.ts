@@ -155,8 +155,6 @@ export class QwenWebExecutor extends BaseExecutor {
     const modelId = mapModel(requestedModel);
     const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(bodyObj, messages);
     const prompt = this.foldMessages(effectiveMessages);
-    const requestedModel = (bodyObj.model as string) || DEFAULT_MODEL;
-    const modelId = mapModel(requestedModel);
     const msgPayload = this.buildMessagePayload("ffi-chat", modelId, prompt, requestedModel);
     const apiHeaders = this.buildApiHeaders(token, cookieHeader);
 
