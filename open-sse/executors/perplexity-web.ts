@@ -415,9 +415,55 @@ export class PerplexityWebExecutor extends BaseExecutor {
     if (!cookieString && !credentials.accessToken) return null;
 
     const poolKey = `perplexity-web:${(cookieBlob || credentials.accessToken || "").slice(0, 24)}`;
+
+    // Frontend-fetch fallback. Perplexity sits behind Cloudflare Enterprise,
+    // which pins JA3/JA4 to a real browser handshake — so when the DOM
+    // automation cannot find the composer, dropping to Node fetch() throws away
+    // the one thing that actually gets past the edge. Issuing the very same
+    // /rest/sse/perplexity_ask request from inside the authenticated page keeps
+    // the real cookies, TLS fingerprint and Origin, with no selector coupling.
+    const ffiRequestId = crypto.randomUUID();
+    const ffiBody = buildPplxRequestBody(
+      query,
+      parsed.currentMsg,
+      pplxMode,
+      modelPref,
+      sessionLookup(parsed.history),
+      ffiRequestId
+    );
+    const ffiHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+      Origin: "https://www.perplexity.ai",
+      Referer: "https://www.perplexity.ai/",
+      "x-perplexity-request-endpoint": PPLX_SSE_ENDPOINT,
+      "x-perplexity-request-reason": "ask-query-state-provider",
+      "x-perplexity-request-try-number": "1",
+      "x-request-id": ffiRequestId,
+    };
+    if (credentials.accessToken) {
+      ffiHeaders["Authorization"] = `Bearer ${credentials.accessToken}`;
+    }
+
     const result = await runBrowserAutomation({
       providerName: "perplexity-web",
       poolKey,
+      frontendFetchConfig: {
+        providerName: "perplexity-web",
+        poolKey: `${poolKey}-ffi`,
+        pageUrl: "https://www.perplexity.ai/",
+        cookieDomain: "www.perplexity.ai",
+        cookieString: cookieString ?? "",
+        userAgent: PPLX_USER_AGENT,
+        fetchUrl: PPLX_SSE_ENDPOINT,
+        // Same-origin fetch from the page: the browser attaches the session
+        // cookies itself, so no Cookie header is set here (and setting one
+        // would be a forbidden header in-page anyway).
+        fetchOptions: { method: "POST", headers: ffiHeaders, body: JSON.stringify(ffiBody) },
+        responseTimeoutMs: 60_000,
+        log,
+        signal,
+      },
       pageUrl: "https://www.perplexity.ai/",
       cookieDomain: "www.perplexity.ai",
       cookieString,

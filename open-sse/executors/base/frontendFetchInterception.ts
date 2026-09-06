@@ -266,6 +266,15 @@ export function shouldFallbackToFFI(err: unknown): boolean {
   if (message.includes("Cannot set properties of") && message.includes("undefined")) return true;
   if (message.includes("Target page, context or browser has been closed")) return true;
   if (message.includes("Target closed") && message.toLowerCase().includes("browser")) return true;
+  // A composer that never appears is exactly the case FFI exists for: the page
+  // and its session are fine, only the DOM automation is unusable (the provider
+  // shipped a UI change, or the logged-in layout differs from the one the
+  // selector was written against). Falling through to direct HTTP instead
+  // throws away the authenticated browser context — the whole reason we opened
+  // a browser. Observed on perplexity-web as a 10s locator.waitFor timeout on
+  // every single request.
+  if (message.includes("locator.waitFor") && message.includes("Timeout")) return true;
+  if (message.includes("waiting for locator") && message.includes("exceeded")) return true;
   return false;
 }
 
