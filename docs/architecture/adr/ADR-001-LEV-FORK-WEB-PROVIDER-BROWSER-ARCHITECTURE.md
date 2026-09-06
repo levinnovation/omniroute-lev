@@ -272,15 +272,33 @@ After flattening, `foldMessages()` / `browserPrompt()` can safely fold the conve
 ## Consequences
 
 ### Positive
-- 4 of 7 active web-cookie providers are working with real live LLM calls
+- 5 of 7 active web-cookie providers are working with real live LLM calls (2026-09-06)
+- gemini-web now works via FFI (Frontend Fetch Interception) as primary transport
+- qwen-web multi-turn tool context works (flattenToolHistory fix validated live)
 - Browser pool active-lease protection prevents "Target page, context or browser has been closed" errors
 - Disconnect-aware waits prevent 120s hangs on Browserless disconnects
-- qwen-web fixed from 120s timeout to 30s → OK
+- FFI fallback activates for qwen-web and zai-web when Browserless disconnects mid-operation
+- flattenToolHistory deployed in 8 providers (qwen-web, zai-web, t3-chat-web, huggingchat, blackbox-web, adapta-web, muse-spark-web, perplexity-web)
+- Standalone errorClassifier.ts module created (LEV-4), WebCookieExecutorBase delegates to it
 
 ### Negative
-- gemini-web remains broken due to Google's frontend JS bug (requires GAP-1 implementation)
-- deepseek-web and t3-web are account issues, not architecture issues
+- zai-web multi-turn still times out under Browserless overload — FFI fallback activates but can't acquire a fresh context when the sidecar is overwhelmed
+- deepseek-web and t3-web are account issues (429 muted/rate-limited), not architecture issues
+- LEV-3 migration (robustWebTools) still pending for deepseek-web, gemini-web, perplexity-web
 - 29 inactive providers need code review before they can be activated
 
 ### Neutral
-- The Frontend Fetch Interception (GAP-1) is a new architecture feature that will benefit all web-cookie providers, not just gemini-web
+- The Frontend Fetch Interception (FFI) is a new architecture feature that benefits all web-cookie providers, not just gemini-web
+- zai-web FFI fallback is wired but needs Browserless capacity increase (GAP-9) to be fully effective
+
+## Live Test Results (2026-09-06)
+
+| Provider | Model | Time | Result | Notes |
+|----------|-------|------|--------|-------|
+| qwen-web | qwen-3.5-72b | 9s | OK | Multi-turn tool context works |
+| zai-web | glm-5.2 | 35s | OK | Simple prompts work; multi-turn times out under load |
+| huggingchat | Llama-4-Scout-17B | 4s | OK | |
+| perplexity-web | pplx-sonar | 14s | OK | |
+| gemini-web | gemini-3.5-flash | 7s | OK | Via FFI primary transport |
+| deepseek-web | deepseek-chat | 27s | 429 | Account muted until 2026-09-07 |
+| t3-web | llama-3.3-70b | 120s | timeout | Upstream rate limiting |
