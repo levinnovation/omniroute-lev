@@ -114,6 +114,13 @@ async function fillPrompt(
         // Rich-text editors (Perplexity, Gemini/Quill, Claude) render a
         // contenteditable <div>, not a <textarea>. Assigning `.value` on those
         // is a silent no-op, so the prompt never reaches the composer.
+        //
+        // NOTE: this branch only works for plain contenteditable elements.
+        // Editors that keep their own document model and reconcile it onto the
+        // DOM — Lexical (data-lexical-editor), ProseMirror, Quill — ignore a
+        // direct textContent write, so the prompt looks present in the DOM but
+        // the editor state stays empty and submit sends nothing. Those
+        // providers must use fillMode: "type", which drives real key events.
         if (element.isContentEditable) {
           element.focus();
           element.textContent = text;

@@ -13,7 +13,13 @@
  * build. The executor discovers it dynamically from the page's JS runtime.
  */
 
-import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./base.ts";
+import {
+  BaseExecutor,
+  mergeAbortSignals,
+  type ExecuteInput,
+  type ExecutorExecuteResult,
+} from "./base.ts";
+import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { errorResponse } from "../utils/error.ts";
 import { prepareToolMessages } from "../translator/webTools.ts";
 import {
@@ -622,11 +628,20 @@ export class T3ChatWebExecutor extends BaseExecutor {
 
       log?.info?.("T3-CHAT-WEB", `POST ${completionUrl} model=${model}`);
 
+      // Bound the upstream call. Without a timeout this fetch inherits only the
+      // client signal, so when t3.chat accepts the connection and then never
+      // responds the request hangs indefinitely — observed live as a 180s
+      // no-response on t3-web/gemini-2.5-flash after the browser path had
+      // already returned "no response captured". Same AbortSignal.timeout +
+      // mergeAbortSignals pattern the other web-cookie executors use.
+      const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+      const combinedSignal = signal ? mergeAbortSignals(signal, timeoutSignal) : timeoutSignal;
+
       const resp = await fetch(completionUrl, {
         method: "POST",
         headers,
         body: JSON.stringify(requestPayload),
-        signal,
+        signal: combinedSignal,
       });
 
       // 3. Handle HTTP errors

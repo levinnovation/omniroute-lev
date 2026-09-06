@@ -434,7 +434,13 @@ export class PerplexityWebExecutor extends BaseExecutor {
       responseUrlMatch: /perplexity\.ai.*\/rest\/.*ask|\/api\/.*ask|sse\/rest\/.*ask/i,
       responseTimeoutMs: 60_000,
       postSubmitWaitMs: 30_000,
-      fillMode: "evaluate",
+      // Must be "type", not "evaluate": #ask-input carries
+      // data-lexical-editor="true" and a __lexicalEditor instance, and Lexical
+      // keeps its own editor state that it reconciles onto the DOM. Assigning
+      // textContent therefore does NOT register with the editor, so the submit
+      // would fire with an empty query. Real key events are the supported way
+      // to drive it, and fillPrompt() focuses the target before typing.
+      fillMode: "type",
       log,
       signal,
     });
