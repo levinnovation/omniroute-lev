@@ -144,6 +144,32 @@ def _search(client, query: str, user_id: str, limit: int = 10):
         raise
 
 
+def _memory_texts(search_result) -> list:
+    """Normalise mem0 search output into a list of memory strings.
+
+    Two shapes have to be handled, and getting either wrong fails silently:
+      * newer mem0 returns {"results": [...]}, so iterating the value directly
+        walks the dict KEYS — every item is a str, isinstance(m, dict) is False,
+        and the caller builds an empty summary while believing it searched;
+      * the stored payload key is "data" when add() ran with infer=False (raw
+        messages), and "memory" when the LLM extracted facts.
+    """
+    items = search_result
+    if isinstance(search_result, dict):
+        items = search_result.get("results", search_result.get("memories", []))
+    if not isinstance(items, list):
+        return []
+    texts = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("memory") or item.get("data") or item.get("text") or ""
+        text = str(text).strip()
+        if text:
+            texts.append(text)
+    return texts
+
+
 def _get_all(client, user_id: str):
     """get_all() has the same top-level-vs-filters split as search()."""
     try:
@@ -299,7 +325,7 @@ async def compact_context(
                 break
         if last_user_msg:
             relevant = _search(client, last_user_msg, req.user_id, 5)
-            summary = "\n".join(f"- {m.get('memory', '')}" for m in relevant if isinstance(m, dict))
+            summary = "\n".join(f"- {t}" for t in _memory_texts(relevant))
             if summary:
                 compact_messages = [
                     {"role": "system", "content": f"Relevant context from memory:\n{summary}"},
