@@ -288,8 +288,12 @@ export class HuggingChatExecutor extends BaseExecutor {
       cookieString: cookieHeader,
       userAgent: USER_AGENT,
       inputSelector: "textarea#chat-input, textarea[data-testid='chat-input'], textarea",
+      // huggingface.co/chat labels the send control "Send message"; the old
+      // list matched none of its specific entries and fell through to the
+      // generic button[type="submit"], whose first DOM match is the
+      // "Toggle sidebar navigation" button (verified against the live page).
       submitSelector:
-        'button[data-testid="send-button"], button[aria-label="Send"], button[type="submit"]',
+        'button[aria-label="Send message"], button[data-testid="send-button"], button[aria-label="Send"], button[type="submit"]',
       prompt: inputs,
       responseUrlMatch: /\/chat\/conversation\/[a-zA-Z0-9]+/,
       responseTimeoutMs: 60_000,

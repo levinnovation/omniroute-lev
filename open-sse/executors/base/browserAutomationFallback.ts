@@ -227,20 +227,37 @@ export async function runBrowserAutomation(
     );
 
     if (submitSelector) {
-      const btn = page.locator(submitSelector).first();
-      if ((await btn.count()) > 0) {
+      // Every provider writes submitSelector as a comma-separated fallback list
+      // ordered most-specific first. A CSS selector list matches in DOM order,
+      // NOT selector order, so `locator("a, b").first()` returns whichever
+      // element appears first in the document — which silently defeats that
+      // intent. On huggingface.co/chat the trailing generic
+      // `button[type="submit"]` matches "Toggle sidebar navigation" long before
+      // the real "Send message" button, so the submit click hit the sidebar.
+      // Try each alternative in written order instead and use the first that
+      // actually matches.
+      const candidates = submitSelector
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean);
+      let clicked = false;
+      for (const candidate of candidates) {
+        const btn = page.locator(candidate).first();
+        if ((await btn.count()) === 0) continue;
         try {
           if (submitButtonMode === "dom") {
             await btn.evaluate((element) => (element as HTMLElement).click());
           } else {
             await btn.click({ timeout: 2000 });
           }
+          clicked = true;
+          break;
         } catch {
-          await page.keyboard.press("Enter");
+          // Matched but not clickable (covered, disabled, detached) — fall
+          // through to the next, less specific candidate.
         }
-      } else {
-        await page.keyboard.press("Enter");
       }
+      if (!clicked) await page.keyboard.press("Enter");
     } else {
       await page.keyboard.press("Enter");
     }
