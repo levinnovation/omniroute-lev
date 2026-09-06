@@ -344,11 +344,26 @@ async def compact_context(
                 break
         if last_user_msg:
             relevant = _search(client, last_user_msg, req.user_id, SEARCH_LIMIT)
+            # Drop memories that are just the current turn echoed back. add()
+            # stores the whole conversation INCLUDING the message we then search
+            # with, so the query is its own nearest neighbour and takes the top
+            # slot every time — verified live, where the returned block led with
+            # the user's own question. Also drop anything already present
+            # verbatim in the tail: repeating it wastes the budget that should
+            # carry older context the tail cannot.
+            tail_preview = req.messages[-KEEP_LAST_MESSAGES:]
+            seen = {
+                str(m.get("content", ""))[:MEMORY_SNIPPET_CHARS].strip()
+                for m in tail_preview
+            }
+            seen.add(last_user_msg[:MEMORY_SNIPPET_CHARS].strip())
+
             lines, used = [], 0
             for text in _memory_texts(relevant):
                 snippet = text[:MEMORY_SNIPPET_CHARS].strip()
-                if not snippet:
+                if not snippet or snippet in seen:
                     continue
+                seen.add(snippet)
                 if used + len(snippet) > MEMORY_BLOCK_CHARS:
                     break
                 lines.append(f"- {snippet}")
