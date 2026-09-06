@@ -125,6 +125,37 @@ def get_mem0():
     return _mem0_client
 
 
+def _search(client, query: str, user_id: str, limit: int = 10):
+    """Call mem0's search across API versions.
+
+    Newer mem0ai moved entity scoping out of the top-level kwargs:
+      "Top-level entity parameters frozenset({'user_id'}) are not supported in
+       search(). Use filters={'user_id': '...'} instead."
+    Older builds only accept the top-level form, so try the current signature
+    first and fall back rather than pinning the caller to one mem0 release.
+    """
+    try:
+        return client.search(query=query, filters={"user_id": user_id}, limit=limit)
+    except TypeError:
+        return client.search(query=query, user_id=user_id, limit=limit)
+    except ValueError as e:
+        if "filters" in str(e) or "Top-level entity" in str(e):
+            return client.search(query=query, user_id=user_id, limit=limit)
+        raise
+
+
+def _get_all(client, user_id: str):
+    """get_all() has the same top-level-vs-filters split as search()."""
+    try:
+        return client.get_all(filters={"user_id": user_id})
+    except TypeError:
+        return client.get_all(user_id=user_id)
+    except ValueError as e:
+        if "filters" in str(e) or "Top-level entity" in str(e):
+            return client.get_all(user_id=user_id)
+        raise
+
+
 # ── Auth middleware (simple API key) ───────────────────────────────────────
 def resolve_api_key(
     api_key: Optional[str] = None,
@@ -228,11 +259,7 @@ async def search_memory(req: SearchMemoryRequest, api_key: Optional[str] = None,
     if client is None:
         return {"status": "stub", "memories": []}
     try:
-        results = client.search(
-            query=req.query,
-            user_id=req.user_id,
-            limit=req.limit,
-        )
+        results = _search(client, req.query, req.user_id, req.limit)
         return {"status": "ok", "memories": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -271,7 +298,7 @@ async def compact_context(
                 last_user_msg = str(m.get("content", ""))[:500]
                 break
         if last_user_msg:
-            relevant = client.search(query=last_user_msg, user_id=req.user_id, limit=5)
+            relevant = _search(client, last_user_msg, req.user_id, 5)
             summary = "\n".join(f"- {m.get('memory', '')}" for m in relevant if isinstance(m, dict))
             if summary:
                 compact_messages = [
@@ -293,7 +320,7 @@ async def list_memories(user_id: str = "default", api_key: Optional[str] = None,
     if client is None:
         return {"status": "stub", "memories": []}
     try:
-        memories = client.get_all(user_id=user_id)
+        memories = _get_all(client, user_id)
         return {"status": "ok", "memories": memories}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
