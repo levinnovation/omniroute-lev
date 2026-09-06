@@ -435,6 +435,7 @@ import {
   getComboTargetTokenLimit,
   resolveComboContextLimit,
 } from "../services/contextManager.ts";
+import { createHash } from "node:crypto";
 import { compactContext as mem0CompactContext } from "../services/sidecars.ts";
 import {
   shouldCompact as shouldCompactFidelity,
@@ -2169,7 +2170,19 @@ export async function handleChatCore({
           role: m.role,
           content: typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? ""),
         }));
-        const mem0UserId = String(apiKeyInfo?.id ?? connectionId ?? "default").slice(0, 64);
+        // Scope the memory namespace to THIS conversation, not just the API key.
+        // Keying on the API key alone put every conversation from that key into
+        // one collection, so a top-K similarity search returned whatever was
+        // closest across all of them — unrelated older sessions crowded out the
+        // current one and mid-conversation facts were never retrieved. The
+        // fingerprint is the first user turn, which is stable for the life of a
+        // conversation but differs between them.
+        const mem0Scope = (() => {
+          const firstUser = mem0Input.find((m) => m.role === "user");
+          if (!firstUser) return "";
+          return createHash("sha256").update(firstUser.content).digest("hex").slice(0, 16);
+        })();
+        const mem0UserId = `${String(apiKeyInfo?.id ?? connectionId ?? "default").slice(0, 40)}:${mem0Scope}`;
         try {
           const mem0Result = await mem0CompactContext(
             mem0Input,

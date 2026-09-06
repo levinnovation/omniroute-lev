@@ -48,6 +48,14 @@ LLM_API_KEY = os.getenv("MEM0_LLM_API_KEY", "").strip()
 # hot path of every compaction, so it is opt-in.
 INFER_ON_ADD = os.getenv("MEM0_INFER_ON_ADD", "false").strip().lower() in ("1", "true", "yes")
 
+# Retrieval breadth. The original limit of 5 memories plus a 4-message tail was
+# far too narrow: on a 27-turn conversation a fact buried mid-history was never
+# retrieved and the model answered "I don't know". Top-K over a similarity index
+# needs enough K to cover a long session, and enough verbatim tail that the
+# immediate thread survives regardless of what retrieval returns.
+SEARCH_LIMIT = int(os.getenv("MEM0_SEARCH_LIMIT", "20"))
+KEEP_LAST_MESSAGES = int(os.getenv("MEM0_KEEP_LAST_MESSAGES", "10"))
+
 # ── Mem0 client (lazy init) ────────────────────────────────────────────────
 _mem0_client = None
 _last_init_error = None
@@ -324,12 +332,23 @@ async def compact_context(
                 last_user_msg = str(m.get("content", ""))[:500]
                 break
         if last_user_msg:
-            relevant = _search(client, last_user_msg, req.user_id, 5)
+            relevant = _search(client, last_user_msg, req.user_id, SEARCH_LIMIT)
             summary = "\n".join(f"- {t}" for t in _memory_texts(relevant))
             if summary:
-                compact_messages = [
-                    {"role": "system", "content": f"Relevant context from memory:\n{summary}"},
-                ] + req.messages[-4:]
+                # Preserve the caller's own system prompt. It carries the
+                # operating instructions for the whole session, and dropping it
+                # changed the assistant's behaviour, not just its context.
+                original_system = [m for m in req.messages if m.get("role") == "system"][:1]
+                # Keep a real tail. Retrieval is top-K over a similarity index,
+                # so it is not guaranteed to surface the immediately preceding
+                # turns — those have to be carried verbatim or the model loses
+                # the thread of what is being discussed right now.
+                tail = req.messages[-KEEP_LAST_MESSAGES:]
+                compact_messages = (
+                    original_system
+                    + [{"role": "system", "content": f"Relevant context from memory:\n{summary}"}]
+                    + [m for m in tail if m.get("role") != "system"]
+                )
                 return {"status": "ok", "compacted": True, "messages": compact_messages, "method": "mem0"}
         return {"status": "ok", "compacted": False, "messages": req.messages}
     except Exception as e:
