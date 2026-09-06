@@ -56,6 +56,17 @@ INFER_ON_ADD = os.getenv("MEM0_INFER_ON_ADD", "false").strip().lower() in ("1", 
 SEARCH_LIMIT = int(os.getenv("MEM0_SEARCH_LIMIT", "20"))
 KEEP_LAST_MESSAGES = int(os.getenv("MEM0_KEEP_LAST_MESSAGES", "10"))
 
+# Downstream executors cap the system prompt they will forward — perplexity-web
+# truncates it at 12,000 chars (MAX_SYSTEM_LEN in perplexity-web/protocol.ts),
+# and others have their own budgets. Retrieval returns whole stored messages,
+# so 20 memories of a few KB each blew straight past that: the memory block was
+# truncated downstream and the very fact that was retrieved got cut off. Bound
+# each memory and the block as a whole so the highest-similarity hits actually
+# survive the trip. Ordered by similarity, so truncation drops the least
+# relevant rather than an arbitrary tail.
+MEMORY_SNIPPET_CHARS = int(os.getenv("MEM0_MEMORY_SNIPPET_CHARS", "300"))
+MEMORY_BLOCK_CHARS = int(os.getenv("MEM0_MEMORY_BLOCK_CHARS", "4000"))
+
 # ── Mem0 client (lazy init) ────────────────────────────────────────────────
 _mem0_client = None
 _last_init_error = None
@@ -333,7 +344,16 @@ async def compact_context(
                 break
         if last_user_msg:
             relevant = _search(client, last_user_msg, req.user_id, SEARCH_LIMIT)
-            summary = "\n".join(f"- {t}" for t in _memory_texts(relevant))
+            lines, used = [], 0
+            for text in _memory_texts(relevant):
+                snippet = text[:MEMORY_SNIPPET_CHARS].strip()
+                if not snippet:
+                    continue
+                if used + len(snippet) > MEMORY_BLOCK_CHARS:
+                    break
+                lines.append(f"- {snippet}")
+                used += len(snippet)
+            summary = "\n".join(lines)
             if summary:
                 # Preserve the caller's own system prompt. It carries the
                 # operating instructions for the whole session, and dropping it
