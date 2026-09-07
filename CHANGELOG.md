@@ -16,7 +16,7 @@
 
 ---
 
-## [3.8.51] — TBD
+## [3.8.53] — TBD
 
 _Living section — cycle opened at the v3.8.50 freeze (parallel-cycle model). Bullets are aggregated from `changelog.d/` fragments at each `/generate-release` phase._
 

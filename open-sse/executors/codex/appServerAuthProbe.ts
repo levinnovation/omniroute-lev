@@ -5,7 +5,7 @@
  * its Codex CLI is signed in. A public user whose CLI is not yet authenticated
  * would otherwise see a green "ready" badge and then fail on the first turn with
  * an upstream auth error. This probe opens the same JSON-RPC/WebSocket the
- * executor uses and calls `account/read` (verified against codex 0.149.0): an
+ * executor uses and calls `account/read` (verified against codex 0.153.4): an
  * authenticated server returns `{ account: { type, email, planType }, ... }`;
  * a logged-out server returns no account (or an error). So the presence of
  * `result.account` is the "authenticated" signal.
@@ -14,10 +14,7 @@
  * lightweight client + transport, and so it is independently unit-testable with a
  * fake websocketFn.
  */
-import {
-  CodexAppServerClient,
-  type CodexAppServerWebsocketFn,
-} from "./appServerClient.ts";
+import { CodexAppServerClient, type CodexAppServerWebsocketFn } from "./appServerClient.ts";
 import type { CodexAppServerConfig } from "./appServerConfig.ts";
 
 export type CodexAppServerAuthStatus =
