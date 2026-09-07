@@ -997,6 +997,163 @@ function openaiResponsesToOpenAIResponseStream(chunk, state) {
     return null;
   }
 
+  // Custom tool call started (gpt-6-astra and other models with apply_patch_tool_type: "freeform"
+  // return custom_tool_call items instead of function_call items for freeform/custom tools).
+  // Without this handler, custom_tool_call items were silently dropped at `return null` (line ~1460),
+  // causing the client to never see the tool call — the model's text output was all that remained.
+  if (eventType === "response.output_item.added" && data.item?.type === "custom_tool_call") {
+    const item = data.item;
+    const callId = item.call_id || fallbackToolCallId();
+    state.currentToolCallId = callId;
+
+    const toolName = normalizeToolName(item.name);
+    let index: number | null = null;
+    if (toolName) {
+      index = state.toolCallIndex ?? 0;
+      state.toolCallIndex = index + 1;
+    }
+
+    if (!(state.toolCallByCallId instanceof Map)) state.toolCallByCallId = new Map();
+    state.toolCallByCallId.set(callId, {
+      index,
+      name: toolName,
+      argsBuffer: "",
+      deferred: !toolName,
+      needsNormalization: false,
+    });
+    if (!(state.toolCallItemToCallId instanceof Map)) state.toolCallItemToCallId = new Map();
+    if (item.id) state.toolCallItemToCallId.set(item.id, callId);
+    if (!(state.toolCallOutputIndexToCallId instanceof Map)) {
+      state.toolCallOutputIndexToCallId = new Map();
+    }
+    if (data.output_index != null) state.toolCallOutputIndexToCallId.set(data.output_index, callId);
+
+    if (!state.toolCallIdsSeen) state.toolCallIdsSeen = new Set();
+    state.toolCallIdsSeen.add(callId);
+
+    if (!toolName) return null;
+
+    return {
+      id: state.chatId,
+      object: "chat.completion.chunk",
+      created: state.created,
+      model: state.model || "gpt-4",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index,
+                id: callId,
+                type: "function",
+                function: {
+                  name: toolName,
+                  arguments: "",
+                },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+  }
+
+  // Custom tool call input delta (analogous to function_call_arguments.delta but for
+  // custom/freeform tools — the raw input streams via custom_tool_call_input.delta).
+  if (eventType === "response.custom_tool_call_input.delta") {
+    const argsDelta = data.delta || "";
+    if (!argsDelta) return null;
+
+    const map = state.toolCallByCallId instanceof Map ? state.toolCallByCallId : null;
+    let callId = data.item_id ? state.toolCallItemToCallId?.get(data.item_id) : undefined;
+    if (!callId && data.output_index != null) {
+      callId = state.toolCallOutputIndexToCallId?.get(data.output_index);
+    }
+    if (!callId && map) {
+      callId = map.size === 1 ? [...map.keys()][0] : state.currentToolCallId;
+    }
+    const entry = callId ? map?.get(callId) : undefined;
+    if (!entry) return null;
+
+    entry.argsBuffer = (entry.argsBuffer || "") + argsDelta;
+    return null;
+  }
+
+  // Custom tool call done — emit the tool call with buffered/raw input as arguments.
+  if (eventType === "response.output_item.done" && data.item?.type === "custom_tool_call") {
+    const item = data.item;
+    const map = state.toolCallByCallId instanceof Map ? state.toolCallByCallId : null;
+    let callId = item.call_id;
+    if (!callId && item.id) callId = state.toolCallItemToCallId?.get(item.id);
+    if (!callId) callId = state.currentToolCallId || fallbackToolCallId();
+    const trackedEntry = callId ? map?.get(callId) : undefined;
+    const entry = trackedEntry || { index: null, argsBuffer: "", deferred: false };
+
+    const buffered = entry.argsBuffer || "";
+    const toolName = normalizeToolName(item.name);
+
+    if (entry.index == null && toolName) {
+      entry.index = state.toolCallIndex ?? 0;
+      state.toolCallIndex = entry.index + 1;
+    }
+    const currentIndex = entry.index;
+
+    // custom_tool_call items carry `input` (string) instead of `arguments`.
+    const rawInput =
+      typeof item.input === "string" && item.input.length > 0
+        ? item.input
+        : typeof item.input === "object" && item.input !== null
+          ? JSON.stringify(item.input)
+          : buffered;
+
+    if (toolName && state.toolCalls instanceof Map) {
+      state.toolCalls.set(currentIndex, {
+        id: callId,
+        index: currentIndex,
+        type: "function",
+        function: { name: toolName, arguments: rawInput },
+      });
+    }
+
+    if (!state.toolCallIdsSeen) state.toolCallIdsSeen = new Set();
+    if (callId) state.toolCallIdsSeen.add(callId);
+
+    if (map && callId) map.delete(callId);
+    if (state.currentToolCallId === callId) state.currentToolCallId = null;
+
+    if (entry.deferred && !toolName) return null;
+
+    const argsStr = rawInput || "";
+
+    return {
+      id: state.chatId,
+      object: "chat.completion.chunk",
+      created: state.created,
+      model: state.model || "gpt-4",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: currentIndex,
+                id: callId,
+                type: "function",
+                function: {
+                  name: toolName,
+                  arguments: argsStr,
+                },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+  }
+
   // Function call started
   if (eventType === "response.output_item.added" && data.item?.type === "function_call") {
     const item = data.item;

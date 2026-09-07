@@ -679,9 +679,14 @@ export async function peekCodexSseTransientError(
       }
       // A real content/completion event this early means the response is
       // healthy — stop peeking so we do not needlessly buffer a long stream.
+      // Include tool-call events: a tool-first turn (e.g. gpt-6-astra calling
+      // skills before producing text) is also healthy and must not be buffered.
       if (
         lower.includes('"type":"response.output_text.delta"') ||
-        lower.includes('"type":"response.completed"')
+        lower.includes('"type":"response.completed"') ||
+        lower.includes('"type":"response.output_item.added"') ||
+        lower.includes('"type":"response.function_call_arguments.delta"') ||
+        lower.includes('"type":"response.custom_tool_call_input.delta"')
       ) {
         break;
       }
