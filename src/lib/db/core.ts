@@ -83,7 +83,16 @@ type CriticalTableSpec = {
 
 // ──────────────── Environment Detection ────────────────
 
-export const isCloud = typeof globalThis.caches === "object" && globalThis.caches !== null;
+// LEV fork: OMNIROUTE_FORCE_SELFHOSTED overrides the globalThis.caches cloud
+// detection. Node.js 26 / Next.js 16 standalone server may expose
+// globalThis.caches (via Undici 8), which would falsely trigger isCloud=true
+// on a self-hosted Railway deployment — disabling SQLite persistence, call
+// log writes, and all disk-based storage. Setting OMNIROUTE_FORCE_SELFHOSTED=true
+// on Railway forces isCloud=false so the full persistence stack works.
+export const isCloud =
+  process.env.OMNIROUTE_FORCE_SELFHOSTED === "true"
+    ? false
+    : typeof globalThis.caches === "object" && globalThis.caches !== null;
 
 // Next.js build workers sometimes drop NEXT_PHASE from their env, so
 // OMNIROUTE_BUILDING=1 (set by build-next-isolated.mjs and inherited by every

@@ -113,6 +113,10 @@ ENV HOSTNAME=0.0.0.0
 ENV OMNIROUTE_MEMORY_MB=2048
 ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_MEMORY_MB}"
 ENV DATA_DIR=/app/data
+# LEV fork: Force self-hosted mode so globalThis.caches (Node 26 / Undici 8)
+# does not falsely trigger isCloud=true, which would disable SQLite persistence
+# and call log writes on Railway.
+ENV OMNIROUTE_FORCE_SELFHOSTED=true
 RUN mkdir -p /app/data
 
 # Copy built standalone app from builder

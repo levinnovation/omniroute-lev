@@ -192,7 +192,12 @@ function buildStoreKey(hash: string, principalId?: string): string {
 const MAX_DURABLE_BLOCK_BYTES = 512 * 1024;
 
 /** Matches the detection call-log artifacts use (`callLogArtifacts.ts`). */
-const isCloudRuntime = typeof globalThis.caches === "object" && globalThis.caches !== null;
+// LEV fork: respect OMNIROUTE_FORCE_SELFHOSTED to override globalThis.caches
+// false positive on Node.js 26 / Next.js 16 standalone (see src/lib/db/core.ts).
+const isCloudRuntime =
+  process.env.OMNIROUTE_FORCE_SELFHOSTED === "true"
+    ? false
+    : typeof globalThis.caches === "object" && globalThis.caches !== null;
 
 function durableTierEnabled(): boolean {
   return !isCloudRuntime && process.env.COMPRESSION_CCR_DURABLE_STORE !== "false";

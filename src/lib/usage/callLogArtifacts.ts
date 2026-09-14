@@ -4,7 +4,12 @@ import type { RequestPipelinePayloads } from "@omniroute/open-sse/utils/requestL
 import { resolveDataDir } from "../dataPaths";
 import { getCallLogPipelineMaxSizeBytes, isChatDebugFileEnabled } from "../logEnv";
 
-const isCloud = typeof globalThis.caches === "object" && globalThis.caches !== null;
+// LEV fork: respect OMNIROUTE_FORCE_SELFHOSTED to override globalThis.caches
+// false positive on Node.js 26 / Next.js 16 standalone (see src/lib/db/core.ts).
+const isCloud =
+  process.env.OMNIROUTE_FORCE_SELFHOSTED === "true"
+    ? false
+    : typeof globalThis.caches === "object" && globalThis.caches !== null;
 const isBuildPhase =
   process.env.NEXT_PHASE === "phase-production-build" || process.env.OMNIROUTE_BUILDING === "1";
 const DATA_DIR = resolveDataDir({ isCloud });
