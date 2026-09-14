@@ -166,7 +166,17 @@ export function resolveRequestLifecycleEvent(input: {
   };
 }
 
+// LEV diagnostic: confirm persistAttemptLogs is reached for actual chat requests
+let lastPersistDiagMs = 0;
+function diagLogPersist(status: number, provider: unknown, model: unknown): void {
+  const now = Date.now();
+  if (now - lastPersistDiagMs < 10_000) return;
+  lastPersistDiagMs = now;
+  console.log(`[persistAttemptLogs DIAG] status=${status} provider=${provider} model=${model}`);
+}
+
 export function persistAttemptLogs(args: PersistAttemptLogsArgs, ctx: PersistAttemptLogsContext) {
+  diagLogPersist(args.status, ctx.provider, ctx.model);
   const {
     status,
     tokens,

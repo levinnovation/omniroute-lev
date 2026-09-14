@@ -549,6 +549,10 @@ export async function handleChatCore({
   reasoningTransportFallback = "drop",
   managedLease = null,
 }) {
+  // LEV diagnostic: confirm handleChatCore entry
+  console.log(
+    `[handleChatCore DIAG] ENTER provider=${modelInfo?.provider} model=${modelInfo?.model} isCombo=${isCombo} comboName=${comboName}`
+  );
   let { provider, model, extendedContext } = modelInfo;
   const resilienceSettings = resolveResilienceSettings(cachedSettings);
   if (!skipResourcePressureGuard) {
