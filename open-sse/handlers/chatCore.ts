@@ -776,6 +776,9 @@ export async function handleChatCore({
     log,
   });
   if (idempotencyHit) {
+    console.log(
+      `[handleChatCore DIAG] EARLY RETURN idempotencyHit provider=${provider} model=${model}`
+    );
     return idempotencyHit;
   }
   // T07: Inject connectionId into credentials so executors can rotate API keys
@@ -817,6 +820,9 @@ export async function handleChatCore({
   // Check for bypass patterns (warmup, skip) - return fake response
   const bypassResponse = handleBypassRequest(body, model, userAgent);
   if (bypassResponse) {
+    console.log(
+      `[handleChatCore DIAG] EARLY RETURN bypassResponse provider=${provider} model=${model}`
+    );
     return bypassResponse;
   }
 
@@ -1273,6 +1279,7 @@ export async function handleChatCore({
       ?.cacheDefaultMode,
   });
   if (cacheHit) {
+    console.log(`[handleChatCore DIAG] EARLY RETURN cacheHit provider=${provider} model=${model}`);
     return cacheHit;
   }
 
@@ -3881,10 +3888,12 @@ export async function handleChatCore({
       const dedupResult = await deduplicate(dedupHash, execute);
       if (dedupResult.wasDeduplicated) {
         log?.debug?.("DEDUP", `Joined in-flight request hash=${dedupHash}`);
+        console.log(`[handleChatCore DIAG] EARLY RETURN dedup provider=${provider} model=${model}`);
       }
       return materializeDeduplicatedExecutionResult(dedupResult.result);
     }
 
+    console.log(`[handleChatCore DIAG] reaching execute() provider=${provider} model=${model}`);
     return execute();
   };
 
