@@ -1216,7 +1216,52 @@ export async function handleChatCore({
       log,
       providerApiKey: credentials?.apiKey || null,
     });
-    if (litellmResult) return litellmResult;
+    if (litellmResult) {
+      // LEV fix: persist call log for LiteLLM-delegated requests. The delegate
+      // bypasses the normal executor path, so without this the dashboard never
+      // sees API-key provider traffic routed through LiteLLM. We call saveCallLog
+      // directly (not persistAttemptLogs) because reqLogger and other later-bound
+      // closures aren't initialized yet at this point in the handler.
+      console.log(
+        `[handleChatCore DIAG] EARLY RETURN litellmDelegate provider=${provider} model=${model}`
+      );
+      try {
+        const { saveCallLog } = await import("@/lib/usageDb");
+        saveCallLog({
+          method: "POST",
+          path: clientRawRequest?.endpoint || "/v1/chat/completions",
+          status: litellmResult.response.status,
+          model,
+          requestedModel: requestedModel || model,
+          provider,
+          connectionId: connectionId || credentials?.connectionId || undefined,
+          duration: Date.now() - startTime,
+          tokens: {},
+          requestBody: null,
+          responseBody: null,
+          error: litellmResult.response.ok
+            ? null
+            : `LiteLLM delegate HTTP ${litellmResult.response.status}`,
+          sourceFormat,
+          targetFormat,
+          comboName,
+          comboStepId,
+          comboExecutionKey,
+          tokensCompressed: null,
+          cacheSource: "upstream",
+          apiKeyId: apiKeyInfo?.id || null,
+          apiKeyName: apiKeyInfo?.name || null,
+          noLog: noLogEnabled,
+          pipelinePayloads: null,
+          correlationId,
+          modelPinned: modelPinned || false,
+          sessionTag: conversationId || explicitSessionIdHeader || null,
+        }).catch(() => {});
+      } catch (logErr) {
+        console.error("[callLogs] LiteLLM delegate log failed:", (logErr as Error).message);
+      }
+      return litellmResult;
+    }
   }
 
   // `settings` is already consolidated once near the top of handleChatCore
