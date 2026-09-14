@@ -558,7 +558,12 @@ export async function handleChatCore({
   if (!skipResourcePressureGuard) {
     try {
       const pressureGuard = checkResourcePressureGuard();
-      if (pressureGuard) return pressureGuard;
+      if (pressureGuard) {
+        console.log(
+          `[handleChatCore DIAG] EARLY RETURN pressureGuard provider=${provider} model=${model}`
+        );
+        return pressureGuard;
+      }
     } catch {
       /* fail open */
     }
@@ -692,6 +697,9 @@ export async function handleChatCore({
     log,
   });
   if (pluginGate.blocked === true) {
+    console.log(
+      `[handleChatCore DIAG] EARLY RETURN pluginGate.blocked provider=${provider} model=${model}`
+    );
     return {
       success: false,
       status: 403,
@@ -763,6 +771,7 @@ export async function handleChatCore({
   // ── Phase 9.2: Idempotency check ──
   // Resolve the idempotency key once here and reuse it at the Phase 9.2 save site below,
   // rather than re-deriving it. (#3821-review LEDGER-6)
+  console.log(`[handleChatCore DIAG] pre-idempotency provider=${provider} model=${model}`);
   const { hit: idempotencyHit, idempotencyKey } = await checkIdempotencyCache({
     clientRawRequest,
     provider,
