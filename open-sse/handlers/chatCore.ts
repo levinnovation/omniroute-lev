@@ -549,21 +549,12 @@ export async function handleChatCore({
   reasoningTransportFallback = "drop",
   managedLease = null,
 }) {
-  // LEV diagnostic: confirm handleChatCore entry
-  console.log(
-    `[handleChatCore DIAG] ENTER provider=${modelInfo?.provider} model=${modelInfo?.model} isCombo=${isCombo} comboName=${comboName}`
-  );
   let { provider, model, extendedContext } = modelInfo;
   const resilienceSettings = resolveResilienceSettings(cachedSettings);
   if (!skipResourcePressureGuard) {
     try {
       const pressureGuard = checkResourcePressureGuard();
-      if (pressureGuard) {
-        console.log(
-          `[handleChatCore DIAG] EARLY RETURN pressureGuard provider=${provider} model=${model}`
-        );
-        return pressureGuard;
-      }
+      if (pressureGuard) return pressureGuard;
     } catch {
       /* fail open */
     }
@@ -697,9 +688,6 @@ export async function handleChatCore({
     log,
   });
   if (pluginGate.blocked === true) {
-    console.log(
-      `[handleChatCore DIAG] EARLY RETURN pluginGate.blocked provider=${provider} model=${model}`
-    );
     return {
       success: false,
       status: 403,
@@ -771,7 +759,6 @@ export async function handleChatCore({
   // ── Phase 9.2: Idempotency check ──
   // Resolve the idempotency key once here and reuse it at the Phase 9.2 save site below,
   // rather than re-deriving it. (#3821-review LEDGER-6)
-  console.log(`[handleChatCore DIAG] pre-idempotency provider=${provider} model=${model}`);
   const { hit: idempotencyHit, idempotencyKey } = await checkIdempotencyCache({
     clientRawRequest,
     provider,
@@ -785,9 +772,6 @@ export async function handleChatCore({
     log,
   });
   if (idempotencyHit) {
-    console.log(
-      `[handleChatCore DIAG] EARLY RETURN idempotencyHit provider=${provider} model=${model}`
-    );
     return idempotencyHit;
   }
   // T07: Inject connectionId into credentials so executors can rotate API keys
@@ -829,9 +813,6 @@ export async function handleChatCore({
   // Check for bypass patterns (warmup, skip) - return fake response
   const bypassResponse = handleBypassRequest(body, model, userAgent);
   if (bypassResponse) {
-    console.log(
-      `[handleChatCore DIAG] EARLY RETURN bypassResponse provider=${provider} model=${model}`
-    );
     return bypassResponse;
   }
 
@@ -1222,9 +1203,6 @@ export async function handleChatCore({
       // sees API-key provider traffic routed through LiteLLM. We call saveCallLog
       // directly (not persistAttemptLogs) because reqLogger and other later-bound
       // closures aren't initialized yet at this point in the handler.
-      console.log(
-        `[handleChatCore DIAG] EARLY RETURN litellmDelegate provider=${provider} model=${model}`
-      );
       try {
         const { saveCallLog } = await import("@/lib/usageDb");
         saveCallLog({
@@ -1333,7 +1311,6 @@ export async function handleChatCore({
       ?.cacheDefaultMode,
   });
   if (cacheHit) {
-    console.log(`[handleChatCore DIAG] EARLY RETURN cacheHit provider=${provider} model=${model}`);
     return cacheHit;
   }
 
@@ -3942,12 +3919,10 @@ export async function handleChatCore({
       const dedupResult = await deduplicate(dedupHash, execute);
       if (dedupResult.wasDeduplicated) {
         log?.debug?.("DEDUP", `Joined in-flight request hash=${dedupHash}`);
-        console.log(`[handleChatCore DIAG] EARLY RETURN dedup provider=${provider} model=${model}`);
       }
       return materializeDeduplicatedExecutionResult(dedupResult.result);
     }
 
-    console.log(`[handleChatCore DIAG] reaching execute() provider=${provider} model=${model}`);
     return execute();
   };
 

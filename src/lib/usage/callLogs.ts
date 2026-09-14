@@ -439,11 +439,6 @@ function getLegacyInlineDetail(id: string) {
 async function saveCallLogOperation(entry: any): Promise<void> {
   try {
     const apiKeyContext = getCallLogApiKeyContext();
-    // LEV diagnostic: verify the INSERT path is reached
-    console.log(
-      `[callLogs DIAG] saveCallLogOperation ENTER | provider=${entry?.provider} model=${entry?.model} | ` +
-        `shouldPersistToDisk=${shouldPersistToDisk}`
-    );
     // `||` (not `??`): an empty-string apiKeyId/apiKeyName is "unattributed",
     // same as before this fallback existed — it must not be persisted verbatim
     // nor block the request-scoped context.
@@ -586,31 +581,12 @@ async function saveCallLogOperation(entry: any): Promise<void> {
     });
 
     scheduleCallLogRotation();
-    // LEV diagnostic: confirm INSERT succeeded
-    console.log(
-      `[callLogs DIAG] INSERT OK | id=${logEntry.id} provider=${logEntry.provider} model=${logEntry.model} status=${logEntry.status}`
-    );
   } catch (error) {
     console.error("[callLogs] Failed to save call log:", (error as Error).message);
   }
 }
 
-// LEV diagnostic: log saveCallLog calls to verify persistence is working.
-// Throttled to 1/10s to avoid log spam.
-let lastSaveCallLogDiagMs = 0;
-function diagLogSaveCallLog(entry: any): void {
-  const now = Date.now();
-  if (now - lastSaveCallLogDiagMs < 10_000) return;
-  lastSaveCallLogDiagMs = now;
-  console.log(
-    `[callLogs DIAG] saveCallLog called | shouldPersistToDisk=${shouldPersistToDisk} | ` +
-      `provider=${entry?.provider} model=${entry?.model} status=${entry?.status} | ` +
-      `closing=${callLogSavesClosing}`
-  );
-}
-
 export function saveCallLog(entry: any): Promise<void> {
-  diagLogSaveCallLog(entry);
   if (!shouldPersistToDisk || callLogSavesClosing) return Promise.resolve();
 
   const operation = saveCallLogOperation(entry);
@@ -658,27 +634,6 @@ export async function closeCallLogSaves(timeoutMs = 2_000): Promise<void> {
 
 if (shouldPersistToDisk && process.env.NODE_ENV !== "test") {
   scheduleCallLogRotation();
-}
-
-// LEV diagnostic: startup log to verify persistence flags at module load time
-if (process.env.NODE_ENV !== "test") {
-  console.log(
-    `[callLogs DIAG] module loaded | shouldPersistToDisk=${shouldPersistToDisk} | ` +
-      `OMNIROUTE_FORCE_SELFHOSTED=${process.env.OMNIROUTE_FORCE_SELFHOSTED ?? "(unset)"} | ` +
-      `NODE_ENV=${process.env.NODE_ENV}`
-  );
-  try {
-    const db = getDbInstance();
-    const tableExists = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='call_logs'")
-      .get() as { name?: string } | undefined;
-    const count = tableExists
-      ? (db.prepare("SELECT COUNT(*) as c FROM call_logs").get() as { c: number }).c
-      : -1;
-    console.log(`[callLogs DIAG] call_logs table exists=${!!tableExists} row_count=${count}`);
-  } catch (e) {
-    console.log(`[callLogs DIAG] table check failed: ${(e as Error).message}`);
-  }
 }
 
 /**
