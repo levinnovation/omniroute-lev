@@ -178,10 +178,16 @@ export async function tryCrewAIDelegate(
 
     args.log?.debug?.(
       "CREWAI",
-      `delegating agentic request to CrewAI sidecar (model=${agenticModel}, requestId=${requestId}, depth=${currentDepth})`
+      `delegating agentic request to CrewAI sidecar (model=${agenticModel}, requestId=${requestId}, depth=${currentDepth}, stream=${args.stream})`
     );
 
-    const response = await fetch(`${config.url.replace(/\/$/, "")}/api/v1/run`, {
+    // v0.2: When streaming is requested, use the streaming endpoint.
+    // The sidecar emits SidecarStreamEvent SSE events which we relay to the client.
+    const endpoint = args.stream
+      ? `${config.url.replace(/\/$/, "")}/api/v1/run/stream`
+      : `${config.url.replace(/\/$/, "")}/api/v1/run`;
+
+    const response = await fetch(endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify(crewaiBody),
@@ -213,8 +219,15 @@ export async function tryCrewAIDelegate(
       return null; // Caller explicitly allowed direct fallback
     }
 
-    // The CrewAI sidecar returns {result: "...", error: null}.
-    // Wrap it as an OpenAI-compatible chat completion response.
+    // v0.2: Streaming response — relay SSE events from the sidecar
+    if (args.stream && response.body) {
+      return {
+        success: true,
+        response: relaySidecarStream(response, requestId, args.model, args.log),
+      };
+    }
+
+    // Non-streaming response — parse JSON and wrap as OpenAI-compatible
     const crewaiResult = await response.json();
     const codingResult = crewaiResult.result || "";
     const error = crewaiResult.error;
@@ -365,6 +378,197 @@ function buildAgenticUnavailableResponse(
     status: 503,
     headers: {
       "Content-Type": "application/json",
+      [REQUEST_ID_HEADER]: requestId,
+    },
+  });
+}
+
+/**
+ * Relay SSE events from the CrewAI sidecar to the client.
+ * Maps SidecarStreamEvent events to OpenAI-compatible chat.completion.chunk events.
+ *
+ * The sidecar emits:
+ * - flow.started, agent.started — lifecycle events (mapped to role chunk)
+ * - tool.started, tool.completed — tool events (logged, not mapped to client)
+ * - content.delta — incremental text (mapped to delta chunk)
+ * - completed — final result (mapped to finish chunk)
+ * - error — failure (mapped to error chunk)
+ */
+function relaySidecarStream(
+  sidecarResponse: Response,
+  requestId: string,
+  model: string,
+  log?: { debug?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void } | null
+): Response {
+  const reader = sidecarResponse.body!.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      let buffer = "";
+      let sentRole = false;
+
+      const sendChunk = (data: Record<string, unknown>) => {
+        const line = `data: ${JSON.stringify(data)}\n\n`;
+        controller.enqueue(encoder.encode(line));
+      };
+
+      const sendDone = () => {
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      };
+
+      const sendError = (message: string) => {
+        sendChunk({
+          id: `chatcmpl-crewai-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [
+            {
+              index: 0,
+              delta: { content: `\n\nError: ${message}` },
+              finish_reason: "error",
+            },
+          ],
+        });
+        sendDone();
+      };
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const data = line.slice(6).trim();
+            if (data === "[DONE]") {
+              sendDone();
+              return;
+            }
+
+            let event: Record<string, unknown>;
+            try {
+              event = JSON.parse(data);
+            } catch {
+              continue;
+            }
+
+            const eventType = event.type as string;
+
+            // Send initial role chunk on first event
+            if (!sentRole) {
+              sendChunk({
+                id: `chatcmpl-crewai-${requestId}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { role: "assistant" },
+                    finish_reason: null,
+                  },
+                ],
+              });
+              sentRole = true;
+            }
+
+            switch (eventType) {
+              case "content.delta":
+                sendChunk({
+                  id: `chatcmpl-crewai-${requestId}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: event.delta as string },
+                      finish_reason: null,
+                    },
+                  ],
+                });
+                break;
+
+              case "tool.started":
+                log?.debug?.("CREWAI", `tool.started: ${event.tool}`);
+                // Optionally emit a progress chunk to the client
+                sendChunk({
+                  id: `chatcmpl-crewai-${requestId}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: `\n\n[tool: ${event.tool}]` },
+                      finish_reason: null,
+                    },
+                  ],
+                });
+                break;
+
+              case "tool.completed":
+                log?.debug?.("CREWAI", `tool.completed: ${event.tool}`);
+                break;
+
+              case "completed":
+                sendChunk({
+                  id: `chatcmpl-crewai-${requestId}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {},
+                      finish_reason: (event.finishReason as string) ?? "stop",
+                    },
+                  ],
+                });
+                sendDone();
+                return;
+
+              case "error":
+                sendError((event.message as string) ?? "Unknown error");
+                return;
+
+              case "flow.started":
+              case "agent.started":
+                // Lifecycle events — log but don't emit to client
+                log?.debug?.("CREWAI", `${eventType}: ${event.message ?? ""}`);
+                break;
+
+              default:
+                // Unknown event type — log and continue
+                log?.debug?.("CREWAI", `unknown event: ${eventType}`);
+                break;
+            }
+          }
+        }
+
+        // Stream ended without [DONE] or completed — send done anyway
+        sendDone();
+      } catch (err) {
+        sendError(err instanceof Error ? err.message : String(err));
+      }
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
       [REQUEST_ID_HEADER]: requestId,
     },
   });
