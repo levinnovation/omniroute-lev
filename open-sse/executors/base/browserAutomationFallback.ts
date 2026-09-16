@@ -27,6 +27,8 @@ import {
   shouldFallbackToFFI,
   type FrontendFetchConfig,
 } from "./frontendFetchInterception.ts";
+import { resolveSelector } from "./adaptiveSelectors.ts";
+import { fetchViaScrapling, isWafBlocked } from "../../services/sidecars.ts";
 
 type Page = import("playwright").Page;
 
@@ -54,6 +56,8 @@ export interface BrowserAutomationConfig {
   signal?: AbortSignal | null;
   reuseContext?: boolean;
   frontendFetchConfig?: FrontendFetchConfig;
+  /** Enable adaptive selector relocation when CSS selectors fail (default: true). */
+  adaptiveSelectors?: boolean;
 }
 
 export interface BrowserAutomationResult {
@@ -89,12 +93,25 @@ function waitWithSignal(ms: number, signal?: AbortSignal | null): Promise<void> 
 
 async function fillPrompt(
   page: Page,
+  providerName: string,
   selector: string,
   prompt: string,
   mode: "evaluate" | "fill" | "type",
-  signal?: AbortSignal | null
+  signal?: AbortSignal | null,
+  adaptiveSelectors?: boolean
 ): Promise<void> {
-  const locator = page.locator(selector).first();
+  // LEV fork: try original selector, fall back to adaptive relocation if enabled.
+  const resolved = await resolveSelector(page, providerName, "input", selector, {
+    adaptive: adaptiveSelectors,
+  });
+  const effectiveSelector = resolved?.selector ?? selector;
+  if (resolved?.adaptive) {
+    console.log(
+      `[${providerName.toUpperCase()}] Adaptive selector relocated input: ${selector} → ${effectiveSelector}`
+    );
+  }
+
+  const locator = page.locator(effectiveSelector).first();
   await locator.waitFor({ state: "visible", timeout: 10_000 });
 
   // Focus the target before typing. `page.keyboard.type()` types into whatever
@@ -176,6 +193,7 @@ export async function runBrowserAutomation(
     signal,
     reuseContext = true,
     frontendFetchConfig,
+    adaptiveSelectors = true,
   } = config;
 
   const contextKey = reuseContext
@@ -225,7 +243,15 @@ export async function runBrowserAutomation(
       await waitWithSignal(500, signal);
     }
 
-    await fillPrompt(page, inputSelector, prompt, fillMode, signal);
+    await fillPrompt(
+      page,
+      providerName,
+      inputSelector,
+      prompt,
+      fillMode,
+      signal,
+      adaptiveSelectors
+    );
     await waitWithSignal(800, signal);
 
     const responsePromise = page.waitForResponse(
@@ -243,6 +269,9 @@ export async function runBrowserAutomation(
       // the real "Send message" button, so the submit click hit the sidebar.
       // Try each alternative in written order instead and use the first that
       // actually matches.
+      //
+      // LEV fork: if none of the original selectors match, try adaptive
+      // relocation using a stored fingerprint of the last known submit button.
       const candidates = submitSelector
         .split(",")
         .map((part) => part.trim())
@@ -258,10 +287,39 @@ export async function runBrowserAutomation(
             await btn.click({ timeout: 2000 });
           }
           clicked = true;
+          // Capture fingerprint of the working submit button
+          if (adaptiveSelectors) {
+            const { captureFingerprint, storeFingerprint } = await import("./adaptiveSelectors.ts");
+            const fp = await captureFingerprint(page, candidate);
+            if (fp) storeFingerprint(providerName, "submit", fp);
+          }
           break;
         } catch {
           // Matched but not clickable (covered, disabled, detached) — fall
           // through to the next, less specific candidate.
+        }
+      }
+      if (!clicked && adaptiveSelectors) {
+        // Adaptive relocation: find a submit button similar to the last known one
+        const { resolveSelector } = await import("./adaptiveSelectors.ts");
+        const resolved = await resolveSelector(page, providerName, "submit", candidates[0], {
+          adaptive: true,
+        });
+        if (resolved?.adaptive) {
+          console.log(
+            `[${providerName.toUpperCase()}] Adaptive selector relocated submit: ${candidates[0]} → ${resolved.selector}`
+          );
+          const btn = page.locator(resolved.selector).first();
+          try {
+            if (submitButtonMode === "dom") {
+              await btn.evaluate((element) => (element as HTMLElement).click());
+            } else {
+              await btn.click({ timeout: 2000 });
+            }
+            clicked = true;
+          } catch {
+            // adaptive match also not clickable
+          }
         }
       }
       if (!clicked) await page.keyboard.press("Enter");
@@ -329,4 +387,62 @@ export async function runBrowserAutomation(
  */
 export function isBrowserAutomationEnabled(): boolean {
   return !isPoolDisabled();
+}
+
+// ── LEV fork Phase 3: Scrapling fallback for WAF-blocked HTTP ──────────────
+
+export interface ScraplingFallbackRequest {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+  impersonate?: string;
+  timeoutMs?: number;
+  log?: ExecutorLog | null;
+  providerName: string;
+}
+
+/**
+ * LEV fork Phase 3: Retry an HTTP request through the Scrapling sidecar when
+ * the direct-HTTP path was WAF-blocked (Cloudflare 403, DataDome challenge).
+ *
+ * This is a fallback-of-last-resort: the browser path is tried first, then
+ * direct HTTP, then FFI, and finally Scrapling for WAF-blocked responses.
+ * Returns null when Scrapling is not configured or the retry fails, so the
+ * caller can return the original WAF-blocked response or a 502.
+ */
+export async function retryViaScrapling(
+  request: ScraplingFallbackRequest
+): Promise<BrowserAutomationResult | null> {
+  const result = await fetchViaScrapling({
+    url: request.url,
+    method: request.method,
+    headers: request.headers,
+    body: request.body,
+    impersonate: request.impersonate,
+    timeoutMs: request.timeoutMs,
+  });
+  if (!result) return null;
+  request.log?.info?.(
+    request.providerName.toUpperCase(),
+    `Scrapling fallback: HTTP ${result.status} (${result.elapsedMs}ms)`
+  );
+  return {
+    status: result.status,
+    headers: result.headers,
+    body: result.body,
+    contentType: result.contentType,
+  };
+}
+
+/**
+ * LEV fork Phase 3: Check whether a direct-HTTP response was WAF-blocked and
+ * should be retried through the Scrapling sidecar.
+ */
+export function shouldRetryViaScrapling(
+  status: number,
+  headers: Record<string, string>,
+  body: string
+): boolean {
+  return isWafBlocked(status, headers, body);
 }

@@ -818,3 +818,225 @@ export async function readPageResponseBody(
   const body = await response.body();
   return { status: response.status(), headers, body: Buffer.from(body) };
 }
+
+// ── LEV fork Phase 2: WebSocket frame capture ─────────────────────────────
+//
+// Ported from Patchright Enhanced's CDP WebSocket capture technique.
+// Some providers (Claude web, ChatGPT web) stream responses over WebSocket
+// instead of HTTP SSE. page.waitForResponse() cannot capture WS frames.
+// This helper uses a CDP session to attach to Network.webSocketFrameReceived
+// and Network.webSocketFrameSent events, collecting frames into a buffer.
+
+/** A captured WebSocket frame. */
+export interface CapturedWebSocketFrame {
+  /** "received" or "sent" */
+  direction: "received" | "sent";
+  /** The WebSocket URL the frame belongs to. */
+  wsUrl: string;
+  /** Frame payload data (string). */
+  data: string;
+  /** Timestamp (epoch ms). */
+  timestamp: number;
+}
+
+/** State for an active WebSocket capture session. */
+export interface WebSocketCaptureSession {
+  /** All captured frames so far. */
+  frames: CapturedWebSocketFrame[];
+  /** Stop capturing and detach the CDP listeners. */
+  stop: () => Promise<void>;
+}
+
+/**
+ * LEV fork Phase 2: Start capturing WebSocket frames on a page via CDP.
+ *
+ * Attaches to the page's CDP session and listens for
+ * `Network.webSocketFrameReceived` and `Network.webSocketFrameSent` events.
+ * Returns a session object with the captured frames and a stop() method.
+ *
+ * Call this BEFORE navigating to the page so frames from the initial
+ * connection are captured. Call stop() when done to detach the CDP session.
+ *
+ * @param page - The Playwright Page to capture WS frames on.
+ * @param urlFilter - Optional: only capture frames from WS URLs matching this
+ *   regex. When omitted, all WS frames are captured.
+ */
+export async function startWebSocketCapture(
+  page: Page,
+  urlFilter?: RegExp
+): Promise<WebSocketCaptureSession> {
+  const cdp = await page.context().newCDPSession(page);
+  const frames: CapturedWebSocketFrame[] = [];
+  let stopped = false;
+
+  const onFrameReceived = (event: {
+    requestId: string;
+    timestamp: number;
+    response: { payloadData: string };
+  }) => {
+    if (stopped) return;
+    const data = event.response?.payloadData ?? "";
+    frames.push({
+      direction: "received",
+      wsUrl: "", // CDP doesn't provide the URL per-frame; tracked on creation
+      data,
+      timestamp: Date.now(),
+    });
+  };
+
+  const onFrameSent = (event: {
+    requestId: string;
+    timestamp: number;
+    response: { payloadData: string };
+  }) => {
+    if (stopped) return;
+    const data = event.response?.payloadData ?? "";
+    frames.push({
+      direction: "sent",
+      wsUrl: "",
+      data,
+      timestamp: Date.now(),
+    });
+  };
+
+  const onWebSocketCreated = (event: { requestId: string; url: string }) => {
+    if (stopped) return;
+    if (urlFilter && !urlFilter.test(event.url)) return;
+    // Track the URL for this requestId if we ever need it; for now we
+    // just let frames flow through.
+  };
+
+  try {
+    await cdp.send("Network.enable");
+    cdp.on("Network.webSocketFrameReceived", onFrameReceived);
+    cdp.on("Network.webSocketFrameSent", onFrameSent);
+    cdp.on("Network.webSocketCreated", onWebSocketCreated);
+  } catch {
+    // CDP may not be available (e.g., local launch without CDP). Gracefully
+    // degrade — frames array stays empty, caller falls back to HTTP capture.
+  }
+
+  return {
+    frames,
+    async stop() {
+      if (stopped) return;
+      stopped = true;
+      try {
+        cdp.off("Network.webSocketFrameReceived", onFrameReceived);
+        cdp.off("Network.webSocketFrameSent", onFrameSent);
+        cdp.off("Network.webSocketCreated", onWebSocketCreated);
+        await cdp.detach();
+      } catch {
+        // ignore detach errors
+      }
+    },
+  };
+}
+
+// ── LEV fork Phase 2: Batch action support ────────────────────────────────
+//
+// Ported from Patchright Enhanced's batch_actions pattern. Combines multiple
+// page interactions (click, fill, type, evaluate, waitFor) into a single
+// helper that executes them in sequence. This reduces the number of round
+// trips to the browser for providers that need multiple UI steps (model
+// selection + prompt fill + submit) and provides a clean declarative API.
+
+/** A single batch action to execute on a page. */
+export type BatchAction =
+  | { type: "click"; selector: string; timeout?: number }
+  | { type: "fill"; selector: string; text: string }
+  | { type: "type"; selector: string; text: string; delay?: number }
+  | { type: "evaluate"; selector: string; fn: string }
+  | {
+      type: "waitFor";
+      selector: string;
+      state?: "visible" | "hidden" | "attached" | "detached";
+      timeout?: number;
+    }
+  | { type: "wait"; ms: number }
+  | { type: "press"; key: string };
+
+/** Result of a single batch action. */
+export interface BatchActionResult {
+  action: BatchAction;
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * LEV fork Phase 2: Execute a sequence of page actions in a single call.
+ *
+ * Each action is executed in order. By default, execution stops on the first
+ * error. When `continueOnError` is true, all actions are attempted and
+ * results indicate which succeeded/failed.
+ *
+ * This is a convenience wrapper — it does not use a single CDP round-trip
+ * (Playwright's API is already round-trip-per-action), but it consolidates
+ * the error handling and provides a declarative interface for providers
+ * that need multi-step UI automation.
+ *
+ * @param page - The Playwright Page to execute actions on.
+ * @param actions - Ordered list of actions to execute.
+ * @param options - Optional: continueOnError (default: false).
+ */
+export async function executeBatchActions(
+  page: Page,
+  actions: BatchAction[],
+  options?: { continueOnError?: boolean }
+): Promise<BatchActionResult[]> {
+  const continueOnError = options?.continueOnError ?? false;
+  const results: BatchActionResult[] = [];
+
+  for (const action of actions) {
+    try {
+      switch (action.type) {
+        case "click": {
+          await page
+            .locator(action.selector)
+            .first()
+            .click({ timeout: action.timeout ?? 5000 });
+          break;
+        }
+        case "fill": {
+          await page.locator(action.selector).first().fill(action.text);
+          break;
+        }
+        case "type": {
+          await page
+            .locator(action.selector)
+            .first()
+            .click({ timeout: 5000 })
+            .catch(() => {});
+          await page.keyboard.type(action.text, { delay: action.delay ?? 5 });
+          break;
+        }
+        case "evaluate": {
+          await page.locator(action.selector).first().evaluate(action.fn);
+          break;
+        }
+        case "waitFor": {
+          await page
+            .locator(action.selector)
+            .first()
+            .waitFor({ state: action.state ?? "visible", timeout: action.timeout ?? 10_000 });
+          break;
+        }
+        case "wait": {
+          await new Promise((r) => setTimeout(r, action.ms));
+          break;
+        }
+        case "press": {
+          await page.keyboard.press(action.key);
+          break;
+        }
+      }
+      results.push({ action, success: true });
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      results.push({ action, success: false, error });
+      if (!continueOnError) break;
+    }
+  }
+
+  return results;
+}

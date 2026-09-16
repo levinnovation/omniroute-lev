@@ -1,10 +1,12 @@
 // LEV fork: Sidecar service integration for OmniRoute.
 //
-// Connects to four Railway sidecar services:
+// Connects to six Railway sidecar services:
 //   1. Browserless — external browser pool for web-cookie providers
 //   2. LiteLLM — API-key provider router
 //   3. Mem0 — context/memory compaction service
 //   4. Cloudflare-Solver — Python sidecar for cf_clearance acquisition
+//   5. Scrapling-Fetcher — Python sidecar for browser TLS fingerprint impersonation
+//   6. CrewAI-Coder — Python sidecar for agentic coding (CrewAI flow)
 //
 // Each sidecar has a health check and graceful fallback if unavailable.
 
@@ -69,6 +71,31 @@ export function getCfSolverConfig(): SidecarConfig | null {
   };
 }
 
+// LEV fork Phase 3: Scrapling fetcher sidecar — browser TLS fingerprint
+// impersonation for direct-HTTP fallback when WAFs block plain fetch.
+export function getScraplingConfig(): SidecarConfig | null {
+  const url = process.env.OMNIROUTE_SCRAPLING_URL;
+  if (!url) return null;
+  return {
+    url,
+    apiKey: process.env.OMNIROUTE_SCRAPLING_KEY || undefined,
+    timeoutMs: 30000, // 30s — HTTP proxy with fingerprint impersonation
+  };
+}
+
+// LEV fork Phase 4: CrewAI coding sidecar — agentic coding service.
+// Receives "agentic/" prefixed model requests, runs a CrewAI flow that
+// uses OmniRoute as its LLM backend, and returns the coding result.
+export function getCrewAIConfig(): SidecarConfig | null {
+  const url = process.env.OMNIROUTE_CREWAI_URL;
+  if (!url) return null;
+  return {
+    url,
+    apiKey: process.env.OMNIROUTE_CREWAI_KEY || undefined,
+    timeoutMs: 120000, // 120s — coding tasks can be long-running
+  };
+}
+
 // ── Health checks ──────────────────────────────────────────────────────────
 
 // Each sidecar has a different health endpoint.
@@ -77,6 +104,8 @@ const SIDECAR_HEALTH_PATHS: Record<string, string> = {
   litellm: "/health/liveness",
   mem0: "/health",
   cfsolver: "/health",
+  scrapling: "/health",
+  crewai: "/health",
 };
 
 async function checkSidecarHealth(name: string, config: SidecarConfig): Promise<SidecarHealth> {
@@ -125,6 +154,10 @@ export async function checkAllSidecars(): Promise<SidecarHealth[]> {
   if (mem0) checks.push(checkSidecarHealth("mem0", mem0));
   const cfsolver = getCfSolverConfig();
   if (cfsolver) checks.push(checkSidecarHealth("cfsolver", cfsolver));
+  const scrapling = getScraplingConfig();
+  if (scrapling) checks.push(checkSidecarHealth("scrapling", scrapling));
+  const crewai = getCrewAIConfig();
+  if (crewai) checks.push(checkSidecarHealth("crewai", crewai));
   return Promise.all(checks);
 }
 
@@ -221,4 +254,113 @@ export function getBrowserlessWsUrl(): string | null {
   // Browserless v2: ghcr.io/browserless/chrome exposes the CDP WebSocket at
   // /chrome (not /chromium). connectOverCDP uses this endpoint.
   return `${wsUrl}/chrome${tokenParam}`;
+}
+
+// ── Scrapling fetcher integration ──────────────────────────────────────────
+
+export interface ScraplingFetchRequest {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+  impersonate?: string;
+  timeoutMs?: number;
+}
+
+export interface ScraplingFetchResult {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+  contentType: string;
+  elapsedMs: number;
+}
+
+/**
+ * LEV fork Phase 3: Proxy an HTTP request through the Scrapling sidecar
+ * with browser TLS fingerprint impersonation. Used as a fallback when
+ * direct-HTTP fetch is WAF-blocked (Cloudflare 403, DataDome challenge).
+ *
+ * Returns null when the sidecar is not configured or the request fails,
+ * so callers can fall back to the existing direct-HTTP path.
+ */
+export async function fetchViaScrapling(
+  request: ScraplingFetchRequest
+): Promise<ScraplingFetchResult | null> {
+  const config = getScraplingConfig();
+  if (!config) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    request.timeoutMs ?? config.timeoutMs ?? 30_000
+  );
+
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (config.apiKey) headers["X-Scrapling-Key"] = config.apiKey;
+
+    const response = await fetch(`${config.url}/fetch`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        url: request.url,
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+        impersonate: request.impersonate ?? "chrome131",
+        timeout: Math.ceil((request.timeoutMs ?? config.timeoutMs ?? 30_000) / 1000),
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      console.warn(
+        `[Scrapling] Sidecar returned ${response.status}: ${await response.text().catch(() => "")}`
+      );
+      return null;
+    }
+
+    const result = await response.json();
+    return {
+      status: result.status,
+      headers: result.headers,
+      body: result.body,
+      contentType: result.content_type,
+      elapsedMs: result.elapsed_ms,
+    };
+  } catch (err) {
+    clearTimeout(timeout);
+    console.warn(`[Scrapling] Fetch failed: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * LEV fork Phase 3: Detect whether an HTTP error response indicates a WAF
+ * block that the Scrapling sidecar could bypass. Returns true for Cloudflare
+ * and DataDome challenge responses.
+ */
+export function isWafBlocked(
+  status: number,
+  headers: Record<string, string>,
+  body: string
+): boolean {
+  if (status === 403) {
+    // Cloudflare challenge page
+    if (headers["server"]?.toLowerCase().includes("cloudflare")) return true;
+    if (body.includes("cf-challenge") || body.includes("cf-ray")) return true;
+    // DataDome challenge
+    if (headers["x-datadome"]) return true;
+    if (body.includes("datadome") || body.includes("DataDome")) return true;
+    // Generic WAF block
+    if (body.includes("Access denied") && body.includes("security")) return true;
+  }
+  if (status === 429 && headers["server"]?.toLowerCase().includes("cloudflare")) {
+    return true;
+  }
+  return false;
 }

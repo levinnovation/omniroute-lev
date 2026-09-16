@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+# curl_cffi provides browser TLS fingerprint impersonation (JA3/JA4).
+# This is the core of the Scrapling sidecar — it makes Node.js fetch
+# requests look like they come from a real Chrome/Firefox browser at the
+# TLS layer, bypassing WAF fingerprint checks that block plain fetch.
+curl_cffi==0.7.4

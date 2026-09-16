@@ -283,6 +283,7 @@ import { getExecutionConnectionId } from "./chatCore/executionCredentials.ts";
 import { resolveExecutionCredentials as resolveExecutionCredentialsFor } from "./chatCore/executionCredentials.ts";
 import { resolveExecutorWithProxy as resolveExecutorWithProxyFor } from "./chatCore/executorProxy.ts";
 import { tryLiteLLMDelegate } from "./chatCore/litellmDelegate.ts";
+import { tryCrewAIDelegate, isInternalAgentRequest } from "./chatCore/crewaiDelegate.ts";
 import {
   isProviderFailureFallbackable,
   tryProviderFailureComboFallback,
@@ -1184,6 +1185,62 @@ export async function handleChatCore({
           userAgent: streamUserAgent,
           streamDefaultMode: apiKeyInfo?.streamDefaultMode,
         });
+
+  // LEV fork Phase 4: CrewAI agentic coding delegate. For "agentic/" prefixed
+  // models, forward the request to the CrewAI coding sidecar. The sidecar runs
+  // a CrewAI flow that uses OmniRoute as its LLM backend (via the internal API
+  // key), executes coding tools, and returns the result. Recursion prevention:
+  // internal agent requests (detected via OMNIROUTE_INTERNAL_AGENT_KEY) are
+  // never routed to the CrewAI sidecar. Falls back to the existing executor
+  // path if disabled, inapplicable, or on error.
+  if (!isInternalAgentRequest(credentials?.apiKey || null)) {
+    const crewaiResult = await tryCrewAIDelegate({
+      model,
+      body: body && typeof body === "object" ? (body as Record<string, unknown>) : null,
+      stream: !!stream,
+      signal: clientRawRequest?.signal ?? null,
+      log,
+      requestApiKey: credentials?.apiKey || null,
+    });
+    if (crewaiResult) {
+      try {
+        const { saveCallLog } = await import("@/lib/usageDb");
+        saveCallLog({
+          method: "POST",
+          path: clientRawRequest?.endpoint || "/v1/chat/completions",
+          status: crewaiResult.response.status,
+          model,
+          requestedModel: requestedModel || model,
+          provider: "crewai-coder",
+          connectionId: connectionId || undefined,
+          duration: Date.now() - startTime,
+          tokens: {},
+          requestBody: null,
+          responseBody: null,
+          error: crewaiResult.response.ok
+            ? null
+            : `CrewAI delegate HTTP ${crewaiResult.response.status}`,
+          sourceFormat,
+          targetFormat,
+          comboName,
+          comboStepId,
+          comboExecutionKey,
+          tokensCompressed: null,
+          cacheSource: "upstream",
+          apiKeyId: apiKeyInfo?.id || null,
+          apiKeyName: apiKeyInfo?.name || null,
+          noLog: noLogEnabled,
+          pipelinePayloads: null,
+          correlationId,
+          modelPinned: modelPinned || false,
+          sessionTag: conversationId || explicitSessionIdHeader || null,
+        }).catch(() => {});
+      } catch (logErr) {
+        console.error("[callLogs] CrewAI delegate log failed:", (logErr as Error).message);
+      }
+      return crewaiResult;
+    }
+  }
 
   // LEV fork: LiteLLM API-key delegate. For API-key providers (not web-cookie),
   // forward the request to the LiteLLM sidecar as a thin proxy. Falls back to

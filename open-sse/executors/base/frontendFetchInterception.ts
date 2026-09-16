@@ -43,6 +43,51 @@ export interface FrontendFetchConfig {
   beforeFetch?: (page: Page) => Promise<void>;
   log?: ExecutorLog | null;
   signal?: AbortSignal | null;
+  /**
+   * LEV fork Phase 2: Use CDP-level network capture instead of
+   * page.waitForResponse(). Attaches context-level response listeners before
+   * navigation, avoiding the race where waitForResponse misses early
+   * responses (the listener attaches after the response already arrived).
+   * Defaults to false for backward compatibility; enable for providers whose
+   * responses arrive before waitForResponse can attach.
+   */
+  useCdpCapture?: boolean;
+  /**
+   * LEV fork Phase 2: Optional request interception via page.route().
+   * When provided, routes matching the URL pattern are intercepted and the
+   * handler can modify headers, block telemetry, or add auth headers.
+   */
+  routeInterception?: RouteInterceptionConfig;
+  /**
+   * LEV fork Phase 2: Enable network request logging for debugging.
+   * When true, all requests/responses are collected and returned in the
+   * result's networkLog field. Useful for diagnosing missed responses.
+   */
+  logNetwork?: boolean;
+}
+
+/** LEV fork Phase 2: Request interception configuration. */
+export interface RouteInterceptionConfig {
+  /** URL pattern to match for interception. */
+  urlPattern: string | RegExp;
+  /**
+   * Handler for intercepted requests. Call route.continue() to forward,
+   * route.fulfill() to short-circuit, or route.abort() to block.
+   */
+  handler: (
+    route: import("playwright").Route,
+    request: import("playwright").Request
+  ) => Promise<void>;
+}
+
+/** LEV fork Phase 2: A captured network request/response pair. */
+export interface NetworkLogEntry {
+  url: string;
+  method: string;
+  status: number;
+  method_response: string;
+  contentType: string;
+  timestamp: number;
 }
 
 export interface FrontendFetchResult {
@@ -50,6 +95,8 @@ export interface FrontendFetchResult {
   body: string;
   contentType: string;
   headers: Record<string, string>;
+  /** LEV fork Phase 2: network log when logNetwork is enabled. */
+  networkLog?: NetworkLogEntry[];
 }
 
 interface BrowserFetchResult {
@@ -57,6 +104,8 @@ interface BrowserFetchResult {
   body: string;
   contentType: string;
   headers: Record<string, string>;
+  /** LEV fork Phase 2: network log when logNetwork is enabled. */
+  networkLog?: NetworkLogEntry[];
 }
 
 interface FrontendFetchDependencies {
@@ -174,6 +223,120 @@ async function readInterceptedResponse(response: PlaywrightResponse): Promise<Fr
   };
 }
 
+// ── LEV fork Phase 2: CDP-level network capture ────────────────────────────
+//
+// Ported from Patchright Enhanced's CDP network capture technique.
+// page.waitForResponse() attaches a listener that can miss responses that
+// arrive before the listener is registered (race condition on fast providers).
+// Context-level response listeners are attached before navigation, so they
+// capture every response from the moment the context is created.
+
+interface CdpCaptureState {
+  capturedResponse: PlaywrightResponse | null;
+  networkLog: NetworkLogEntry[];
+  cleanup: () => void;
+}
+
+/**
+ * Attach context-level request/response listeners for CDP-style network
+ * capture. The listeners are attached to the BrowserContext (not the Page),
+ * so they fire for every page in the context — including responses that
+ * arrive before page.waitForResponse() could attach.
+ *
+ * Returns a state object with the captured response, network log, and a
+ * cleanup function that removes the listeners.
+ */
+function attachCdpNetworkCapture(
+  page: Page,
+  responseUrlMatch: RegExp | ((url: string) => boolean) | undefined,
+  logNetwork: boolean
+): CdpCaptureState {
+  const context = page.context();
+  const capturedResponse: { value: PlaywrightResponse | null } = { value: null };
+  const networkLog: NetworkLogEntry[] = [];
+
+  const onResponse = (response: PlaywrightResponse) => {
+    const url = response.url();
+    if (logNetwork) {
+      try {
+        networkLog.push({
+          url,
+          method: response.request().method(),
+          status: response.status(),
+          method_response: "response",
+          contentType: response.headers()["content-type"] || "",
+          timestamp: Date.now(),
+        });
+      } catch {
+        // response may be detached; skip
+      }
+    }
+    if (capturedResponse.value) return; // already captured
+    if (responseUrlMatch && matchesResponseUrl(url, responseUrlMatch)) {
+      capturedResponse.value = response;
+    }
+  };
+
+  context.on("response", onResponse);
+
+  return {
+    get capturedResponse() {
+      return capturedResponse.value;
+    },
+    networkLog,
+    cleanup() {
+      context.off("response", onResponse);
+    },
+  } as unknown as CdpCaptureState;
+}
+
+/**
+ * LEV fork Phase 2: Set up request interception via page.route() if configured.
+ * This allows modifying requests (add auth headers, block telemetry) before
+ * they are sent. Ported from Patchright Enhanced's route interception pattern.
+ */
+async function setupRouteInterception(page: Page, config: RouteInterceptionConfig): Promise<void> {
+  await page.route(config.urlPattern, async (route, request) => {
+    try {
+      await config.handler(route, request);
+    } catch {
+      // handler error — fall through to default (continue)
+      await route.continue().catch(() => {});
+    }
+  });
+}
+
+/**
+ * LEV fork Phase 2: Wait for a CDP-captured response with a timeout.
+ * Polls the capture state for the target response, resolving when found
+ * or rejecting on timeout. This avoids the waitForResponse race condition.
+ */
+async function waitForCdpResponse(
+  capture: CdpCaptureState,
+  timeoutMs: number,
+  signal?: AbortSignal | null
+): Promise<PlaywrightResponse> {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise<PlaywrightResponse>((resolve, reject) => {
+    const check = () => {
+      if (signal?.aborted) {
+        reject(new DOMException("Aborted", "AbortError"));
+        return;
+      }
+      if (capture.capturedResponse) {
+        resolve(capture.capturedResponse);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        reject(new Error(`CDP capture timeout after ${timeoutMs}ms`));
+        return;
+      }
+      setTimeout(check, 50);
+    };
+    check();
+  });
+}
+
 /**
  * Perform an authenticated frontend fetch in a fresh browser context.
  *
@@ -199,10 +362,14 @@ export async function interceptFrontendFetch(
     beforeFetch,
     log,
     signal,
+    useCdpCapture = false,
+    routeInterception,
+    logNetwork = false,
   } = config;
   const contextKey = `${poolKey}:ffi:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
   let acquired = false;
   let page: Page | null = null;
+  let cdpCapture: CdpCaptureState | null = null;
 
   try {
     throwIfAborted(signal);
@@ -216,6 +383,20 @@ export async function interceptFrontendFetch(
     });
     acquired = true;
     page = await dependencies.openPage(pooled);
+
+    // LEV fork Phase 2: Set up request interception before navigation so
+    // we can modify headers/block telemetry for requests fired during goto.
+    if (routeInterception) {
+      await setupRouteInterception(page, routeInterception);
+    }
+
+    // LEV fork Phase 2: Attach CDP-level network capture before navigation.
+    // Context-level listeners fire for every response, including ones that
+    // arrive before page.waitForResponse() could attach its listener.
+    if (useCdpCapture || logNetwork) {
+      cdpCapture = attachCdpNetworkCapture(page, responseUrlMatch, logNetwork);
+    }
+
     await page.goto(pageUrl, { waitUntil, timeout: 30_000 });
     throwIfAborted(signal);
 
@@ -229,6 +410,20 @@ export async function interceptFrontendFetch(
         ? await config.fetchOptions(page)
         : config.fetchOptions;
 
+    if (responseUrlMatch && useCdpCapture && cdpCapture) {
+      // LEV fork Phase 2: CDP-level capture path. The context listener was
+      // attached before navigation, so it captures responses that
+      // page.waitForResponse() would miss due to the attach race.
+      const [, intercepted] = await Promise.all([
+        executePageFetch(page, fetchUrl, fetchOptions, responseTimeoutMs),
+        waitForCdpResponse(cdpCapture, responseTimeoutMs, signal),
+      ]);
+      const result = await readInterceptedResponse(intercepted);
+      if (logNetwork) result.networkLog = cdpCapture.networkLog;
+      log?.info?.(providerName.toUpperCase(), `FFI (CDP) completed with HTTP ${result.status}`);
+      return result;
+    }
+
     if (responseUrlMatch) {
       const responsePromise = page.waitForResponse(
         (response) => matchesResponseUrl(response.url(), responseUrlMatch),
@@ -239,11 +434,13 @@ export async function interceptFrontendFetch(
         responsePromise,
       ]);
       const result = await readInterceptedResponse(intercepted);
+      if (logNetwork && cdpCapture) result.networkLog = cdpCapture.networkLog;
       log?.info?.(providerName.toUpperCase(), `FFI completed with HTTP ${result.status}`);
       return result;
     }
 
     const result = await executePageFetch(page, fetchUrl, fetchOptions, responseTimeoutMs);
+    if (logNetwork && cdpCapture) result.networkLog = cdpCapture.networkLog;
     log?.info?.(providerName.toUpperCase(), `FFI completed with HTTP ${result.status}`);
     return result;
   } catch (err) {
@@ -254,6 +451,7 @@ export async function interceptFrontendFetch(
     );
     return null;
   } finally {
+    cdpCapture?.cleanup();
     if (page) await page.close().catch(() => {});
     if (acquired) await dependencies.releaseBrowserContext(contextKey).catch(() => {});
   }
