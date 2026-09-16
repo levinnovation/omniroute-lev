@@ -33,6 +33,8 @@ export interface CrewAIDelegateArgs {
   requestId?: string | null;
   /** Incoming depth header value for recursion tracking. */
   depth?: number | null;
+  /** Whether to allow silent fallback to direct model when CrewAI fails. */
+  allowDirectFallback?: boolean;
 }
 
 export interface CrewAIDelegateResult {
@@ -189,11 +191,26 @@ export async function tryCrewAIDelegate(
     clearTimeout(timeout);
 
     if (!response.ok) {
-      args.log?.warn?.(
-        "CREWAI",
-        `CrewAI sidecar returned ${response.status}: ${await response.text().catch(() => "")}`
-      );
-      return null;
+      const errorBody = await response.text().catch(() => "Unknown error");
+      args.log?.warn?.("CREWAI", `CrewAI sidecar returned ${response.status}: ${errorBody}`);
+
+      // Safe fallback policy: do NOT silently fall back to a direct model.
+      // The user may expect remote tooling, a specific coding flow, or
+      // distinct policy behavior. Return an explicit AGENTIC_UNAVAILABLE error
+      // unless the caller explicitly allows direct fallback.
+      if (!args.allowDirectFallback) {
+        return {
+          success: false,
+          response: buildAgenticUnavailableResponse(
+            requestId,
+            args.model,
+            `CrewAI sidecar returned HTTP ${response.status}`,
+            true // retryable
+          ),
+        };
+      }
+
+      return null; // Caller explicitly allowed direct fallback
     }
 
     // The CrewAI sidecar returns {result: "...", error: null}.
@@ -204,7 +221,21 @@ export async function tryCrewAIDelegate(
 
     if (error) {
       args.log?.warn?.("CREWAI", `CrewAI flow error: ${JSON.stringify(error)}`);
-      return null;
+
+      // Safe fallback policy: return explicit error unless fallback allowed.
+      if (!args.allowDirectFallback) {
+        return {
+          success: false,
+          response: buildAgenticUnavailableResponse(
+            requestId,
+            args.model,
+            `CrewAI flow error: ${error.message ?? JSON.stringify(error)}`,
+            error.retryable ?? true
+          ),
+        };
+      }
+
+      return null; // Caller explicitly allowed direct fallback
     }
 
     // Build an OpenAI-compatible chat completion response
@@ -241,11 +272,23 @@ export async function tryCrewAIDelegate(
       }),
     };
   } catch (err) {
-    args.log?.warn?.(
-      "CREWAI",
-      `CrewAI delegation failed: ${err instanceof Error ? err.message : String(err)}`
-    );
-    return null;
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    args.log?.warn?.("CREWAI", `CrewAI delegation failed: ${errorMessage}`);
+
+    // Safe fallback policy: return explicit error unless fallback allowed.
+    if (!args.allowDirectFallback) {
+      return {
+        success: false,
+        response: buildAgenticUnavailableResponse(
+          requestId,
+          args.model,
+          `CrewAI delegation failed: ${errorMessage}`,
+          true // Network errors are retryable
+        ),
+      };
+    }
+
+    return null; // Caller explicitly allowed direct fallback
   }
 }
 
@@ -273,4 +316,56 @@ export function getDelegationDepth(headers: Record<string, string>): number {
  */
 export function getRequestId(headers: Record<string, string>): string | null {
   return headers[REQUEST_ID_HEADER] ?? headers["x-request-id"] ?? null;
+}
+
+/**
+ * Build an OpenAI-compatible error response for agentic routing failures.
+ * Returns HTTP 503 with an actionable error message that does NOT silently
+ * fall back to a direct model.
+ */
+function buildAgenticUnavailableResponse(
+  requestId: string,
+  model: string,
+  cause: string,
+  retryable: boolean
+): Response {
+  const body = {
+    id: `chatcmpl-crewai-error-${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: "",
+        },
+        finish_reason: "error",
+      },
+    ],
+    error: {
+      type: "agentic_unavailable",
+      code: "AGENTIC_UNAVAILABLE",
+      message: `Agentic routing unavailable: ${cause}`,
+      cause,
+      retryable,
+      model,
+      requestId,
+      remediation: `Use a direct model (e.g. omniroute/claude/claude-sonnet-4) or retry later.`,
+    },
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    },
+  };
+
+  return new Response(JSON.stringify(body), {
+    status: 503,
+    headers: {
+      "Content-Type": "application/json",
+      [REQUEST_ID_HEADER]: requestId,
+    },
+  });
 }

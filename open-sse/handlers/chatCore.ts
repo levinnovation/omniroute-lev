@@ -1219,6 +1219,13 @@ export async function handleChatCore({
       requestApiKey: credentials?.apiKey || null,
       requestId: requestId || null,
       depth: Number.isFinite(depth) ? depth : 0,
+      // Safe fallback: only allow direct fallback when explicitly requested
+      // via x-allow-direct-fallback header or body metadata flag.
+      allowDirectFallback:
+        clientRawRequest?.headers?.get?.("x-allow-direct-fallback") === "true" ||
+        (body &&
+          typeof body === "object" &&
+          (body as Record<string, unknown>).allow_direct_fallback === true),
     });
     if (crewaiResult) {
       try {
