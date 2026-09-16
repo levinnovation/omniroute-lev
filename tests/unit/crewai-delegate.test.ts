@@ -11,6 +11,8 @@ import {
   shouldDelegateToCrewAI,
   extractAgenticModel,
   isInternalAgentRequest,
+  getDelegationDepth,
+  getRequestId,
   type CrewAIDelegateArgs,
 } from "../../open-sse/handlers/chatCore/crewaiDelegate.ts";
 
@@ -123,4 +125,72 @@ test("shouldDelegateToCrewAI returns true for agentic model with non-internal ke
     delete process.env.OMNIROUTE_CREWAI_URL;
     delete process.env.OMNIROUTE_INTERNAL_AGENT_KEY;
   }
+});
+
+// ── Depth enforcement ────────────────────────────────────────────────────
+
+test("shouldDelegateToCrewAI returns false when depth exceeds max", () => {
+  process.env.OMNIROUTE_CREWAI_URL = "http://lev-crewai-coder.railway.internal:8000";
+  delete process.env.OMNIROUTE_INTERNAL_AGENT_KEY;
+  try {
+    const args: CrewAIDelegateArgs = {
+      model: "agentic/coder",
+      body: { messages: [{ role: "user", content: "test" }] },
+      stream: false,
+      requestApiKey: "user-key",
+      depth: 2, // At max depth
+    };
+    assert.equal(shouldDelegateToCrewAI(args), false);
+  } finally {
+    delete process.env.OMNIROUTE_CREWAI_URL;
+  }
+});
+
+test("shouldDelegateToCrewAI returns true when depth is below max", () => {
+  process.env.OMNIROUTE_CREWAI_URL = "http://lev-crewai-coder.railway.internal:8000";
+  delete process.env.OMNIROUTE_INTERNAL_AGENT_KEY;
+  try {
+    const args: CrewAIDelegateArgs = {
+      model: "agentic/coder",
+      body: { messages: [{ role: "user", content: "test" }] },
+      stream: false,
+      requestApiKey: "user-key",
+      depth: 1, // Below max
+    };
+    assert.equal(shouldDelegateToCrewAI(args), true);
+  } finally {
+    delete process.env.OMNIROUTE_CREWAI_URL;
+  }
+});
+
+// ── getDelegationDepth ────────────────────────────────────────────────────
+
+test("getDelegationDepth returns 0 for missing header", () => {
+  assert.equal(getDelegationDepth({}), 0);
+  assert.equal(getDelegationDepth({ "content-type": "application/json" }), 0);
+});
+
+test("getDelegationDepth parses valid header", () => {
+  assert.equal(getDelegationDepth({ "x-omniroute-depth": "1" }), 1);
+  assert.equal(getDelegationDepth({ "x-omniroute-depth": "2" }), 2);
+});
+
+test("getDelegationDepth handles invalid header", () => {
+  assert.equal(getDelegationDepth({ "x-omniroute-depth": "abc" }), 0);
+  assert.equal(getDelegationDepth({ "x-omniroute-depth": "" }), 0);
+});
+
+// ── getRequestId ─────────────────────────────────────────────────────────
+
+test("getRequestId extracts x-omniroute-request-id", () => {
+  assert.equal(getRequestId({ "x-omniroute-request-id": "req_123" }), "req_123");
+});
+
+test("getRequestId falls back to x-request-id", () => {
+  assert.equal(getRequestId({ "x-request-id": "req_456" }), "req_456");
+});
+
+test("getRequestId returns null for missing headers", () => {
+  assert.equal(getRequestId({}), null);
+  assert.equal(getRequestId({ "content-type": "application/json" }), null);
 });

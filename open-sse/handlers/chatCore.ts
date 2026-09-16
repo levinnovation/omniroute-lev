@@ -1194,6 +1194,22 @@ export async function handleChatCore({
   // never routed to the CrewAI sidecar. Falls back to the existing executor
   // path if disabled, inapplicable, or on error.
   if (!isInternalAgentRequest(credentials?.apiKey || null)) {
+    // Extract request ID and depth headers for tracing and recursion prevention.
+    const requestId =
+      clientRawRequest?.headers && typeof clientRawRequest.headers.get === "function"
+        ? clientRawRequest.headers.get("x-request-id") ||
+          clientRawRequest.headers.get("x-omniroute-request-id")
+        : getHeaderValueCaseInsensitive(clientRawRequest?.headers ?? null, "x-request-id") ||
+          getHeaderValueCaseInsensitive(
+            clientRawRequest?.headers ?? null,
+            "x-omniroute-request-id"
+          );
+    const depthHeader =
+      clientRawRequest?.headers && typeof clientRawRequest.headers.get === "function"
+        ? clientRawRequest.headers.get("x-omniroute-depth")
+        : getHeaderValueCaseInsensitive(clientRawRequest?.headers ?? null, "x-omniroute-depth");
+    const depth = depthHeader ? parseInt(depthHeader, 10) : 0;
+
     const crewaiResult = await tryCrewAIDelegate({
       model,
       body: body && typeof body === "object" ? (body as Record<string, unknown>) : null,
@@ -1201,6 +1217,8 @@ export async function handleChatCore({
       signal: clientRawRequest?.signal ?? null,
       log,
       requestApiKey: credentials?.apiKey || null,
+      requestId: requestId || null,
+      depth: Number.isFinite(depth) ? depth : 0,
     });
     if (crewaiResult) {
       try {

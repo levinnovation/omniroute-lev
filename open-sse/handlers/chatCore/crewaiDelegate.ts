@@ -12,12 +12,14 @@
  * - OmniRoute detects this key and NEVER routes internal requests to the
  *   CrewAI sidecar.
  * - A depth header (X-OmniRoute-Depth) tracks delegation depth; max depth = 2.
+ * - A request ID header (X-OmniRoute-Request-Id) enables end-to-end tracing.
  *
  * If the CrewAI sidecar is unreachable or returns an error, the delegate
  * returns null so the existing OmniRoute executor path handles the request.
  */
 
 import { getCrewAIConfig } from "../../services/sidecars.ts";
+import { randomUUID } from "node:crypto";
 
 export interface CrewAIDelegateArgs {
   model: string;
@@ -27,6 +29,10 @@ export interface CrewAIDelegateArgs {
   log?: { debug?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void } | null;
   /** The API key from the incoming request. Used to detect internal requests. */
   requestApiKey?: string | null;
+  /** Incoming request ID for tracing (from x-request-id header). */
+  requestId?: string | null;
+  /** Incoming depth header value for recursion tracking. */
+  depth?: number | null;
 }
 
 export interface CrewAIDelegateResult {
@@ -34,14 +40,17 @@ export interface CrewAIDelegateResult {
   response: Response;
 }
 
-/** Maximum delegation depth (prevents infinite recursion). Reserved for future depth-tracking. */
-const _MAX_DELEGATION_DEPTH = 2;
+/** Maximum delegation depth (prevents infinite recursion). */
+const MAX_DELEGATION_DEPTH = 2;
 
 /** Model prefix that triggers CrewAI delegation. */
 const AGENTIC_PREFIX = "agentic/";
 
 /** Header name for tracking delegation depth. */
 const DEPTH_HEADER = "x-omniroute-depth";
+
+/** Header name for request tracing. */
+const REQUEST_ID_HEADER = "x-omniroute-request-id";
 
 /**
  * Check if the request should be delegated to the CrewAI sidecar.
@@ -63,6 +72,12 @@ export function shouldDelegateToCrewAI(args: CrewAIDelegateArgs): boolean {
 
   // Model must have the agentic/ prefix
   if (!args.model.startsWith(AGENTIC_PREFIX)) return false;
+
+  // Depth check: if the incoming request already has a depth header that
+  // exceeds the maximum, do not delegate further.
+  if (args.depth !== null && args.depth !== undefined && args.depth >= MAX_DELEGATION_DEPTH) {
+    return false;
+  }
 
   return true;
 }
@@ -110,20 +125,45 @@ export async function tryCrewAIDelegate(
     typeof lastUser.content === "string" ? lastUser.content : JSON.stringify(lastUser.content);
   const agenticModel = extractAgenticModel(args.model);
 
-  // Build the CrewAI sidecar request
+  // Generate or forward a request ID for tracing
+  const requestId = args.requestId ?? `omniroute-${randomUUID()}`;
+  const traceId = `trace-${randomUUID()}`;
+  const currentDepth = (args.depth ?? 0) + 1;
+
+  // Extract workspace and client info from request metadata if present
+  const metadata = (args.body.metadata as Record<string, unknown> | undefined) ?? {};
+  const workspace = metadata.workspace as Record<string, unknown> | undefined;
+  const client = metadata.client as Record<string, unknown> | undefined;
+
+  // Build the CrewAI sidecar request with full conversation context
   const crewaiBody = {
+    requestId,
+    model: agenticModel,
     inputs: {
       message: prompt,
       model: agenticModel,
-      // Pass through conversation context for multi-turn
-      messages: messages.map((m) => ({ role: m.role, content: m.content })),
+      // Pass through full conversation context for multi-turn
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        ...(m.name ? { name: m.name } : {}),
+        ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+      })),
+      ...(workspace ? { workspace } : {}),
+      ...(client ? { client } : {}),
     },
-    model: agenticModel,
+    stream: false, // v0.1: non-streaming
+    metadata: {
+      traceId,
+      parentRequestId: args.requestId ?? undefined,
+      recursionDepth: currentDepth,
+    },
   };
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    [DEPTH_HEADER]: "1", // This is the first delegation
+    [DEPTH_HEADER]: String(currentDepth),
+    [REQUEST_ID_HEADER]: requestId,
   };
   if (config.apiKey) {
     headers["X-API-Key"] = config.apiKey;
@@ -136,7 +176,7 @@ export async function tryCrewAIDelegate(
 
     args.log?.debug?.(
       "CREWAI",
-      `delegating agentic request to CrewAI sidecar (model=${agenticModel})`
+      `delegating agentic request to CrewAI sidecar (model=${agenticModel}, requestId=${requestId}, depth=${currentDepth})`
     );
 
     const response = await fetch(`${config.url.replace(/\/$/, "")}/api/v1/run`, {
@@ -194,7 +234,10 @@ export async function tryCrewAIDelegate(
       success: true,
       response: new Response(JSON.stringify(completionBody), {
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          [REQUEST_ID_HEADER]: requestId,
+        },
       }),
     };
   } catch (err) {
@@ -213,4 +256,21 @@ export async function tryCrewAIDelegate(
 export function isInternalAgentRequest(apiKey?: string | null): boolean {
   const internalKey = process.env.OMNIROUTE_INTERNAL_AGENT_KEY;
   return !!(internalKey && apiKey === internalKey);
+}
+
+/**
+ * Extract the delegation depth from request headers.
+ */
+export function getDelegationDepth(headers: Record<string, string>): number {
+  const raw = headers[DEPTH_HEADER] ?? headers[DEPTH_HEADER.toLowerCase()];
+  if (!raw) return 0;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Extract the request ID from request headers.
+ */
+export function getRequestId(headers: Record<string, string>): string | null {
+  return headers[REQUEST_ID_HEADER] ?? headers["x-request-id"] ?? null;
 }
