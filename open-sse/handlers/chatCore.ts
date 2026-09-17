@@ -560,7 +560,14 @@ export async function handleChatCore({
       /* fail open */
     }
   }
-  if (isVirtualAlias(model)) {
+
+  // LEV fork Phase 4: Intercept agentic/ prefixed models BEFORE provider resolution.
+  // "agentic/coder" is not a real provider — it routes to the CrewAI sidecar.
+  // We must check this before resolveVirtualAlias tries to resolve "agentic" as a provider.
+  if (model && typeof model === "string" && model.startsWith("agentic/")) {
+    // Don't resolve the provider — keep model as-is for the delegate
+    provider = "agentic";
+  } else if (isVirtualAlias(model)) {
     const availableModelIds = new Set<string>();
     for (const [providerAlias, entries] of Object.entries(PROVIDER_MODELS)) {
       for (const entry of entries || []) {

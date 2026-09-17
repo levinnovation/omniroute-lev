@@ -1325,6 +1325,48 @@ async function handleSingleModelChat(
   );
   if (resolved.error) return resolved.error;
 
+  // LEV fork Phase 4: Agentic routing — intercept agentic/ prefixed models
+  // BEFORE provider resolution. "agentic/coder" is not a real provider —
+  // it routes to the CrewAI sidecar via tryCrewAIDelegate.
+  if ((resolved as any).agentic) {
+    log.info("ROUTING", `agentic model "${modelStr}" → CrewAI sidecar`);
+
+    // Call the CrewAI delegate directly — bypass normal provider resolution
+    const { tryCrewAIDelegate } =
+      await import("../../open-sse/handlers/chatCore/crewaiDelegate.ts");
+
+    // Extract request ID and depth headers for tracing
+    const requestId =
+      clientRawRequest?.headers?.get?.("x-request-id") ||
+      clientRawRequest?.headers?.get?.("x-omniroute-request-id") ||
+      null;
+    const depthHeader = clientRawRequest?.headers?.get?.("x-omniroute-depth") || null;
+    const depth = depthHeader ? parseInt(depthHeader, 10) : 0;
+
+    const crewaiResult = await tryCrewAIDelegate({
+      model: modelStr,
+      body: body && typeof body === "object" ? (body as Record<string, unknown>) : null,
+      stream: !!body?.stream,
+      signal: clientRawRequest?.signal ?? null,
+      log,
+      requestApiKey: apiKeyInfo?.apiKey || null,
+      requestId,
+      depth: Number.isFinite(depth) ? depth : 0,
+      allowDirectFallback:
+        clientRawRequest?.headers?.get?.("x-allow-direct-fallback") === "true" ||
+        (body &&
+          typeof body === "object" &&
+          (body as Record<string, unknown>).allow_direct_fallback === true),
+    });
+
+    if (crewaiResult) {
+      return crewaiResult.response;
+    }
+
+    // If delegation returned null (shouldn't happen for agentic models),
+    // fall through to normal handling
+  }
+
   // Safety net: if auto-combo resolution returned a combo object, redirect
   // to combo flow. This handles the case where the auto-fuzzy match in
   // resolveModelOrError found a combo but the main handler's combo lookup missed it.

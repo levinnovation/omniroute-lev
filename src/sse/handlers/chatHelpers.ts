@@ -124,6 +124,18 @@ export async function resolveModelOrError(
   const modelInfo = await getModelInfo(modelStr);
   const sourceFormat = detectFormatFromEndpoint(body, endpointPath);
 
+  // LEV fork: intercept agentic/ prefixed models BEFORE provider resolution.
+  // "agentic/coder" is not a real provider — it routes to the CrewAI sidecar.
+  // Return a special marker so handleSingleModelChat can route to the delegate.
+  if (modelInfo.provider === "agentic" || (modelStr && modelStr.startsWith("agentic/"))) {
+    return {
+      agentic: true,
+      provider: "agentic",
+      model: modelInfo.model || modelStr.slice("agentic/".length),
+      modelStr,
+    };
+  }
+
   if (
     modelInfo.provider === "openai" &&
     typeof modelInfo.model === "string" &&
