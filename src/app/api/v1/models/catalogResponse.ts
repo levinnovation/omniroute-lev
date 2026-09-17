@@ -258,6 +258,28 @@ export async function finalizeCatalogResponse(
   await yieldTurn();
   const orderedModels = sortCatalogModelsProviderGrouped(enrichedModels);
   await yieldTurn();
+  // LEV fork: advertise agentic/* models delegated to the CrewAI sidecar so
+  // OpenAI-compatible clients (lev-coder, Zed, Cursor) can discover them via
+  // /v1/models. Interception happens at the chat boundary regardless — this is
+  // discovery only, so entries are appended post-filter.
+  if (process.env.OMNIROUTE_CREWAI_URL) {
+    const agenticIds = (process.env.OMNIROUTE_AGENTIC_MODELS ?? "agentic/coder")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const id of agenticIds) {
+      if (!orderedModels.some((m) => m.id === id)) {
+        orderedModels.push({
+          id,
+          object: "model",
+          created: 0,
+          owned_by: "agentic",
+          name: id,
+          context_length: 200_000,
+        });
+      }
+    }
+  }
   // Codex CLI compatibility: its model-catalog refresh (codex_models_manager) does
   // GET /v1/models?client_version=<v> and decodes a JSON object with a TOP-LEVEL
   // `models` array, so the OpenAI-standard `{object,data}` shape makes it fail with
