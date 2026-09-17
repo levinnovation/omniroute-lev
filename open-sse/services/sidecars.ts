@@ -92,7 +92,9 @@ export function getCrewAIConfig(): SidecarConfig | null {
   return {
     url,
     apiKey: process.env.OMNIROUTE_CREWAI_KEY || undefined,
-    timeoutMs: 120000, // 120s — coding tasks can be long-running
+    // 360s — coding runs use max_execution_time=300s on the sidecar; the
+    // delegate timeout must exceed it or long agentic runs get cut off.
+    timeoutMs: Number(process.env.OMNIROUTE_CREWAI_TIMEOUT_MS) || 360_000,
   };
 }
 
