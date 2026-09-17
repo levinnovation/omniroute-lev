@@ -1333,7 +1333,7 @@ async function handleSingleModelChat(
 
     // Call the CrewAI delegate directly — bypass normal provider resolution
     const { tryCrewAIDelegate } =
-      await import("../../open-sse/handlers/chatCore/crewaiDelegate.ts");
+      await import("@omniroute/open-sse/handlers/chatCore/crewaiDelegate.ts");
 
     // Extract request ID and depth headers for tracing
     const requestId =
