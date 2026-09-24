@@ -17,6 +17,7 @@ import { BaseExecutor, type ExecuteInput, type ExecutorExecuteResult } from "./b
 import { buildErrorBody, sanitizeErrorMessage } from "../utils/error.ts";
 import { normalizeGeminiCookieInput } from "../utils/geminiCookies.ts";
 import { prepareToolMessages } from "../translator/webTools.ts";
+import { flattenToolHistory } from "../utils/flattenToolHistory.ts";
 import { buildToolModeResponse } from "./chatgptWebTools.ts";
 import {
   checkGeminiWebUnsupportedControls,
@@ -139,6 +140,24 @@ export function buildGeminiStreamRequestBody(
 }
 
 /**
+ * Extract plain text from an OpenAI message `content` field, which may be a
+ * string or a multipart array (`[{type:"text",text:"..."}]`). Agentic clients
+ * (opencode, Cursor, Cline) routinely send multipart user turns — treating
+ * non-string content as empty silently drops the actual request, and Gemini
+ * then answers a system-only prompt with a bare acknowledgement ("Ready.").
+ */
+function contentToText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return (content as Array<{ type?: string; text?: string }>)
+      .filter((part) => part?.type === "text" && typeof part?.text === "string")
+      .map((part) => part.text as string)
+      .join("\n");
+  }
+  return "";
+}
+
+/**
  * Flatten the OpenAI-style multi-turn `messages[]` into the single plain-text
  * prompt typed into the Gemini web UI (#8371).
  *
@@ -167,9 +186,12 @@ export function buildGeminiStreamRequestBody(
  *   <last user message>
  */
 export function buildGeminiPrompt(messages: Array<{ role: string; content: unknown }>): string {
-  const textMessages = messages.filter(
-    (m) => typeof m.content === "string" && (m.content as string).trim().length > 0
-  ) as Array<{ role: string; content: string }>;
+  // flattenToolHistory() turns `role:"tool"` results and assistant `tool_calls`
+  // into assistant prose so agentic history survives the single-prompt fold
+  // (same pattern as the 8 other web-cookie providers, ADR-001).
+  const textMessages = flattenToolHistory(messages)
+    .map((m) => ({ role: m.role ?? "", content: contentToText(m.content) }))
+    .filter((m) => m.content.trim().length > 0);
 
   const userMessages = textMessages.filter((m) => m.role === "user");
   const lastUser = userMessages[userMessages.length - 1];
@@ -180,11 +202,19 @@ export function buildGeminiPrompt(messages: Array<{ role: string; content: unkno
   const priorTurns = textMessages.filter(
     (m, i) => i < lastUserIdx && (m.role === "user" || m.role === "assistant")
   );
+  // Turns AFTER the last user message — in an agentic loop these are the
+  // in-flight exchange (assistant tool_calls + tool results the client just
+  // executed). Dropping them made the model re-issue the same tool call
+  // forever, or answer without the data it had already fetched.
+  const postTurns = textMessages.filter(
+    (m, i) => i > lastUserIdx && (m.role === "user" || m.role === "assistant")
+  );
 
-  // Single-turn (no earlier user/assistant turns): byte-for-byte the original
-  // single-message derivation. Do NOT prepend system text here — the old
-  // no-tools path ignored a system-only prefix on the first turn.
-  if (priorTurns.length === 0) return lastUserContent;
+  // Single-turn (no earlier user/assistant turns and nothing after the user
+  // ask): byte-for-byte the original single-message derivation. Do NOT prepend
+  // system text here — the old no-tools path ignored a system-only prefix on
+  // the first turn.
+  if (priorTurns.length === 0 && postTurns.length === 0) return lastUserContent;
 
   const systemText = textMessages
     .filter((m) => m.role === "system")
@@ -194,11 +224,17 @@ export function buildGeminiPrompt(messages: Array<{ role: string; content: unkno
   const historyLines = priorTurns.map(
     (m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`
   );
+  const postLines = postTurns.map(
+    (m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`
+  );
 
   const parts: string[] = [];
   if (systemText) parts.push(`System:\n${systemText}`);
-  parts.push(`Previous conversation:\n${historyLines.join("\n\n")}`);
+  if (historyLines.length > 0) {
+    parts.push(`Previous conversation:\n${historyLines.join("\n\n")}`);
+  }
   parts.push(`Current user message:\n${lastUserContent}`);
+  if (postLines.length > 0) parts.push(postLines.join("\n\n"));
   return parts.join("\n\n");
 }
 
@@ -221,15 +257,17 @@ export function buildGeminiToolPrompt(
   // model then received a tool REMINDER naming tools whose contract it had
   // never been given, could not emit a <tool> block, and answered with a bare
   // acknowledgement — "I am ready to assist you" against a 48K-token request.
-  const systemText = effectiveMessages
-    .filter((m) => m.role === "system" && typeof m.content === "string")
-    .map((m) => (m.content as string).trim())
+  const flatMessages = flattenToolHistory(effectiveMessages);
+
+  const systemText = flatMessages
+    .filter((m) => m.role === "system")
+    .map((m) => contentToText(m.content).trim())
     .filter(Boolean)
     .join("\n\n");
 
-  const textMessages = effectiveMessages.filter(
-    (m) => typeof m.content === "string" && (m.content as string).trim().length > 0
-  ) as Array<{ role: string; content: string }>;
+  const textMessages = flatMessages
+    .map((m) => ({ role: m.role ?? "", content: contentToText(m.content) }))
+    .filter((m) => m.content.trim().length > 0);
 
   const userMessages = textMessages.filter((m) => m.role === "user");
   const lastUser = userMessages[userMessages.length - 1];
@@ -244,6 +282,12 @@ export function buildGeminiToolPrompt(
   const priorTurns = textMessages.filter(
     (m, i) => i < lastUserIdx && (m.role === "user" || m.role === "assistant")
   );
+  // In-flight turns after the last user message (assistant tool_calls + tool
+  // results) must trail the current user message so the model reacts to the
+  // freshest tool output instead of re-issuing the same <tool> call forever.
+  const postTurns = textMessages.filter(
+    (m, i) => i > lastUserIdx && (m.role === "user" || m.role === "assistant")
+  );
 
   const parts: string[] = [];
   if (systemText) parts.push(systemText);
@@ -253,7 +297,16 @@ export function buildGeminiToolPrompt(
         .map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`)
         .join("\n\n")}`
     );
-    parts.push(`Current user message:\n${userText}`);
+  }
+  if (priorTurns.length > 0 || postTurns.length > 0) {
+    if (userText) parts.push(`Current user message:\n${userText}`);
+    if (postTurns.length > 0) {
+      parts.push(
+        postTurns
+          .map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`)
+          .join("\n\n")
+      );
+    }
   } else if (userText) {
     parts.push(userText);
   }
@@ -614,8 +667,7 @@ export class GeminiWebExecutor extends BaseExecutor {
 
         frontendSession = await page.evaluate(() => {
           const globalData = (window as unknown as Record<string, unknown>)["WIZ_global_data"] as
-            | Record<string, unknown>
-            | undefined;
+            Record<string, unknown> | undefined;
           const globalToken = globalData?.["SNlM0e"];
           const globalBuild = globalData?.["cfb2h"];
           if (
@@ -731,7 +783,9 @@ export class GeminiWebExecutor extends BaseExecutor {
         {
           start(controller) {
             controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify(formatStreamChunk(responseText, modelId))}\n\n`)
+              encoder.encode(
+                `data: ${JSON.stringify(formatStreamChunk(responseText, modelId))}\n\n`
+              )
             );
             controller.enqueue(
               encoder.encode(`data: ${JSON.stringify(formatStreamChunk("", modelId, "stop"))}\n\n`)
@@ -768,9 +822,7 @@ export class GeminiWebExecutor extends BaseExecutor {
     };
   }
 
-  private async executeViaUiAutomation(
-    input: ExecuteInput
-  ): Promise<ExecutorExecuteResult | null> {
+  private async executeViaUiAutomation(input: ExecuteInput): Promise<ExecutorExecuteResult | null> {
     if (!isBrowserAutomationEnabled()) return null;
     const { model, body, stream, credentials, signal, log, onCredentialsRefreshed } = input;
     const requestBody = body as GeminiRequestBody;
@@ -830,11 +882,18 @@ export class GeminiWebExecutor extends BaseExecutor {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       // LEV fork: Check if we've been redirected to a login/consent page
       const currentUrl = page.url();
-      if (currentUrl.includes("accounts.google.com") || currentUrl.includes("signin") || currentUrl.includes("consent")) {
+      if (
+        currentUrl.includes("accounts.google.com") ||
+        currentUrl.includes("signin") ||
+        currentUrl.includes("consent")
+      ) {
         log?.warn?.("GEMINI-WEB", `Browser path: redirected to login/consent page: ${currentUrl}`);
         return null;
       }
-      log?.info?.("GEMINI-WEB", `Browser path: page navigated to ${currentUrl}, looking for input selector`);
+      log?.info?.(
+        "GEMINI-WEB",
+        `Browser path: page navigated to ${currentUrl}, looking for input selector`
+      );
 
       const imageMode = (body as Record<string, unknown>)?.x_gemini_web_image_mode === true;
       let responseText = "";
@@ -877,11 +936,18 @@ export class GeminiWebExecutor extends BaseExecutor {
       // LEV fork: Wait for Quill to be fully initialized before typing.
       // The Gemini frontend throws "Cannot access 'N' before initialization"
       // when keystrokes arrive before Quill's internal state is ready.
-      await page.waitForFunction(() => {
-        const editor = document.querySelector(".ql-editor, [contenteditable='true']") as HTMLElement | null;
-        if (!editor) return false;
-        return editor.isContentEditable && document.activeElement === editor;
-      }, { timeout: 10_000 }).catch(() => {});
+      await page
+        .waitForFunction(
+          () => {
+            const editor = document.querySelector(
+              ".ql-editor, [contenteditable='true']"
+            ) as HTMLElement | null;
+            if (!editor) return false;
+            return editor.isContentEditable && document.activeElement === editor;
+          },
+          { timeout: 10_000 }
+        )
+        .catch(() => {});
       // LEV fork: The Gemini frontend's minified JS throws "Cannot access 'T'
       // before initialization" on ANY keyboard event because a module-level
       // variable in an event handler hasn't been initialized. This is a
@@ -908,16 +974,23 @@ export class GeminiWebExecutor extends BaseExecutor {
             }
           }
           // Fallback: set innerHTML and dispatch input event
-          const editor = document.querySelector(".ql-editor, [contenteditable='true']") as HTMLElement | null;
+          const editor = document.querySelector(
+            ".ql-editor, [contenteditable='true']"
+          ) as HTMLElement | null;
           if (editor) {
             editor.innerHTML = `<p>${text}</p>`;
-            editor.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" }));
+            editor.dispatchEvent(
+              new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" })
+            );
           }
         }, prompt);
         promptFilled = true;
         log?.info?.("GEMINI-WEB", "Browser path: prompt filled via evaluate");
       } catch (e) {
-        log?.warn?.("GEMINI-WEB", `evaluate fill failed: ${e instanceof Error ? e.message : String(e)}`);
+        log?.warn?.(
+          "GEMINI-WEB",
+          `evaluate fill failed: ${e instanceof Error ? e.message : String(e)}`
+        );
       }
       if (!promptFilled) {
         // Last resort: try keyboard.type() with a long delay
@@ -926,14 +999,21 @@ export class GeminiWebExecutor extends BaseExecutor {
           promptFilled = true;
           log?.info?.("GEMINI-WEB", "Browser path: prompt filled via keyboard.type()");
         } catch (e) {
-          log?.warn?.("GEMINI-WEB", `keyboard.type() failed: ${e instanceof Error ? e.message : String(e)}`);
+          log?.warn?.(
+            "GEMINI-WEB",
+            `keyboard.type() failed: ${e instanceof Error ? e.message : String(e)}`
+          );
         }
       }
       // Submit: try clicking the send button first, then fall back to DOM-based submit.
       // LEV fork: Avoid page.keyboard.press("Enter") — the Gemini frontend throws
       // "Cannot access 'T' before initialization" on ANY keyboard event.
-      const sendBtn = page.locator('button[aria-label="Send"], button[data-testid="send-button"], button.send-button, button[mattooltip*="Send"], rich-text-menu + button, .send-button').first();
-      if (await sendBtn.count() > 0) {
+      const sendBtn = page
+        .locator(
+          'button[aria-label="Send"], button[data-testid="send-button"], button.send-button, button[mattooltip*="Send"], rich-text-menu + button, .send-button'
+        )
+        .first();
+      if ((await sendBtn.count()) > 0) {
         try {
           await sendBtn.evaluate((el) => (el as HTMLElement).click());
           log?.info?.("GEMINI-WEB", "Browser path: submitted via send button DOM click");
@@ -943,31 +1023,39 @@ export class GeminiWebExecutor extends BaseExecutor {
             log?.info?.("GEMINI-WEB", "Browser path: submitted via send button Playwright click");
           } catch {
             // Last resort: submit via form submit() or evaluate-based Enter
-            await page.evaluate(() => {
-              const form = document.querySelector("form") as HTMLFormElement | null;
-              if (form) form.submit();
-            }).catch(() => {});
+            await page
+              .evaluate(() => {
+                const form = document.querySelector("form") as HTMLFormElement | null;
+                if (form) form.submit();
+              })
+              .catch(() => {});
             log?.info?.("GEMINI-WEB", "Browser path: submitted via form.submit()");
           }
         }
       } else {
         // No send button found — try submitting the form directly
-        await page.evaluate(() => {
-          const form = document.querySelector("form") as HTMLFormElement | null;
-          if (form) form.submit();
-          else {
-            // Try clicking any button that looks like a submit
-            const buttons = document.querySelectorAll("button");
-            for (const btn of buttons) {
-              const text = (btn.textContent || "").toLowerCase();
-              const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
-              if (text.includes("send") || aria.includes("send") || btn.classList.contains("send")) {
-                (btn as HTMLElement).click();
-                return;
+        await page
+          .evaluate(() => {
+            const form = document.querySelector("form") as HTMLFormElement | null;
+            if (form) form.submit();
+            else {
+              // Try clicking any button that looks like a submit
+              const buttons = document.querySelectorAll("button");
+              for (const btn of buttons) {
+                const text = (btn.textContent || "").toLowerCase();
+                const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+                if (
+                  text.includes("send") ||
+                  aria.includes("send") ||
+                  btn.classList.contains("send")
+                ) {
+                  (btn as HTMLElement).click();
+                  return;
+                }
               }
             }
-          }
-        }).catch(() => {});
+          })
+          .catch(() => {});
         log?.info?.("GEMINI-WEB", "Browser path: submitted via evaluate form submit");
       }
       const responseWaitMs = imageMode ? 90000 : hasTools ? 60000 : 30000;
@@ -980,11 +1068,21 @@ export class GeminiWebExecutor extends BaseExecutor {
       // or browser has been closed" when Browserless disconnects mid-wait.
       const timeoutPromise = new Promise<void>((resolve) => {
         const t = setTimeout(() => resolve(), responseWaitMs);
-        signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+        signal?.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(t);
+            resolve();
+          },
+          { once: true }
+        );
       });
       await Promise.race([responsePromise, timeoutPromise, disconnectPromise]);
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      log?.info?.("GEMINI-WEB", `Browser path: response wait settled, responseText length=${responseText.length}, images=${responseImages.length}`);
+      log?.info?.(
+        "GEMINI-WEB",
+        `Browser path: response wait settled, responseText length=${responseText.length}, images=${responseImages.length}`
+      );
 
       await this.persistRotatedCookies(
         pooled.context,
