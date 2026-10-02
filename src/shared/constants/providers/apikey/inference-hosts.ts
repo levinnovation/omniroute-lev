@@ -360,4 +360,16 @@ export const APIKEY_PROVIDERS_INFERENCE = {
     },
     serviceKinds: ["llm"],
   },
+  spacebunny: {
+    id: "spacebunny",
+    alias: "sb",
+    name: "Space Bunny",
+    icon: "pets",
+    color: "#F472B6",
+    textIcon: "SB",
+    website: "https://spacebunny.app",
+    apiHint:
+      "Anonymous-preview chat endpoint. OmniRoute translates its custom SSE dialect into standard OpenAI chunks.",
+    serviceKinds: ["llm"],
+  },
 };
