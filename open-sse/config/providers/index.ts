@@ -94,6 +94,7 @@ import { freeaiapikeyProvider } from "./registry/freeaiapikey/index.ts";
 import { qwen_webProvider } from "./registry/qwen/web/index.ts";
 import { qwen_cloudProvider } from "./registry/qwen-cloud/index.ts";
 import { qwen_cloud_token_planProvider } from "./registry/qwen-cloud-token-plan/index.ts";
+import { spacebunnyProvider } from "./registry/spacebunny/index.ts";
 import { zai_webProvider } from "./registry/zai-web/index.ts";
 import { modalProvider } from "./registry/modal/index.ts";
 import { zenmuxProvider } from "./registry/zenmux/index.ts";
@@ -364,6 +365,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
   "qwen-web": qwen_webProvider,
   "qwen-cloud": qwen_cloudProvider,
   "qwen-cloud-token-plan": qwen_cloud_token_planProvider,
+  spacebunny: spacebunnyProvider,
   "zai-web": zai_webProvider,
   modal: modalProvider,
   zenmux: zenmuxProvider,

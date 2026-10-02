@@ -197,6 +197,8 @@ const lazyExecutors: Record<string, () => Promise<BaseExecutor>> = {
   qw: () => import("./qwen-web.ts").then((m) => new m.QwenWebExecutor()), // Alias
   "conol-web": () => import("./conol-web.ts").then((m) => new m.ConolWebExecutor()),
   cnl: () => import("./conol-web.ts").then((m) => new m.ConolWebExecutor()), // Alias
+  spacebunny: () => import("./spacebunny.ts").then((m) => new m.SpaceBunnyExecutor()),
+  sb: () => import("./spacebunny.ts").then((m) => new m.SpaceBunnyExecutor()), // Alias
 };
 
 // Bootstrap: declare every built-in alias in the ExecutorRegistry. Duplicate
