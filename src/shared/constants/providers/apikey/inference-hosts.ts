@@ -372,4 +372,17 @@ export const APIKEY_PROVIDERS_INFERENCE = {
       "Anonymous-preview chat endpoint. OmniRoute translates its custom SSE dialect into standard OpenAI chunks.",
     serviceKinds: ["llm"],
   },
+  // PGS Grove / Phoenix Grove — OpenAI-compatible US-based inference host
+  // (api.pgsgrove.com). Key format pgsk_…; free Flash models on the intro plan.
+  pgsgrove: {
+    id: "pgsgrove",
+    alias: "pgs",
+    name: "PGS Grove",
+    icon: "forest",
+    color: "#16A34A",
+    textIcon: "PG",
+    website: "https://pgsgrove.com",
+    apiHint: "OpenAI-compatible endpoint at https://api.pgsgrove.com/v1 — paste the pgsk_… key.",
+    serviceKinds: ["llm"],
+  },
 };
