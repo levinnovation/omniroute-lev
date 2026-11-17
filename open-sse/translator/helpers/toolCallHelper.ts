@@ -352,6 +352,9 @@ export function fixMissingToolResponses<T extends ToolCallBody>(body: T): T {
 // role:"tool" messages and Claude-format tool_result content blocks. Drops a
 // user message entirely if stripping empties its content array. Returns the
 // same body reference when nothing needs to change (no-op fast path).
+// Results with no id cannot be paired after a client removes the opening call.
+// Keep their output as labelled user context rather than forwarding invalid tool
+// messages or discarding the evidence the model needs to continue.
 export function stripOrphanedToolResults<T extends ToolCallBody>(body: T): T {
   if (!body.messages || !Array.isArray(body.messages)) return body;
 
@@ -366,6 +369,20 @@ export function stripOrphanedToolResults<T extends ToolCallBody>(body: T): T {
   const filteredMessages: ToolMessage[] = [];
 
   for (const msg of body.messages) {
+    if (
+      msg.role === "tool" &&
+      (msg.tool_call_id == null || String(msg.tool_call_id).trim() === "")
+    ) {
+      const content =
+        typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? "");
+      filteredMessages.push({
+        role: "user",
+        content: `[Tool Result: missing call ID]\n${content}`,
+      });
+      changed = true;
+      continue;
+    }
+
     if (msg.role === "tool" && msg.tool_call_id) {
       if (knownCallIds.has(String(msg.tool_call_id))) {
         filteredMessages.push(msg);
