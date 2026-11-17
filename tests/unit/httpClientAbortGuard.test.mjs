@@ -1,6 +1,7 @@
 "use strict";
 
 import assert from "node:assert";
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { EventEmitter } from "node:events";
 import {
@@ -69,6 +70,8 @@ test("isClientAbortError rejects genuine server errors", () => {
   assert.equal(isClientAbortError(real), false);
   const noCode = new Error("something else entirely");
   assert.equal(isClientAbortError(noCode), false);
+  assert.equal(isClientAbortError(new DOMException("upstream timed out", "AbortError")), false);
+  assert.equal(isClientAbortError(new Error("request_signal_aborted")), false);
 });
 
 test("attachRequestStreamGuards swallows a client abort on req without throwing", () => {
@@ -116,4 +119,22 @@ test("shouldSwallowUncaught preserves crash semantics for genuine errors", () =>
 test("installProcessCrashGuard does not throw on import and is idempotent", () => {
   assert.doesNotThrow(() => installProcessCrashGuard(() => {}));
   assert.doesNotThrow(() => installProcessCrashGuard(() => {}));
+});
+
+test("a request-signal disconnect leaves the guarded process alive", () => {
+  const guardUrl = new URL("../../src/shared/utils/httpClientAbortGuard.mjs", import.meta.url);
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { installProcessCrashGuard } from ${JSON.stringify(guardUrl.href)};
+    installProcessCrashGuard();
+    Promise.reject(new DOMException("request_signal_aborted", "AbortError"));
+    setImmediate(() => {
+      throw new DOMException("request_signal_aborted", "AbortError");
+    });
+    setTimeout(() => console.log("still running"), 30);
+  `], { encoding: "utf8", timeout: 5000 });
+
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /still running/);
+  assert.match(child.stderr, /swallowed client-abort unhandledRejection/);
+  assert.match(child.stderr, /swallowed client-abort uncaughtException/);
 });
