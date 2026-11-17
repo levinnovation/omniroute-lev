@@ -42,6 +42,8 @@ export function isClientAbortError(err) {
   const e = /** @type {NodeJS.ErrnoException} */ (err);
   // Node emits `Error: aborted` (no code) from http.Server#abortIncoming.
   if (e.message === "aborted" || e.message === "Aborted") return true;
+  // Streaming handlers wrap client disconnects in an AbortError with this reason.
+  if (e.name === "AbortError" && e.message === "request_signal_aborted") return true;
   switch (e.code) {
     case "ERR_STREAM_PREMATURE_CLOSE":
     case "ECONNRESET":
@@ -117,7 +119,7 @@ export function installProcessCrashGuard(log) {
   if (crashGuardInstalled) return;
   crashGuardInstalled = true;
 
-  const logger = log ?? console;
+  const logger = log ?? ((level, ...args) => console[level](...args));
 
   process.on("uncaughtException", (err, origin) => {
     if (shouldSwallowUncaught(err, origin)) {
